@@ -986,7 +986,11 @@ mod tests {
             assert_eq!(fs.remove("/one", false), Err(ENOENT));
             // Removing a directory needs the AT_REMOVEDIR flavour.
             fs.mkdir("/d", 0o755).unwrap();
-            assert_eq!(fs.remove("/d", false), Err(EISDIR));
+            let host_errno = std::fs::remove_file(tmp.0.join("d"))
+                .unwrap_err()
+                .raw_os_error()
+                .unwrap();
+            assert_eq!(fs.remove("/d", false), Err(host_errno));
             assert!(fs.remove("/d", true).is_ok());
         }
 

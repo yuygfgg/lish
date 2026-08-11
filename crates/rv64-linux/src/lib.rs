@@ -178,18 +178,28 @@ impl Machine {
         self.cpu.x[2] = sp; // sp
     }
 
+    /// Execute one raw CPU slice and report its actual retired instruction
+    /// count. A syscall can stop the CPU before `budget`, so callers must debit
+    /// this value instead of assuming that only `StopReason::Budget` consumes
+    /// fuel.
+    pub fn run_cpu_slice(&mut self, budget: u64) -> (StopReason, u64) {
+        let before = self.cpu.insn_count;
+        let stop = {
+            let mut bus = FlatMemory::new(0, &mut self.mem);
+            self.cpu.run(&mut bus, budget)
+        };
+        (stop, self.cpu.insn_count - before)
+    }
+
     /// Run until exit, unhandled trap, or budget exhaustion.
     pub fn run(&mut self, host: &mut dyn Host, budget: u64) -> RunResult {
         let mut remaining = budget;
         loop {
             let slice = remaining.min(1_000_000);
-            let stop = {
-                let mut bus = FlatMemory::new(0, &mut self.mem);
-                self.cpu.run(&mut bus, slice)
-            };
+            let (stop, retired) = self.run_cpu_slice(slice);
+            remaining = remaining.saturating_sub(retired);
             match stop {
                 StopReason::Budget => {
-                    remaining = remaining.saturating_sub(slice);
                     if remaining == 0 {
                         return RunResult::Budget;
                     }
@@ -199,9 +209,13 @@ impl Machine {
                         self.exit_code = Some(code);
                         return RunResult::Exited(code);
                     }
+                    if remaining == 0 {
+                        return RunResult::Budget;
+                    }
                 }
                 StopReason::Break => {
                     // Treat like SIGTRAP-without-debugger: abort.
+                    self.exit_code = Some(133);
                     return RunResult::Exited(133);
                 }
                 StopReason::Trap(e) => return RunResult::Trap(e),
@@ -209,5 +223,70 @@ impl Machine {
                 StopReason::Wfi => unreachable!("WFI stop without system mode"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestHost;
+
+    impl Host for TestHost {
+        fn write_out(&mut self, _fd: i32, _bytes: &[u8]) {}
+    }
+
+    fn machine(instructions: &[u32]) -> Machine {
+        Machine {
+            cpu: Cpu::new(),
+            mem: instructions
+                .iter()
+                .flat_map(|instruction| instruction.to_le_bytes())
+                .collect(),
+            brk: 0,
+            brk_start: 0,
+            mmap_top: (instructions.len() * 4) as u64,
+            exit_code: None,
+            icache_flush_pending: false,
+        }
+    }
+
+    #[test]
+    fn syscall_stops_still_consume_instruction_fuel() {
+        let mut machine = machine(&[0x0000_0073; 4]);
+        machine.cpu.x[17] = 172; // getpid
+
+        assert!(matches!(machine.run(&mut TestHost, 1), RunResult::Budget));
+        assert_eq!(machine.cpu.insn_count, 1);
+        assert_eq!(machine.cpu.pc, 4);
+        assert_eq!(machine.cpu.x[10], 42);
+    }
+
+    #[test]
+    fn terminal_stops_take_priority_at_the_exact_budget_boundary() {
+        let mut exiting = machine(&[0x0000_0073]);
+        exiting.cpu.x[17] = 93;
+        exiting.cpu.x[10] = 7;
+        assert!(matches!(
+            exiting.run(&mut TestHost, 1),
+            RunResult::Exited(7)
+        ));
+        assert_eq!(exiting.exit_code, Some(7));
+
+        let mut breaking = machine(&[0x0010_0073]);
+        assert!(matches!(
+            breaking.run(&mut TestHost, 1),
+            RunResult::Exited(133)
+        ));
+        assert_eq!(breaking.exit_code, Some(133));
+    }
+
+    #[test]
+    fn zero_budget_has_no_cpu_side_effects() {
+        let mut machine = machine(&[0x0000_0073]);
+        machine.cpu.x[17] = 172;
+        assert!(matches!(machine.run(&mut TestHost, 0), RunResult::Budget));
+        assert_eq!(machine.cpu.pc, 0);
+        assert_eq!(machine.cpu.insn_count, 0);
     }
 }

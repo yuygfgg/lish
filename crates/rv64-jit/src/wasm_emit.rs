@@ -5,14 +5,16 @@ pub struct WasmModule {
     code: Vec<u8>,
     n_locals_i64: u32,
     n_locals_i32: u32,
-    /// Import `env.tlb_fill: (i64 va, i32 store) -> i64` and call it on a
-    /// fused-TLB miss. It resolves to the host module's own exported function,
-    /// so the call is wasm->wasm with no JS frame.
+    /// Import `env.tlb_fill: (i32 context, i64 va, i32 store) -> i64` and
+    /// call it on a fused-TLB miss. The explicit execution context keeps the
+    /// generated module independent of the host's machine globals. It resolves
+    /// to the host module's own exported function, so the call is wasm->wasm
+    /// with no JS frame.
     wants_tlb_fill: bool,
     /// Import `env.__indirect_function_table` so the block can tail-call the
     /// next compiled block directly (see emit_chain_exit).
     wants_table: bool,
-    /// Import `env.chain_next: (i32 state) -> ()` — the host module's
+    /// Import `env.chain_next: (i32 context) -> ()` — the host module's
     /// dispatch-line transfer (see rv64-wasm chain_next). A FUNCTION import
     /// like tlb_fill, deliberately NOT the table: table-importing modules
     /// made every table.set O(importing instances) on V8.
@@ -131,6 +133,11 @@ pub const F32_CONVERT_I64_S: u8 = 0xb4;
 pub const F32_CONVERT_I64_U: u8 = 0xb5;
 pub const I32_TRUNC_F32_S: u8 = 0xa8;
 pub const I64_NE_: u8 = 0x52;
+
+// Generated-module ABI. Keep single blocks and batches on the same canonical
+// type declarations so direct calls and table slots remain interchangeable.
+const BLOCK_FUNCTION_TYPE: &[u8] = &[0x60, 1, 0x7f, 0];
+const TLB_FILL_FUNCTION_TYPE: &[u8] = &[0x60, 3, 0x7f, 0x7e, 0x7f, 1, 0x7e];
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -297,7 +304,8 @@ impl WasmModule {
         self
     }
 
-    /// call $tlb_fill — pops (i64 va, i32 store), pushes the i64 offset or -1.
+    /// call $tlb_fill — pops (i32 context, i64 va, i32 store), pushes the i64
+    /// offset or -1.
     pub fn call_tlb_fill(&mut self) -> &mut Self {
         self.code.push(0x10);
         uleb(&mut self.code, 0);
@@ -404,20 +412,20 @@ impl WasmModule {
 
     /// Finish: wrap the instruction stream into a complete wasm module:
     /// - import "env" "memory" (memory 1)
-    /// - export "run": [] -> [] with n i64 locals
+    /// - export "run": (i32 context) -> () with n i64 locals
     pub fn finish(self) -> Vec<u8> {
         let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0]; // magic + version
 
         // type section: one type: (i32) -> [].
-        // The parameter is the emulator-state pointer: the host passes it so
+        // The parameter is the execution-context pointer: the host passes it so
         // the pointer visibly escapes into the generated code, which stops
         // LLVM from caching CPU state in registers across block calls.
         let n_types = 1 + u8::from(self.wants_tlb_fill) + u8::from(self.helper.is_some());
         let mut sec = vec![n_types]; // count
-        sec.extend_from_slice(&[0x60, 1, 0x7f, 0]);
+        sec.extend_from_slice(BLOCK_FUNCTION_TYPE);
         if self.wants_tlb_fill {
-            // type 1: (i64, i32) -> i64
-            sec.extend_from_slice(&[0x60, 2, 0x7e, 0x7f, 1, 0x7e]);
+            // type 1: (i32 context, i64 va, i32 store) -> i64
+            sec.extend_from_slice(TLB_FILL_FUNCTION_TYPE);
         }
         if self.helper.is_some() {
             // helper type: () -> i32 (last type index)
@@ -535,8 +543,11 @@ pub fn finish_batch(bodies: Vec<(Vec<u8>, u32, u32)>) -> Vec<u8> {
     let n = bodies.len();
     let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
 
-    // types: 0 = (i32) -> (), 1 = tlb (i64, i32) -> i64
-    let sec_types: Vec<u8> = vec![2, 0x60, 1, 0x7f, 0, 0x60, 2, 0x7e, 0x7f, 1, 0x7e];
+    // types: 0 = (i32 context) -> (),
+    // 1 = tlb (i32 context, i64 va, i32 store) -> i64
+    let mut sec_types = vec![2];
+    sec_types.extend_from_slice(BLOCK_FUNCTION_TYPE);
+    sec_types.extend_from_slice(TLB_FILL_FUNCTION_TYPE);
     section(&mut m, 1, &sec_types);
 
     // imports: tlb_fill (func 0), memory

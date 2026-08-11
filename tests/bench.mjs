@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const { RV64Debug: RV64 } = await import(join(root, "web/rv64.js"));
+const { RV64Debug: RV64, Stop } = await import(join(root, "web/rv64.js"));
 const wasmBytes = await readFile(
   join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"),
 );
@@ -38,6 +38,19 @@ function best(runs) {
   return runs.reduce((a, b) => (b.ms < a.ms ? b : a));
 }
 
+function runUserWithinBudget(vm, budget) {
+  let remaining = BigInt(budget);
+  while (remaining > 0n) {
+    const before = vm.userInsnCount();
+    const stop = vm.runUser(remaining);
+    const retired = vm.userInsnCount() - before;
+    if (stop !== Stop.YIELD || retired >= remaining) return stop;
+    if (retired === 0n) throw new Error("user-mode yield made no progress");
+    remaining -= retired;
+  }
+  return Stop.YIELD;
+}
+
 // ---- user-mode workloads ----
 const benchElf = new Uint8Array(
   await readFile(
@@ -54,7 +67,12 @@ for (const [key, argv] of [
     vm.onWrite = () => {};
     vm.loadElf(benchElf, argv);
     const t0 = performance.now();
-    vm.runUser(2_000_000_000n);
+    const stop = runUserWithinBudget(vm, 2_000_000_000n);
+    if (stop !== Stop.EXITED || vm.userExitCode() !== 0) {
+      throw new Error(
+        `user benchmark did not exit cleanly: stop=${stop} exit=${vm.userExitCode()}`,
+      );
+    }
     runs.push(stats(vm, t0, performance.now(), vm.userInsnCount()));
   }
   results[key] = best(runs);

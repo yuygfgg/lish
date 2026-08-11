@@ -34,7 +34,11 @@ skip() {
 }
 
 note "1/8 cargo tests"
-cargo test --workspace --release -q || FAILED=1
+# Testing the whole workspace in one Cargo invocation also asks macOS to link
+# rv64-wasm as a native cdylib. Its host symbols are WebAssembly imports, so
+# only the Rust test harness has a native link target.
+cargo test --workspace --exclude rv64-wasm --release -q || FAILED=1
+cargo test -p rv64-wasm --lib --release -q || FAILED=1
 
 note "2/8 guest builds"
 for g in hello-nostd hello-std fpu-test bench; do
@@ -88,6 +92,7 @@ note "7/8 wasm build + smoke"
 if command -v node >/dev/null 2>&1; then
     node tests/vs-v86/harness-selftest.mjs || FAILED=1
     node tests/jit-code-store.mjs || FAILED=1
+    node tests/host-callback-boundary.mjs || FAILED=1
     if command -v zig >/dev/null 2>&1 || command -v "${PREFIX}gcc" >/dev/null 2>&1; then
         tools/build-guest-benchmarks.sh || FAILED=1
     else
@@ -95,6 +100,7 @@ if command -v node >/dev/null 2>&1; then
     fi
     cargo build --release -q -p rv64-wasm --target wasm32-unknown-unknown || FAILED=1
     node tests/jit-module-bench.mjs || FAILED=1
+    node tests/virt-jit.mjs || FAILED=1
     node tests/http-relay.mjs || FAILED=1
     node tests/wasm-smoke.mjs || FAILED=1
     node tests/jit-differential.mjs || FAILED=1

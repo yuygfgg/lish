@@ -4,6 +4,9 @@
 // No bundler, no wasm-bindgen glue; works as an ES module in browsers and Node.
 
 export const Stop = Object.freeze({
+  /** Resume execution: fuel ended or host events were delivered. */
+  YIELD: 0,
+  /** Backward-compatible name for YIELD. */
   BUDGET: 0,
   ECALL: 1,
   BREAK: 2,
@@ -17,6 +20,52 @@ const DEFAULT_JIT_LIMITS = Object.freeze({
   maxBytes: 128 * 1024 * 1024,
   growSlots: 4096,
 });
+
+// These exports can emit a large stream of host events. Deliver their queued
+// events before the public run method returns. All other Wasm entries use the
+// microtask fallback so a host import never calls application code reentrantly.
+const SYNCHRONOUS_HOST_DRAIN_EXPORTS = new Set([
+  "user_run",
+  "run",
+  "sys_run",
+  "virt_run",
+]);
+
+// Generated JIT modules call these with an ephemeral execution context. They
+// are internal callbacks, not safe low-level entry points for embedders.
+const INTERNAL_WASM_CALLBACK_EXPORTS = new Set([
+  "chain_next",
+  "full_system_dispatch_abort",
+  "jit_tlb_fill",
+]);
+
+class OwnerReference {
+  constructor(value) {
+    if (typeof globalThis.WeakRef === "function") {
+      this.weakTarget = new globalThis.WeakRef(value);
+      this.weakStore = new globalThis.WeakRef(value.jitCodeStore);
+      this.strongTarget = undefined;
+    } else {
+      this.weakTarget = undefined;
+      this.weakStore = undefined;
+      this.strongTarget = value;
+    }
+  }
+
+  deref() {
+    return this.weakTarget?.deref() ?? this.strongTarget;
+  }
+
+  derefStore() {
+    return this.weakStore?.deref() ?? this.strongTarget?.jitCodeStore;
+  }
+
+  clear() {
+    this.weakTarget = undefined;
+    this.weakStore = undefined;
+    this.strongTarget = undefined;
+  }
+}
 
 /**
  * Owns all dynamically compiled WebAssembly functions for one VM.
@@ -43,14 +92,24 @@ export class JitCodeStore {
     this.free = [];
     this.owners = new Map();
     this.slotOwners = new Map();
-    this.pending = new Map();
+    this.retirements = new Map();
+    this.reservations = new Map();
     this.nextOwner = 1;
+    this.nextReservation = 1;
     this.generation = 0;
     this.liveSlots = 0;
     this.liveBytes = 0;
+    this.pendingSlots = 0;
+    this.pendingBytes = 0;
     this.peakModules = 0;
     this.peakSlots = 0;
     this.peakBytes = 0;
+    this.peakPendingModules = 0;
+    this.peakPendingSlots = 0;
+    this.peakPendingBytes = 0;
+    this.peakCommittedModules = 0;
+    this.peakCommittedSlots = 0;
+    this.peakCommittedBytes = 0;
     this.emittedBytes = 0;
     this.registeredModules = 0;
     this.retiredModules = 0;
@@ -59,14 +118,18 @@ export class JitCodeStore {
     this.evictedSlots = 0;
     this.capacityRejects = 0;
     this.registrationFailures = 0;
+    this.destroyed = false;
   }
 
   canRegister(slotCount, byteLength) {
-    return Number.isSafeInteger(slotCount) &&
+    return !this.destroyed &&
+      Number.isSafeInteger(slotCount) &&
       slotCount > 0 &&
-      this.owners.size < this.limits.maxModules &&
-      this.liveSlots + slotCount <= this.limits.maxSlots &&
-      this.liveBytes + byteLength <= this.limits.maxBytes &&
+      Number.isSafeInteger(byteLength) &&
+      byteLength >= 0 &&
+      this.owners.size + this.reservations.size < this.limits.maxModules &&
+      this.liveSlots + this.pendingSlots + slotCount <= this.limits.maxSlots &&
+      this.liveBytes + this.pendingBytes + byteLength <= this.limits.maxBytes &&
       this.#hasRun(slotCount);
   }
 
@@ -75,12 +138,82 @@ export class JitCodeStore {
       this.capacityRejects++;
       return -2;
     }
+    const functions = this.#getFunctions(instance, exportNames);
+    const base = this.#allocate(functions.length);
+    return this.#install(base, functions, byteLength);
+  }
+
+  /** Reserve bounded capacity and table slots for one asynchronous module. */
+  reserve(slotCount, byteLength) {
+    if (!this.canRegister(slotCount, byteLength)) {
+      this.capacityRejects++;
+      return null;
+    }
+    const base = this.#allocate(slotCount);
+    try {
+      const reservation = Object.freeze({
+        id: this.nextReservation++,
+        generation: this.generation,
+        base,
+        slotCount,
+        byteLength,
+      });
+      this.reservations.set(reservation, reservation);
+      this.pendingSlots += slotCount;
+      this.pendingBytes += byteLength;
+      this.#recordPendingPeaks();
+      return reservation;
+    } catch (error) {
+      this.#releaseRun(base, slotCount);
+      throw error;
+    }
+  }
+
+  /** Release an asynchronous module reservation that did not become live. */
+  releaseReservation(reservation) {
+    const active = this.reservations.get(reservation);
+    if (active === undefined) return false;
+    this.reservations.delete(reservation);
+    this.pendingSlots -= active.slotCount;
+    this.pendingBytes -= active.byteLength;
+    this.#releaseRun(active.base, active.slotCount);
+    return true;
+  }
+
+  /** Atomically turn an asynchronous reservation into a live module owner. */
+  registerReserved(reservation, instance, exportNames) {
+    const active = this.reservations.get(reservation);
+    if (active === undefined) {
+      throw new TypeError("JIT reservation is not active");
+    }
+    if (active.generation !== this.generation) {
+      this.releaseReservation(reservation);
+      return -1;
+    }
+    try {
+      if (exportNames.length !== active.slotCount) {
+        this.registrationFailures++;
+        throw new RangeError("JIT reservation slot count does not match its exports");
+      }
+      const functions = this.#getFunctions(instance, exportNames);
+      this.#consumeReservation(active);
+      return this.#install(active.base, functions, active.byteLength);
+    } catch (error) {
+      this.releaseReservation(reservation);
+      throw error;
+    }
+  }
+
+  #getFunctions(instance, exportNames) {
     const functions = exportNames.map((name) => instance.exports[name]);
     if (functions.some((fn) => typeof fn !== "function")) {
       this.registrationFailures++;
       throw new TypeError("JIT module has a missing function export");
     }
-    const base = this.#allocate(functions.length);
+    return functions;
+  }
+
+  #install(base, functions, byteLength) {
     const ownerId = this.nextOwner++;
     const owner = {
       bytes: byteLength,
@@ -108,23 +241,21 @@ export class JitCodeStore {
     this.liveBytes += byteLength;
     this.emittedBytes += byteLength;
     this.registeredModules++;
-    this.peakModules = Math.max(this.peakModules, this.owners.size);
-    this.peakSlots = Math.max(this.peakSlots, this.liveSlots);
-    this.peakBytes = Math.max(this.peakBytes, this.liveBytes);
+    this.#recordLivePeaks();
     return base;
   }
 
   /** Queue one slot for cleanup. reason=1 identifies policy eviction. */
   retire(slot, reason = 0) {
     if (!this.slotOwners.has(slot)) return;
-    this.pending.set(slot, Math.max(this.pending.get(slot) ?? 0, reason));
+    this.retirements.set(slot, Math.max(this.retirements.get(slot) ?? 0, reason));
   }
 
   /** Clear queued slots at a JavaScript boundary, never in a Wasm import. */
   flushRetired() {
-    if (this.pending.size === 0) return;
-    const slots = [...this.pending].sort((a, b) => a[0] - b[0]);
-    this.pending.clear();
+    if (this.retirements.size === 0) return;
+    const slots = [...this.retirements].sort((a, b) => a[0] - b[0]);
+    this.retirements.clear();
     const released = [];
     for (const [slot, reason] of slots) {
       const ownerId = this.slotOwners.get(slot);
@@ -154,15 +285,30 @@ export class JitCodeStore {
   }
 
   clear() {
+    if (this.destroyed) return;
     this.generation++;
-    for (const slot of this.slotOwners.keys()) this.pending.set(slot, 0);
+    for (const slot of this.slotOwners.keys()) this.retirements.set(slot, 0);
     this.flushRetired();
+  }
+
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.generation++;
+    for (const slot of this.slotOwners.keys()) this.retirements.set(slot, 0);
+    this.flushRetired();
+    for (const reservation of [...this.reservations.keys()]) {
+      this.releaseReservation(reservation);
+    }
   }
 
   snapshot() {
     return Object.freeze({
       liveModules: this.owners.size,
       liveSlots: this.liveSlots,
+      pendingModules: this.reservations.size,
+      pendingSlots: this.pendingSlots,
+      pendingBytes: this.pendingBytes,
       freeSlots: this.free.reduce((sum, run) => sum + run.length, 0),
       tableHighWater: this.next - this.base,
       tableCapacity: this.table.length - this.base,
@@ -171,6 +317,12 @@ export class JitCodeStore {
       peakModules: this.peakModules,
       peakSlots: this.peakSlots,
       peakBytes: this.peakBytes,
+      peakPendingModules: this.peakPendingModules,
+      peakPendingSlots: this.peakPendingSlots,
+      peakPendingBytes: this.peakPendingBytes,
+      peakCommittedModules: this.peakCommittedModules,
+      peakCommittedSlots: this.peakCommittedSlots,
+      peakCommittedBytes: this.peakCommittedBytes,
       registeredModules: this.registeredModules,
       retiredModules: this.retiredModules,
       retiredSlots: this.retiredSlots,
@@ -178,8 +330,47 @@ export class JitCodeStore {
       evictedSlots: this.evictedSlots,
       capacityRejects: this.capacityRejects,
       registrationFailures: this.registrationFailures,
+      destroyed: this.destroyed,
       limits: this.limits,
     });
+  }
+
+  #consumeReservation(reservation) {
+    this.reservations.delete(reservation);
+    this.pendingSlots -= reservation.slotCount;
+    this.pendingBytes -= reservation.byteLength;
+  }
+
+  #recordLivePeaks() {
+    this.peakModules = Math.max(this.peakModules, this.owners.size);
+    this.peakSlots = Math.max(this.peakSlots, this.liveSlots);
+    this.peakBytes = Math.max(this.peakBytes, this.liveBytes);
+    this.#recordCommittedPeaks();
+  }
+
+  #recordPendingPeaks() {
+    this.peakPendingModules = Math.max(
+      this.peakPendingModules,
+      this.reservations.size,
+    );
+    this.peakPendingSlots = Math.max(this.peakPendingSlots, this.pendingSlots);
+    this.peakPendingBytes = Math.max(this.peakPendingBytes, this.pendingBytes);
+    this.#recordCommittedPeaks();
+  }
+
+  #recordCommittedPeaks() {
+    this.peakCommittedModules = Math.max(
+      this.peakCommittedModules,
+      this.owners.size + this.reservations.size,
+    );
+    this.peakCommittedSlots = Math.max(
+      this.peakCommittedSlots,
+      this.liveSlots + this.pendingSlots,
+    );
+    this.peakCommittedBytes = Math.max(
+      this.peakCommittedBytes,
+      this.liveBytes + this.pendingBytes,
+    );
   }
 
   #hasRun(length) {
@@ -239,9 +430,35 @@ export class JitCodeStore {
 // and differential tests. This is intentionally not the supported embedding
 // API; applications should use RV64 below.
 export class RV64Debug {
+  #wasmExports;
+  #generatedModuleImports;
+  #wasmCallDepth = 0;
+  #hostCalls = [];
+  #hostDrainScheduled = false;
+  #drainingHostCalls = false;
+  #deferredHostFailure;
+  #hasDeferredHostFailure = false;
+  #asyncOwners = new Set();
+
   /** @param {WebAssembly.Instance} instance */
   constructor(instance) {
-    this.ex = instance.exports;
+    this.#wasmExports = instance.exports;
+    const exports = Object.create(null);
+    for (const [name, value] of Object.entries(this.#wasmExports)) {
+      if (INTERNAL_WASM_CALLBACK_EXPORTS.has(name)) continue;
+      const exposed = typeof value === "function"
+        ? (...args) => {
+            this.#throwDeferredHostFailure();
+            return this.#callWasm(
+              value,
+              args,
+              SYNCHRONOUS_HOST_DRAIN_EXPORTS.has(name),
+            );
+          }
+        : value;
+      Object.defineProperty(exports, name, { enumerable: true, value: exposed });
+    }
+    this.ex = Object.freeze(exports);
     /** Override to capture guest console output: (fd, Uint8Array) => void */
     this.onWrite = (fd, bytes) => {
       const text = new TextDecoder().decode(bytes);
@@ -265,6 +482,218 @@ export class RV64Debug {
     this.jitRetirementFlushScheduled = false;
   }
 
+  #jitModuleImports() {
+    return (this.#generatedModuleImports ??= {
+      env: {
+        memory: this.#wasmExports.memory,
+        tlb_fill: this.#wasmExports.jit_tlb_fill,
+        chain_next: this.#wasmExports.chain_next,
+        __indirect_function_table: this.#wasmExports.__indirect_function_table,
+      },
+    });
+  }
+
+  #retainAsyncOwner() {
+    const owner = new OwnerReference(this);
+    this.#asyncOwners.add(owner);
+    return owner;
+  }
+
+  static #instantiateAsyncJit(owner, module) {
+    const target = owner.deref();
+    if (!target || target.jitCodeStore.destroyed) return -1;
+    return new WebAssembly.Instance(module, target.#jitModuleImports());
+  }
+
+  #callWasm(fn, args, synchronousDrain) {
+    if (this.#wasmCallDepth !== 0) {
+      throw new Error("reentrant Wasm calls are not allowed");
+    }
+
+    this.#wasmCallDepth = 1;
+    let result;
+    let failure;
+    let failed = false;
+    let wasmFailed = false;
+    const recordFailure = (error) => {
+      if (!failed) {
+        failure = error;
+        failed = true;
+      }
+    };
+    try {
+      result = fn(...args);
+    } catch (error) {
+      wasmFailed = true;
+      recordFailure(error);
+    }
+    if (wasmFailed) {
+      try {
+        this.#wasmExports.full_system_dispatch_abort?.();
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
+    this.#wasmCallDepth = 0;
+
+    if (synchronousDrain) {
+      try {
+        if (this.jitCodeStore) this.flushJitRetirements();
+      } catch (error) {
+        recordFailure(error);
+      }
+      try {
+        this.#drainHostCalls();
+      } catch (error) {
+        recordFailure(error);
+      }
+    } else {
+      this.#scheduleHostDrain();
+    }
+    if (failed) throw failure;
+    return result;
+  }
+
+  #deferHostCall(fn, receiver, args) {
+    this.#hostCalls.push({ fn, receiver, args });
+    if (this.#wasmCallDepth === 0) this.#scheduleHostDrain();
+  }
+
+  #throwDeferredHostFailure() {
+    if (!this.#hasDeferredHostFailure) return;
+    const error = this.#deferredHostFailure;
+    this.#deferredHostFailure = undefined;
+    this.#hasDeferredHostFailure = false;
+    throw error;
+  }
+
+  #scheduleHostDrain() {
+    if (
+      this.#hostCalls.length === 0 ||
+      this.#hostDrainScheduled ||
+      this.#drainingHostCalls
+    ) {
+      return;
+    }
+    this.#hostDrainScheduled = true;
+    queueMicrotask(() => {
+      this.#hostDrainScheduled = false;
+      if (this.#wasmCallDepth !== 0) {
+        this.#scheduleHostDrain();
+        return;
+      }
+      try {
+        this.#drainHostCalls();
+      } catch (error) {
+        if (!this.#hasDeferredHostFailure) {
+          this.#deferredHostFailure = error;
+          this.#hasDeferredHostFailure = true;
+        }
+      }
+    });
+  }
+
+  #drainHostCalls() {
+    if (this.#wasmCallDepth !== 0 || this.#drainingHostCalls) return;
+    this.#drainingHostCalls = true;
+    let firstFailure;
+    let failed = false;
+    try {
+      while (this.#hostCalls.length !== 0) {
+        const calls = this.#hostCalls.splice(0);
+        for (const { fn, receiver, args } of calls) {
+          try {
+            Reflect.apply(fn, receiver, args);
+          } catch (error) {
+            if (!failed) {
+              firstFailure = error;
+              failed = true;
+            }
+          }
+        }
+      }
+    } finally {
+      this.#drainingHostCalls = false;
+    }
+    if (failed) throw firstFailure;
+  }
+
+  #reportAsyncJitError(message, error) {
+    try {
+      console.warn(message, error);
+    } catch {
+      // Diagnostics must not turn a contained background failure into an
+      // unhandled Promise rejection.
+    }
+  }
+
+  static #reportAsyncJitTaskFailure(error) {
+    try {
+      console.warn("async jit task failed:", error);
+    } catch {
+      // A fire-and-forget task must never create another rejected Promise.
+    }
+  }
+
+  static async #completeAsyncJit(ticket, completion, reservation, owner) {
+    try {
+      let result;
+      try {
+        result = await completion;
+      } catch (error) {
+        const target = owner.deref();
+        if (target) target.#reportAsyncJitError("async jit register failed:", error);
+        result = -1;
+      }
+
+      const target = owner.deref();
+      if (!target || target.jitCodeStore.destroyed) return;
+
+      let idx = typeof result === "number" ? result : -1;
+      if (typeof result !== "number") {
+        try {
+          idx = target.jitCodeStore.registerReserved(
+            reservation,
+            result,
+            ["run"],
+          );
+          if (idx >= 0) target.jitBlocks = (target.jitBlocks ?? 0) + 1;
+        } catch (error) {
+          target.#reportAsyncJitError("async jit register failed:", error);
+          idx = -1;
+        }
+      }
+
+      let orphan = idx >= 0 ? idx : -1;
+      try {
+        // Installation and Rust ownership handoff share this Promise job, so
+        // clear/reset cannot reuse the slot between the two operations.
+        target.#callWasm(target.#wasmExports.sys_sb_ready, [ticket, idx], false);
+        orphan = -1;
+      } catch (error) {
+        if (orphan >= 0) target.jitCodeStore.retire(orphan);
+        target.#reportAsyncJitError("async jit completion failed:", error);
+      } finally {
+        try {
+          target.flushJitRetirements();
+        } catch (error) {
+          target.#reportAsyncJitError("async jit retirement failed:", error);
+        }
+      }
+    } finally {
+      const target = owner.deref();
+      try {
+        if (reservation !== null) {
+          owner.derefStore()?.releaseReservation(reservation);
+        }
+      } catch (error) {
+        if (target) target.#reportAsyncJitError("async jit cleanup failed:", error);
+      }
+      if (target) target.#asyncOwners.delete(owner);
+      owner.clear();
+    }
+  }
+
   /** Instantiate from wasm bytes (ArrayBuffer/TypedArray/Response). */
   static async create(wasmSource, jitOptions = {}) {
     let vm;
@@ -272,43 +701,47 @@ export class RV64Debug {
       env: {
         host_write: (fd, ptr, len) => {
           // Copy out: the view dies if wasm memory grows.
-          const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
-          vm.onWrite(fd, bytes);
+          const bytes = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len).slice();
+          vm.#deferHostCall(vm.onWrite, vm, [fd, bytes]);
         },
         // One Ethernet frame the guest transmitted. Goes straight out the
         // relay socket — one binary message per frame, websockproxy's protocol.
         host_net_send: (ptr, len) => {
-          const frame = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
-          vm.onNetSend(frame);
+          const frame = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len).slice();
+          vm.#deferHostCall(vm.onNetSend, vm, [frame]);
         },
         // HTTP egress for the guest's in-process proxy. Performed with fetch(),
         // the browser's only egress primitive — and the reason the proxy design
         // reaches the network with no external infrastructure. An embedder can
         // intercept instead by setting `onHttpRequest`.
         host_http_request: (id, ptr, len) => {
-          const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
-          if (vm.onHttpRequest) vm.onHttpRequest(id, bytes);
-          else vm.performHttp(id, decodeRequest(bytes), bytes);
+          const bytes = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len).slice();
+          if (vm.onHttpRequest) {
+            vm.#deferHostCall(vm.onHttpRequest, vm, [id, bytes]);
+          } else {
+            vm.#deferHostCall(vm.performHttp, vm, [id, decodeRequest(bytes), bytes]);
+          }
         },
         host_wisp_open: (id, ptr, port) => {
-          const address = new Uint8Array(vm.ex.memory.buffer, ptr, 4).slice();
-          vm.onWispOpen(id, address, port);
+          const address = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, 4).slice();
+          vm.#deferHostCall(vm.onWispOpen, vm, [id, address, port]);
         },
         host_wisp_data: (id, ptr, len) => {
-          const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
-          vm.onWispData(id, bytes);
+          const bytes = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len).slice();
+          vm.#deferHostCall(vm.onWispData, vm, [id, bytes]);
         },
-        host_wisp_close: (id) => vm.onWispClose(id),
+        host_wisp_close: (id) => vm.#deferHostCall(vm.onWispClose, vm, [id]),
         host_wisp_datagram: (id, addressPtr, port, dataPtr, len) => {
-          const address = new Uint8Array(vm.ex.memory.buffer, addressPtr, 4).slice();
-          const bytes = new Uint8Array(vm.ex.memory.buffer, dataPtr, len).slice();
-          vm.onWispDatagram(id, address, port, bytes);
+          const memory = vm.#wasmExports.memory.buffer;
+          const address = new Uint8Array(memory, addressPtr, 4).slice();
+          const bytes = new Uint8Array(memory, dataPtr, len).slice();
+          vm.#deferHostCall(vm.onWispDatagram, vm, [id, address, port, bytes]);
         },
         host_now_ms: () =>
           typeof performance !== "undefined" ? performance.now() : Date.now(),
         host_unix_ms: () => Date.now(),
         host_random: (ptr, len) => {
-          const buf = new Uint8Array(vm.ex.memory.buffer, ptr, len);
+          const buf = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len);
           if (!globalThis.crypto?.getRandomValues) {
             throw new Error("cryptographic randomness is unavailable");
           }
@@ -328,9 +761,9 @@ export class RV64Debug {
           try {
             const t0 = performance.now();
             const bytes = new Uint8Array(
-              vm.ex.memory.buffer,
-              vm.ex.jit_out_ptr(),
-              vm.ex.jit_out_len(),
+              vm.#wasmExports.memory.buffer,
+              vm.#wasmExports.jit_out_ptr(),
+              vm.#wasmExports.jit_out_len(),
             ).slice();
             vm.jitRegCount = (vm.jitRegCount ?? 0) + 1;
             vm.jitRegBytes = (vm.jitRegBytes ?? 0) + bytes.length;
@@ -340,17 +773,9 @@ export class RV64Debug {
             }
             const mod = new WebAssembly.Module(bytes);
             vm.jitRegMs = (vm.jitRegMs ?? 0) + (performance.now() - t0);
-            const inst = new WebAssembly.Instance(mod, {
-              // tlb_fill: blocks that probe the guest TLB inline call back
-              // into the core to walk the page tables on a miss (wasm->wasm,
-              // no JS frame) instead of bailing to the interpreter.
-              env: {
-                memory: vm.ex.memory,
-                tlb_fill: vm.ex.jit_tlb_fill,
-                chain_next: vm.ex.chain_next,
-                __indirect_function_table: vm.ex.__indirect_function_table,
-              },
-            });
+            // tlb_fill passes the block's explicit execution context back to
+            // the core. The page-table walk stays wasm-to-wasm with no JS frame.
+            const inst = new WebAssembly.Instance(mod, vm.#jitModuleImports());
             const idx = vm.jitCodeStore.register(inst, ["run"], bytes.length);
             vm.jitRegTotalMs = (vm.jitRegTotalMs ?? 0) + (performance.now() - t0);
             vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
@@ -366,17 +791,18 @@ export class RV64Debug {
         host_jit_register_batch: (n) => {
           try {
             const bytes = new Uint8Array(
-              vm.ex.memory.buffer,
-              vm.ex.jit_out_ptr(),
-              vm.ex.jit_out_len(),
+              vm.#wasmExports.memory.buffer,
+              vm.#wasmExports.jit_out_ptr(),
+              vm.#wasmExports.jit_out_len(),
             ).slice();
             if (!vm.jitCodeStore.canRegister(n, bytes.length)) {
               vm.jitCodeStore.capacityRejects++;
               return -2;
             }
-            const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
-              env: { memory: vm.ex.memory, tlb_fill: vm.ex.jit_tlb_fill },
-            });
+            const inst = new WebAssembly.Instance(
+              new WebAssembly.Module(bytes),
+              vm.#jitModuleImports(),
+            );
             const names = Array.from({ length: n }, (_, j) => "r" + j);
             const base = vm.jitCodeStore.register(inst, names, bytes.length);
             if (base < 0) return base;
@@ -395,47 +821,31 @@ export class RV64Debug {
         // invoked — on the JS microtask queue, i.e. strictly BETWEEN
         // runSystem calls, never during wasm execution.
         host_jit_register_async: (ticket) => {
-          const bytes = new Uint8Array(
-            vm.ex.memory.buffer,
-            vm.ex.jit_out_ptr(),
-            vm.ex.jit_out_len(),
-          ).slice();
-          const generation = vm.jitCodeStore.generation;
-          if (!vm.jitCodeStore.canRegister(1, bytes.length)) {
-            vm.jitCodeStore.capacityRejects++;
-            vm.ex.sys_sb_ready(ticket, -2);
-            vm.flushJitRetirements();
-            return;
+          let reservation = null;
+          let completion;
+          const owner = vm.#retainAsyncOwner();
+          try {
+            const bytes = new Uint8Array(
+              vm.#wasmExports.memory.buffer,
+              vm.#wasmExports.jit_out_ptr(),
+              vm.#wasmExports.jit_out_len(),
+            ).slice();
+            reservation = vm.jitCodeStore.reserve(1, bytes.length);
+            if (reservation === null) {
+              completion = Promise.resolve(-2);
+            } else {
+              const instantiate = RV64Debug.#instantiateAsyncJit.bind(undefined, owner);
+              completion = WebAssembly.compile(bytes).then(instantiate);
+            }
+          } catch (error) {
+            if (reservation !== null) {
+              vm.jitCodeStore.releaseReservation(reservation);
+            }
+            vm.#reportAsyncJitError("async jit register failed:", error);
+            completion = Promise.resolve(-1);
           }
-          WebAssembly.compile(bytes)
-            .then((mod) =>
-              WebAssembly.instantiate(mod, {
-                env: {
-                  memory: vm.ex.memory,
-                  tlb_fill: vm.ex.jit_tlb_fill,
-                  chain_next: vm.ex.chain_next,
-                  __indirect_function_table: vm.ex.__indirect_function_table,
-                },
-              }),
-            )
-            .then((inst) => {
-              if (generation !== vm.jitCodeStore.generation) {
-                vm.ex.sys_sb_ready(ticket, -1);
-                return;
-              }
-              const idx = vm.jitCodeStore.register(inst, ["run"], bytes.length);
-              if (idx < 0) {
-                vm.ex.sys_sb_ready(ticket, idx);
-                return;
-              }
-              vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
-              vm.ex.sys_sb_ready(ticket, idx);
-            })
-            .catch((e) => {
-              console.warn("async jit register failed:", e);
-              vm.ex.sys_sb_ready(ticket, -1);
-            })
-            .finally(() => vm.flushJitRetirements());
+          const task = RV64Debug.#completeAsyncJit(ticket, completion, reservation, owner);
+          void task.catch(RV64Debug.#reportAsyncJitTaskFailure);
         },
       },
     };
@@ -444,7 +854,7 @@ export class RV64Debug {
         ? await WebAssembly.instantiateStreaming(wasmSource, imports)
         : await WebAssembly.instantiate(wasmSource, imports);
     vm = new RV64Debug(instance);
-    vm.jitCodeStore = new JitCodeStore(vm.ex.__indirect_function_table, jitOptions);
+    vm.jitCodeStore = new JitCodeStore(vm.#wasmExports.__indirect_function_table, jitOptions);
     // Hardware FMA: use f64x2.relaxed_madd for the guest's FMADD family iff
     // the engine validates it AND it is fused on this hardware (the spec
     // allows unfused; only fused is bit-exact). Probe empirically:
@@ -494,7 +904,7 @@ export class RV64Debug {
       // bookkeeping plus two extra call frames per hop. The per-dispatch
       // cost is the bookkeeping itself, not a boundary. RV_TAILCALL=1
       // re-enables for experiments.
-      if (process?.env?.RV_TAILCALL === "1") {
+      if (globalThis.process?.env?.RV_TAILCALL === "1") {
         vm.ex.jit_set_tailcall?.(1);
       }
     } catch {
@@ -527,7 +937,9 @@ export class RV64Debug {
   }
 
   destroyJit() {
-    this.jitCodeStore.clear();
+    for (const owner of this.#asyncOwners) owner.clear();
+    this.#asyncOwners.clear();
+    this.jitCodeStore.destroy();
   }
 
   // ---- user-mode Linux API ----
@@ -554,11 +966,9 @@ export class RV64Debug {
     return loaded;
   }
 
-  /** Run the loaded program; returns a Stop.* code (EXITED when done). */
+  /** Run the loaded program; resume after Stop.YIELD (EXITED when done). */
   runUser(budget = 10_000_000_000n) {
-    const stop = this.ex.user_run(BigInt(budget));
-    this.flushJitRetirements();
-    return stop;
+    return this.ex.user_run(BigInt(budget));
   }
 
   userExitCode() {
@@ -594,9 +1004,7 @@ export class RV64Debug {
 
   /** Run up to `budget` instructions; returns a Stop.* code. */
   run(budget = 1_000_000n) {
-    const stop = this.ex.run(BigInt(budget));
-    this.flushJitRetirements();
-    return stop;
+    return this.ex.run(BigInt(budget));
   }
 
   get pc() {
@@ -933,9 +1341,7 @@ RV64Debug.prototype.performHttpViaRelay = async function (id, encodedRequest) {
 
 /** Run a slice of the booted system. Returns true when powered off. */
 RV64Debug.prototype.runSystem = function (maxInsns = 10_000_000n) {
-  const stopped = this.ex.sys_run(BigInt(maxInsns)) === 1;
-  this.flushJitRetirements();
-  return stopped;
+  return this.ex.sys_run(BigInt(maxInsns)) === 1;
 };
 
 /** Send keyboard input to the guest console. */
@@ -981,6 +1387,7 @@ RV64Debug.prototype.bootVirtLinux = function ({
   this.ex.virt_console_enable(virtioConsole ? 1 : 0);
   this.ex.virt_net_enable(net || proxy ? 1 : 0);
   this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
+  this.jitCodeStore.generation++;
   this.ex.virt_boot(ramMB);
   this.flushJitRetirements();
 };
@@ -1015,6 +1422,7 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
   this.ex.virt_console_enable(virtioConsole ? 1 : 0);
   this.ex.virt_net_enable(net || proxy ? 1 : 0);
   this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
+  this.jitCodeStore.generation++;
   this.ex.virt_boot_direct(ramMB);
   this.flushJitRetirements();
 };
@@ -1022,7 +1430,6 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
 /** Run a slice of the modern virt machine. Returns true when powered off. */
 RV64Debug.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
   const stopped = this.ex.virt_run(BigInt(maxInsns)) === 1;
-  this.flushJitRetirements();
   this.pumpP9();
   return stopped;
 };
@@ -1724,7 +2131,7 @@ export class RV64 {
       this.#core.pc = boot.entry === undefined ? loadAddress : BigInt(boot.entry);
       this.#runSlice = () => {
         const stop = this.#core.run(250_000n);
-        return stop !== Stop.BUDGET;
+        return stop !== Stop.YIELD;
       };
       this.#input = null;
       this.#instructions = () => this.#core.insnCount();

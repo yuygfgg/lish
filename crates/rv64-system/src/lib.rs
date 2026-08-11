@@ -47,6 +47,222 @@ pub const GOLDFISH_RTC_IRQ: u32 = 11;
 /// 10 MHz timebase, like TinyEMU's RTC_FREQ.
 pub const RTC_FREQ: u64 = 10_000_000;
 
+/// Convert a guest-physical RAM range only after proving that both endpoints
+/// fit the host address width and the backing allocation. This check must stay
+/// before every `u64` to `usize` conversion: wasm32 would otherwise alias a
+/// guest address above 4 GiB onto low RAM.
+pub fn checked_ram_range(
+    ram_len: usize,
+    ram_base: u64,
+    addr: u64,
+    len: usize,
+) -> Option<core::ops::Range<usize>> {
+    let offset = addr.checked_sub(ram_base)?;
+    let end = offset.checked_add(u64::try_from(len).ok()?)?;
+    if end > u64::try_from(ram_len).ok()? {
+        return None;
+    }
+    Some(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)
+}
+
+const JIT_PAGE_SHIFT: u32 = 12;
+const JIT_PAGE_SIZE: usize = 1 << JIT_PAGE_SHIFT;
+const INTERPRETER_SYNC_INTERVAL: u64 = 64;
+
+/// Tracks RAM pages that back compiled code and pages written since the last
+/// dispatcher drain.
+///
+/// Dirty flags keep the hot store path idempotent. A guest can write the same
+/// code page many times before the dispatcher regains control, but the
+/// dispatcher only needs one invalidation event for that page.
+#[derive(Clone, Copy, Default)]
+struct JitPageFlags {
+    marked: u64,
+    dirty: u64,
+}
+
+pub struct JitPageState {
+    page_count: usize,
+    flags: Vec<JitPageFlags>,
+    dirty_pages: Vec<u64>,
+    write_generations: Vec<u64>,
+}
+
+impl JitPageState {
+    pub fn new(ram_bytes: usize) -> Self {
+        let page_count = ram_bytes.div_ceil(JIT_PAGE_SIZE);
+        let word_count = page_count.div_ceil(64);
+        Self {
+            page_count,
+            flags: vec![JitPageFlags::default(); word_count],
+            dirty_pages: Vec::new(),
+            write_generations: vec![0; page_count],
+        }
+    }
+
+    #[inline]
+    fn page_for_address(&self, pa: u64) -> Option<usize> {
+        let page = usize::try_from(pa.checked_sub(RAM_BASE)? >> JIT_PAGE_SHIFT).ok()?;
+        (page < self.page_count).then_some(page)
+    }
+
+    #[inline]
+    fn word_and_mask(&self, page: u64) -> Option<(usize, u64)> {
+        let page = usize::try_from(page).ok()?;
+        (page < self.page_count).then_some((page / 64, 1 << (page % 64)))
+    }
+
+    /// Mark the RAM page containing `pa` as a compiled-code page.
+    #[inline]
+    pub fn mark_address(&mut self, pa: u64) {
+        if let Some(page) = self.page_for_address(pa) {
+            self.flags[page / 64].marked |= 1 << (page % 64);
+        }
+    }
+
+    /// Stop tracking compiled code on a physical RAM page number.
+    #[inline]
+    pub fn unmark_page(&mut self, page: u64) {
+        if let Some((word, mask)) = self.word_and_mask(page) {
+            self.flags[word].marked &= !mask;
+        }
+    }
+
+    /// Return true if the physical RAM page number contains compiled code.
+    #[inline]
+    pub fn page_marked(&self, page: u64) -> bool {
+        self.word_and_mask(page)
+            .is_some_and(|(word, mask)| self.flags[word].marked & mask != 0)
+    }
+
+    /// Return true if the RAM page containing `pa` contains compiled code.
+    #[inline]
+    pub fn address_marked(&self, pa: u64) -> bool {
+        self.page_for_address(pa)
+            .is_some_and(|page| self.flags[page / 64].marked & (1 << (page % 64)) != 0)
+    }
+
+    /// Return the write generation for a physical RAM page number.
+    ///
+    /// The generation changes when a marked page first becomes dirty. An
+    /// asynchronous compiler can compare a captured generation at landing to
+    /// reject stale code even if dirty state was drained and the page was
+    /// unmarked and marked again in the meantime.
+    #[inline]
+    pub fn page_generation(&self, page: u64) -> Option<u64> {
+        let page = usize::try_from(page).ok()?;
+        self.write_generations.get(page).copied()
+    }
+
+    /// Record a store if `pa` belongs to a compiled-code page.
+    #[inline]
+    pub fn note_store(&mut self, pa: u64) {
+        if let Some(page) = self.page_for_address(pa) {
+            self.note_page_write(page);
+        }
+    }
+
+    /// Record a device write to every compiled-code page touched by the range.
+    /// CPU stores are naturally page-contained, but DMA buffers can cross page
+    /// boundaries and must invalidate every compiled page they overwrite.
+    pub fn note_write(&mut self, pa: u64, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let Some(last) = pa.checked_add(len as u64 - 1) else {
+            return;
+        };
+        let (Some(first_page), Some(last_page)) =
+            (self.page_for_address(pa), self.page_for_address(last))
+        else {
+            return;
+        };
+        for page in first_page..=last_page {
+            self.note_page_write(page);
+        }
+    }
+
+    #[inline]
+    fn note_page_write(&mut self, page: usize) {
+        let word = page / 64;
+        let mask = 1 << (page % 64);
+        let flags = &mut self.flags[word];
+        if flags.marked & mask != 0 && flags.dirty & mask == 0 {
+            self.write_generations[page] = self.write_generations[page].wrapping_add(1);
+            flags.dirty |= mask;
+            self.dirty_pages.push(page as u64);
+        }
+    }
+
+    #[inline]
+    pub fn has_dirty(&self) -> bool {
+        !self.dirty_pages.is_empty()
+    }
+
+    #[inline]
+    pub fn is_dirty(&self, page: u64) -> bool {
+        self.word_and_mask(page)
+            .is_some_and(|(word, mask)| self.flags[word].dirty & mask != 0)
+    }
+
+    /// Drain dirty physical RAM page numbers in first-write order.
+    pub fn take_dirty(&mut self) -> Vec<u64> {
+        let pages = core::mem::take(&mut self.dirty_pages);
+        for &page in &pages {
+            let (word, mask) = self
+                .word_and_mask(page)
+                .expect("dirty page must belong to guest RAM");
+            self.flags[word].dirty &= !mask;
+        }
+        pages
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterpreterStop {
+    Cpu(StopReason),
+    Compiled,
+}
+
+/// Result of one machine interpreter slice. `idle` means the hart stopped in
+/// WFI and the machine could not advance a deterministic timer internally, so
+/// an embedding should yield until host time or external input changes state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSliceOutcome {
+    pub retired: u64,
+    pub idle: bool,
+}
+
+/// Execute a bulk interpreter slice, or stop exactly after the first
+/// instruction whose successor PC satisfies `compiled`.
+#[inline]
+pub(crate) fn run_cpu_until<B, F>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    max_insns: u64,
+    compiled: &mut Option<F>,
+) -> InterpreterStop
+where
+    B: Bus,
+    F: FnMut(u64) -> bool,
+{
+    let Some(compiled) = compiled.as_mut() else {
+        return InterpreterStop::Cpu(cpu.run(bus, max_insns));
+    };
+
+    let start = cpu.insn_count;
+    while cpu.insn_count - start < max_insns {
+        let stop = cpu.run(bus, 1);
+        if stop != StopReason::Budget {
+            return InterpreterStop::Cpu(stop);
+        }
+        if compiled(cpu.pc) {
+            return InterpreterStop::Compiled;
+        }
+    }
+    InterpreterStop::Cpu(StopReason::Budget)
+}
+
 /// Current Unix-epoch time for native machine embeddings. Browser embeddings
 /// provide the equivalent value through their host ABI.
 #[cfg(not(target_arch = "wasm32"))]
@@ -82,14 +298,7 @@ pub struct SystemBus {
     /// Set when the guest writes an odd value to tohost: value >> 1
     /// (riscv-tests: 0 = pass, n = failing test case number).
     pub htif_exit: Option<u64>,
-    // JIT support: bitset of RAM pages holding compiled code. A store to a
-    // marked page records that page in jit_dirty_pages, so the dispatcher
-    // can drop just the affected blocks (self-modifying code / page reuse).
-    pub jit_pages: Vec<u64>,
-    /// Physical pages (page number = (pa-RAM_BASE)>>12) written since the
-    /// last drain that held compiled code — the dispatcher invalidates just
-    /// those blocks instead of the whole cache.
-    pub jit_dirty_pages: Vec<u64>,
+    pub jit: JitPageState,
 }
 
 impl SystemBus {
@@ -228,7 +437,7 @@ impl SystemBus {
                     if let Some(q) = self.virtio[i].write(off, val) {
                         // QueueNotify: run the virtqueue against RAM.
                         let mut dev = self.virtio.remove(i);
-                        dev.process(q as usize, &mut self.ram, RAM_BASE);
+                        dev.process(q as usize, &mut self.ram, RAM_BASE, &mut self.jit);
                         self.virtio.insert(i, dev);
                     }
                     self.refresh_plic();
@@ -256,7 +465,7 @@ impl SystemBus {
                 continue;
             }
             let mut dev = self.virtio.remove(i);
-            dev.process(0, &mut self.ram, RAM_BASE);
+            dev.process(0, &mut self.ram, RAM_BASE, &mut self.jit);
             self.virtio.insert(i, dev);
             delivered = true;
         }
@@ -286,12 +495,7 @@ impl SystemBus {
 
     /// Mark a RAM page as containing JIT-compiled code.
     pub fn jit_mark_page(&mut self, pa: u64) {
-        if pa >= RAM_BASE {
-            let page = ((pa - RAM_BASE) >> 12) as usize;
-            if let Some(w) = self.jit_pages.get_mut(page / 64) {
-                *w |= 1 << (page % 64);
-            }
-        }
+        self.jit.mark_address(pa);
     }
 
     /// Clear a single compiled-code page's bit (after its blocks are dropped).
@@ -299,44 +503,43 @@ impl SystemBus {
     /// async superblock registration to reject a compile whose source page
     /// was written (and therefore invalidated) while compiling.
     pub fn jit_page_marked(&self, page: u64) -> bool {
-        self.jit_pages
-            .get(page as usize / 64)
-            .is_some_and(|w| w & (1 << (page % 64)) != 0)
+        self.jit.page_marked(page)
     }
 
     pub fn jit_unmark_page(&mut self, page: u64) {
-        if let Some(w) = self.jit_pages.get_mut(page as usize / 64) {
-            *w &= !(1 << (page % 64));
-        }
+        self.jit.unmark_page(page);
     }
 
     /// Take the list of dirtied compiled-code pages (drains it).
     pub fn jit_take_dirty(&mut self) -> Vec<u64> {
-        core::mem::take(&mut self.jit_dirty_pages)
+        self.jit.take_dirty()
+    }
+
+    pub fn jit_has_dirty(&self) -> bool {
+        self.jit.has_dirty()
+    }
+
+    pub fn jit_page_dirty(&self, page: u64) -> bool {
+        self.jit.is_dirty(page)
+    }
+
+    pub fn jit_page_generation(&self, page: u64) -> Option<u64> {
+        self.jit.page_generation(page)
     }
 
     #[inline]
     fn jit_check_store(&mut self, addr: u64) {
-        if addr >= RAM_BASE {
-            let page = ((addr - RAM_BASE) >> 12) as usize;
-            if let Some(w) = self.jit_pages.get(page / 64) {
-                if w & (1 << (page % 64)) != 0 {
-                    self.jit_dirty_pages.push(page as u64);
-                }
-            }
-        }
+        self.jit.note_store(addr);
     }
 
     #[inline]
     fn ram_slice(&mut self, addr: u64, len: usize) -> Option<&mut [u8]> {
         if addr >= RAM_BASE {
-            let off = (addr - RAM_BASE) as usize;
-            if off + len <= self.ram.len() {
-                return Some(&mut self.ram[off..off + len]);
-            }
-        } else if addr >= 0x1000 && (addr as usize) + len <= LOW_RAM_SIZE {
-            let off = addr as usize;
-            return Some(&mut self.low_ram[off..off + len]);
+            let range = checked_ram_range(self.ram.len(), RAM_BASE, addr, len)?;
+            return Some(&mut self.ram[range]);
+        } else if addr >= 0x1000 {
+            let range = checked_ram_range(LOW_RAM_SIZE, 0, addr, len)?;
+            return Some(&mut self.low_ram[range]);
         }
         None
     }
@@ -432,11 +635,8 @@ impl Bus for SystemBus {
         if store {
             // A store to a page holding compiled code must bail so the block is
             // invalidated — so don't fast-path such pages.
-            let ppage = ((pa - RAM_BASE) >> 12) as usize;
-            if let Some(w) = self.jit_pages.get(ppage / 64) {
-                if (w >> (ppage & 63)) & 1 != 0 {
-                    return None;
-                }
+            if self.jit.address_marked(pa) {
+                return None;
             }
         }
         // linear_index = ram.as_ptr() + (pa - RAM_BASE); store off = linear - va.
@@ -450,6 +650,10 @@ pub struct Machine {
     pub bus: SystemBus,
     /// Instructions per mtime tick (insn rate / RTC_FREQ).
     pub insns_per_tick: u64,
+    /// Guest timer ticks accrued while the hart was halted in deterministic
+    /// WFI. Idle time advances the guest clock without inflating the retired
+    /// instruction count reported to the embedding and JIT profiler.
+    pub idle_ticks: u64,
     pub power_off: bool,
     /// Opt-in wall-clock time source (host nanoseconds). `None` (default) =
     /// deterministic instruction-counted time (mtime = insn_count/insns_per_tick),
@@ -565,10 +769,10 @@ impl Machine {
                 htif_console: Vec::new(),
                 power_off: false,
                 htif_exit: None,
-                jit_pages: vec![0u64; (ram_size >> 12).div_ceil(64)],
-                jit_dirty_pages: Vec::new(),
+                jit: JitPageState::new(ram_size),
             },
             insns_per_tick: 10, // pretend 100 Minsn/s against the 10 MHz clock
+            idle_ticks: 0,
             power_off: false,
             wall_ns: None, // deterministic instruction-counted time by default
             wall_anchor_icount: 0,
@@ -581,7 +785,7 @@ impl Machine {
             dev.console_input(bytes);
             // Try to deliver immediately via the RX queue.
             let mut d = self.bus.virtio.remove(0);
-            d.process(0, &mut self.bus.ram, RAM_BASE);
+            d.process(0, &mut self.bus.ram, RAM_BASE, &mut self.bus.jit);
             self.bus.virtio.insert(0, d);
             self.bus.refresh_plic();
         }
@@ -621,30 +825,20 @@ impl Machine {
         self.bus.refresh_plic();
     }
 
+    /// Synchronize device state before a full-system JIT dispatch quantum.
+    pub fn sync_jit_devices(&mut self) {
+        self.sync_devices();
+        self.bus.poll_net_rx();
+        self.power_off = self.bus.power_off;
+    }
+
     /// Run one slice; returns instructions retired.
     pub fn run_slice(&mut self, max_insns: u64) -> u64 {
-        let start = self.cpu.insn_count;
+        self.run_slice_outcome(max_insns).retired
+    }
 
-        // Update timers + interrupt lines before entering the CPU.
-        self.sync_devices();
-        // Frames the host handed us since the last slice may now have buffers.
-        self.bus.poll_net_rx();
-
-        match self.cpu.run(&mut self.bus, max_insns) {
-            StopReason::Wfi => {
-                // Idle: skip time forward to the next timer event.
-                let next = self.bus.mtimecmp;
-                if next != u64::MAX && next > self.bus.mtime {
-                    self.cpu.insn_count += (next - self.bus.mtime) * self.insns_per_tick;
-                }
-            }
-            StopReason::Budget => {}
-            // Full-system mode routes everything else internally.
-            _ => {}
-        }
-        self.sync_devices();
-        self.power_off = self.bus.power_off;
-        self.cpu.insn_count - start
+    pub fn run_slice_outcome(&mut self, max_insns: u64) -> RunSliceOutcome {
+        self.run_slice_inner::<fn(u64) -> bool>(max_insns, None)
     }
 
     /// Interpret up to `max_insns`, but stop as soon as `compiled(pc)` reports
@@ -653,34 +847,63 @@ impl Machine {
     /// the system JIT dispatcher's warm-interp fallback. Runs one instruction at
     /// a time (interrupts/exceptions handled by `cpu.run`), refreshing the clock
     /// only periodically so the per-instruction cost stays near the interpreter's.
-    pub fn run_slice_until(
+    pub fn run_slice_until(&mut self, max_insns: u64, compiled: impl FnMut(u64) -> bool) -> u64 {
+        self.run_slice_until_outcome(max_insns, compiled).retired
+    }
+
+    pub fn run_slice_until_outcome(
         &mut self,
         max_insns: u64,
-        mut compiled: impl FnMut(u64) -> bool,
-    ) -> u64 {
+        compiled: impl FnMut(u64) -> bool,
+    ) -> RunSliceOutcome {
+        self.run_slice_inner(max_insns, Some(compiled))
+    }
+
+    #[inline]
+    fn run_slice_inner<F>(&mut self, max_insns: u64, mut compiled: Option<F>) -> RunSliceOutcome
+    where
+        F: FnMut(u64) -> bool,
+    {
         let start = self.cpu.insn_count;
         self.sync_devices();
         self.bus.poll_net_rx();
-        let mut i = 0u64;
-        while i < max_insns {
-            if let StopReason::Wfi = self.cpu.run(&mut self.bus, 1) {
-                let next = self.bus.mtimecmp;
-                if next != u64::MAX && next > self.bus.mtime {
-                    self.cpu.insn_count += (next - self.bus.mtime) * self.insns_per_tick;
+
+        let stop = if compiled.is_some() {
+            loop {
+                let retired = self.cpu.insn_count - start;
+                if retired >= max_insns {
+                    break InterpreterStop::Cpu(StopReason::Budget);
                 }
-                break;
-            }
-            i = self.cpu.insn_count - start;
-            if compiled(self.cpu.pc) {
-                break; // reached compiled code — hand back to the JIT
-            }
-            if i & 63 == 0 {
+
+                let chunk = (max_insns - retired).min(INTERPRETER_SYNC_INTERVAL);
+                let stop = run_cpu_until(&mut self.cpu, &mut self.bus, chunk, &mut compiled);
+                if stop != InterpreterStop::Cpu(StopReason::Budget) {
+                    break stop;
+                }
                 self.sync_devices();
+            }
+        } else {
+            run_cpu_until(&mut self.cpu, &mut self.bus, max_insns, &mut compiled)
+        };
+
+        let mut idle = false;
+        if stop == InterpreterStop::Cpu(StopReason::Wfi) {
+            // Deterministic execution can advance directly to the next timer
+            // event. Wall-clock execution must yield until the host advances
+            // time or external input wakes the hart.
+            let next = self.bus.mtimecmp;
+            if self.wall_ns.is_none() && next != u64::MAX && next > self.bus.mtime {
+                self.idle_ticks += next - self.bus.mtime;
+            } else {
+                idle = true;
             }
         }
         self.sync_devices();
         self.power_off = self.bus.power_off;
-        self.cpu.insn_count - start
+        RunSliceOutcome {
+            retired: self.cpu.insn_count - start,
+            idle,
+        }
     }
 
     /// Advance the CLINT clock (interrupt lines are sampled live by the CPU
@@ -711,7 +934,7 @@ impl Machine {
                         .min(16384)
                         / 50
             }
-            None => self.cpu.insn_count / self.insns_per_tick,
+            None => self.cpu.insn_count / self.insns_per_tick + self.idle_ticks,
         };
         // Never let the clock run backward (host wall-clock can be non-monotonic).
         self.bus.mtime = next.max(self.bus.mtime);
@@ -826,4 +1049,153 @@ fn build_fdt(
 
     f.end_node(); // root
     f.finish()
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+
+    fn machine() -> Machine {
+        Machine::new(
+            1,
+            BootImages {
+                bios: &[],
+                kernel: None,
+                cmdline: "",
+                disk: None,
+                fs: Vec::new(),
+                net: None,
+            },
+        )
+    }
+
+    #[test]
+    fn checked_ram_range_rejects_wasm32_address_aliases() {
+        assert_eq!(
+            checked_ram_range(64, RAM_BASE, RAM_BASE + 4, 8),
+            Some(4..12)
+        );
+        assert_eq!(
+            checked_ram_range(64, RAM_BASE, RAM_BASE + (1u64 << 32) + 4, 8),
+            None
+        );
+        assert_eq!(checked_ram_range(64, RAM_BASE, RAM_BASE + 60, 8), None);
+    }
+
+    #[test]
+    fn jit_page_state_deduplicates_stores_until_drain() {
+        let mut state = JitPageState::new(3 * JIT_PAGE_SIZE);
+        let code = RAM_BASE + JIT_PAGE_SIZE as u64;
+
+        state.mark_address(code);
+        state.note_store(code + 4);
+        state.note_store(code + 8);
+
+        assert!(state.page_marked(1));
+        assert_eq!(state.page_generation(1), Some(1));
+        assert!(state.has_dirty());
+        assert!(state.is_dirty(1));
+        assert_eq!(state.take_dirty(), vec![1]);
+        assert!(!state.has_dirty());
+        assert!(!state.is_dirty(1));
+
+        state.note_store(code + 12);
+        assert_eq!(state.page_generation(1), Some(2));
+        assert_eq!(state.take_dirty(), vec![1]);
+        state.unmark_page(1);
+        state.note_store(code + 16);
+        assert_eq!(state.page_generation(1), Some(2));
+        assert!(!state.has_dirty());
+
+        state.mark_address(code);
+        state.note_store(code + 20);
+        assert_eq!(state.page_generation(1), Some(3));
+    }
+
+    #[test]
+    fn jit_page_state_rejects_addresses_outside_ram() {
+        let mut state = JitPageState::new(JIT_PAGE_SIZE);
+        state.mark_address(RAM_BASE - 1);
+        state.mark_address(RAM_BASE + JIT_PAGE_SIZE as u64);
+        state.note_store(RAM_BASE + JIT_PAGE_SIZE as u64);
+
+        assert!(!state.page_marked(0));
+        assert!(!state.page_marked(1));
+        assert!(!state.has_dirty());
+    }
+
+    #[test]
+    fn jit_page_state_tracks_each_page_of_a_dma_range() {
+        let mut state = JitPageState::new(2 * JIT_PAGE_SIZE);
+        state.mark_address(RAM_BASE);
+        state.mark_address(RAM_BASE + JIT_PAGE_SIZE as u64);
+
+        state.note_write(RAM_BASE + JIT_PAGE_SIZE as u64 - 2, 4);
+
+        assert_eq!(state.page_generation(0), Some(1));
+        assert_eq!(state.page_generation(1), Some(1));
+        assert_eq!(state.take_dirty(), vec![0, 1]);
+    }
+
+    #[test]
+    fn machine_run_slice_until_stops_at_compiled_successor() {
+        let mut machine = machine();
+        let addi_x5 = 0x0012_8293u32;
+        for (index, instruction) in [addi_x5; 3].iter().enumerate() {
+            let offset = 0x1000 + index * 4;
+            machine.bus.low_ram[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+
+        let retired = machine.run_slice_until(10, |pc| pc == 0x1008);
+
+        assert_eq!(retired, 2);
+        assert_eq!(machine.cpu.pc, 0x1008);
+        assert_eq!(machine.cpu.x[5], 2);
+    }
+
+    #[test]
+    fn deterministic_wfi_advances_time_without_faking_retired_instructions() {
+        let mut machine = machine();
+        machine.bus.low_ram[0x1000..0x1004].copy_from_slice(&0x1050_0073u32.to_le_bytes());
+        machine.bus.mtimecmp = 50;
+
+        let outcome = machine.run_slice_until_outcome(10, |_| false);
+
+        assert_eq!(outcome.retired, 1);
+        assert!(!outcome.idle);
+        assert_eq!(machine.cpu.insn_count, 1);
+        assert_eq!(machine.idle_ticks, 50);
+        assert_eq!(machine.bus.mtime, 50);
+    }
+
+    #[test]
+    fn wallclock_wfi_reports_idle_to_the_embedding() {
+        let mut machine = machine();
+        machine.bus.low_ram[0x1000..0x1004].copy_from_slice(&0x1050_0073u32.to_le_bytes());
+        machine.bus.mtimecmp = 50;
+        machine.wall_ns = Some(0);
+
+        let outcome = machine.run_slice_until_outcome(10, |_| false);
+
+        assert_eq!(outcome.retired, 1);
+        assert!(outcome.idle);
+        assert_eq!(machine.idle_ticks, 0);
+        assert_eq!(machine.bus.mtime, 0);
+    }
+
+    #[test]
+    fn system_bus_uses_shared_jit_page_state() {
+        let mut machine = machine();
+        let code = RAM_BASE;
+        assert!(machine.bus.jit_fast_off(code, code, true).is_some());
+
+        machine.bus.jit_mark_page(code);
+        assert!(machine.bus.jit_fast_off(code, code, true).is_none());
+        machine.bus.write32(code, 1).unwrap();
+        machine.bus.write32(code + 4, 2).unwrap();
+
+        assert!(machine.bus.jit_page_marked(0));
+        assert!(machine.bus.jit_page_dirty(0));
+        assert_eq!(machine.bus.jit_take_dirty(), vec![0]);
+    }
 }

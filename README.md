@@ -322,7 +322,8 @@ tests/run-all.sh
 REQUIRE_ALL=1 tests/run-all.sh
 
 # individual pieces
-cargo test --workspace                  # unit + integration tests
+cargo test --workspace --exclude rv64-wasm  # native unit + integration tests
+cargo test -p rv64-wasm --lib           # wasm ABI unit tests through a native harness
 tests/run-isa-tests.sh                  # official ISA suite only
 cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
 python3 -m http.server -d . 8000        # then open /web/

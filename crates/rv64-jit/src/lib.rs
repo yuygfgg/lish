@@ -1697,8 +1697,8 @@ impl Ctx {
         m.local_get(PAGE).op(I64_NE);
         m.op(IF).op(VOID);
         self.memprof_inc(m, 2);
-        // miss: off = tlb_fill(va, store)
-        m.local_get(VA).i32_const(store as i32);
+        // miss: off = tlb_fill(context, va, store)
+        m.local_get(0).local_get(VA).i32_const(store as i32);
         m.call_tlb_fill();
         m.local_set(SCR2);
         m.local_get(SCR2).i64_const(-1).op(I64_EQ);
@@ -2758,7 +2758,7 @@ fn emit_chain_next(c: &Ctx, m: &mut WasmModule, guard_progress: bool) {
         m.op(IF).op(VOID).op(RETURN).op(END);
     }
     m.use_chain_next();
-    m.local_get(0); // machine-state pointer parameter
+    m.local_get(0); // execution-context pointer parameter
     m.call_chain_next();
 }
 
@@ -2837,7 +2837,7 @@ fn emit_chain_exit_helper(c: &Ctx, m: &mut WasmModule) {
     m.call(hidx).local_set_i32(t);
     m.local_get_i32(t).i32_const(0).op(I32_LT_S);
     m.op(IF).op(VOID).op(RETURN).op(END);
-    m.local_get(0); // machine-state pointer parameter
+    m.local_get(0); // execution-context pointer parameter
     m.local_get_i32(t);
     m.return_call_indirect(0);
 }
@@ -2903,7 +2903,7 @@ fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
     m.i32_const(0).i64_load(lay.fuel_addr as u64);
     m.op(I64_GE_U);
     m.op(IF).op(VOID).op(RETURN).op(END);
-    m.local_get(0); // the machine-state pointer parameter, passed along
+    m.local_get(0); // the execution-context pointer parameter, passed along
     m.local_get_i32(idx2);
     m.return_call_indirect(0);
 }

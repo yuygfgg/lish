@@ -2,6 +2,8 @@
 //! console, block, 9p filesystem and network backends. Register layout mirrors
 //! TinyEMU's virtio.c (which follows the virtio 1.0 spec).
 
+use crate::{checked_ram_range, JitPageState};
+
 /// Device backends the transport can host.
 pub enum Backend {
     /// virtio-console (device id 3). RX = queue 0, TX = queue 1.
@@ -365,7 +367,7 @@ impl VirtioDev {
 
     /// Process queue `qi` (after a notify, or when console input arrives).
     /// `ram`/`ram_base` give access to guest physical memory.
-    pub fn process(&mut self, qi: usize, ram: &mut [u8], ram_base: u64) {
+    pub fn process(&mut self, qi: usize, ram: &mut [u8], ram_base: u64, jit: &mut JitPageState) {
         if qi >= MAX_QUEUES || self.queues[qi].ready == 0 {
             if vio_dbg() {
                 eprintln!(
@@ -378,7 +380,16 @@ impl VirtioDev {
         let mut serviced = 0u32;
         loop {
             let q = self.queues[qi].clone();
-            let avail_idx = read16(ram, ram_base, q.avail + 2);
+            if q.num == 0 {
+                return;
+            }
+            let Some(avail_idx) = q
+                .avail
+                .checked_add(2)
+                .and_then(|addr| read16(ram, ram_base, addr))
+            else {
+                return;
+            };
             if q.last_avail_idx == avail_idx {
                 if vio_dbg() {
                     eprintln!("[vio] notify q{qi} done serviced={serviced} last_avail={} avail_idx={avail_idx}",
@@ -387,24 +398,52 @@ impl VirtioDev {
                 break;
             }
             let slot = (q.last_avail_idx as u64) % (q.num as u64);
-            let head = read16(ram, ram_base, q.avail + 4 + slot * 2);
+            let Some(head) = q
+                .avail
+                .checked_add(4 + slot * 2)
+                .and_then(|addr| read16(ram, ram_base, addr))
+            else {
+                return;
+            };
 
             // Walk the descriptor chain.
-            let mut chain: Vec<(u64, u32, bool)> = Vec::new(); // (addr, len, writable)
-            let mut di = head as u64;
-            for _ in 0..q.num {
-                let base = q.desc + di * 16;
-                let addr = read64(ram, ram_base, base);
-                let len = read32(ram, ram_base, base + 8);
-                let flags = read16(ram, ram_base, base + 12);
-                chain.push((addr, len, flags & 2 != 0));
-                if flags & 1 == 0 {
-                    break;
+            let chain = (|| {
+                let mut chain: Vec<(u64, u32, bool)> = Vec::new();
+                let mut di = head as u64;
+                for _ in 0..q.num {
+                    let base = q.desc.checked_add(di.checked_mul(16)?)?;
+                    let addr = read64(ram, ram_base, base)?;
+                    let len = read32(ram, ram_base, base.checked_add(8)?)?;
+                    let flags = read16(ram, ram_base, base.checked_add(12)?)?;
+                    chain.push((addr, len, flags & 2 != 0));
+                    if flags & 1 == 0 {
+                        break;
+                    }
+                    di = read16(ram, ram_base, base.checked_add(14)?)? as u64;
                 }
-                di = read16(ram, ram_base, base + 14) as u64;
+                Some(chain)
+            })();
+            let Some(chain) = chain else {
+                return;
+            };
+
+            // Validate the used-ring destination before the backend performs
+            // any externally visible work.
+            let Some(used_index_addr) = q.used.checked_add(2) else {
+                return;
+            };
+            let Some(used_idx) = read16(ram, ram_base, used_index_addr) else {
+                return;
+            };
+            let uslot = (used_idx as u64) % (q.num as u64);
+            let Some(used_entry) = q.used.checked_add(4 + uslot * 8) else {
+                return;
+            };
+            if checked_ram_range(ram.len(), ram_base, used_entry, 8).is_none() {
+                return;
             }
 
-            let written = self.service(qi, &chain, ram, ram_base);
+            let written = self.service(qi, &chain, ram, ram_base, jit);
             if written.is_none() {
                 // Not serviceable now (e.g. console RX with no input):
                 // leave the descriptor for later.
@@ -412,11 +451,15 @@ impl VirtioDev {
             }
 
             // Publish to the used ring.
-            let used_idx = read16(ram, ram_base, q.used + 2);
-            let uslot = (used_idx as u64) % (q.num as u64);
-            write32(ram, ram_base, q.used + 4 + uslot * 8, head as u32);
-            write32(ram, ram_base, q.used + 4 + uslot * 8 + 4, written.unwrap());
-            write16(ram, ram_base, q.used + 2, used_idx.wrapping_add(1));
+            write32(ram, ram_base, used_entry, head as u32, jit);
+            write32(ram, ram_base, used_entry + 4, written.unwrap(), jit);
+            write16(
+                ram,
+                ram_base,
+                used_index_addr,
+                used_idx.wrapping_add(1),
+                jit,
+            );
 
             self.queues[qi].last_avail_idx = self.queues[qi].last_avail_idx.wrapping_add(1);
             self.int_status |= 1;
@@ -432,6 +475,7 @@ impl VirtioDev {
         chain: &[(u64, u32, bool)],
         ram: &mut [u8],
         ram_base: u64,
+        jit: &mut JitPageState,
     ) -> Option<u32> {
         match &mut self.backend {
             Backend::Console { rx_buf, tx_out } => {
@@ -446,8 +490,9 @@ impl VirtioDev {
                             continue;
                         }
                         let n = rx_buf.len().min(len as usize);
-                        let off = (addr - ram_base) as usize;
-                        ram[off..off + n].copy_from_slice(&rx_buf[..n]);
+                        if !guest_write(ram, ram_base, addr, &rx_buf[..n], jit) {
+                            continue;
+                        }
                         rx_buf.drain(..n);
                         written += n as u32;
                         if rx_buf.is_empty() {
@@ -457,54 +502,62 @@ impl VirtioDev {
                     Some(written)
                 } else {
                     // TX: collect guest output.
+                    let mut output = Vec::new();
                     for &(addr, len, writable) in chain {
                         if writable {
                             continue;
                         }
-                        let off = (addr - ram_base) as usize;
-                        tx_out.extend_from_slice(&ram[off..off + len as usize]);
+                        match guest_slice(ram, ram_base, addr, len) {
+                            Some(bytes) => output.extend_from_slice(bytes),
+                            None => return Some(0),
+                        }
                     }
+                    tx_out.extend_from_slice(&output);
                     Some(0)
                 }
             }
             Backend::Block { disk } => {
                 // Layout: header (16B, read-only) | data buffers | status (1B, writable)
                 let (hdr_addr, ..) = *chain.first()?;
-                let hoff = (hdr_addr - ram_base) as usize;
-                let req_type = u32::from_le_bytes(ram[hoff..hoff + 4].try_into().unwrap());
-                let sector = u64::from_le_bytes(ram[hoff + 8..hoff + 16].try_into().unwrap());
-                let mut pos = sector as usize * SECTOR;
+                let header = guest_slice(ram, ram_base, hdr_addr, 16)?;
+                let req_type = u32::from_le_bytes(header[..4].try_into().unwrap());
+                let sector = u64::from_le_bytes(header[8..16].try_into().unwrap());
+                let mut pos = usize::try_from(sector)
+                    .ok()
+                    .and_then(|sector| sector.checked_mul(SECTOR));
                 let mut written = 0u32;
                 let mut ok = true;
 
-                for &(addr, len, writable) in &chain[1..chain.len() - 1] {
-                    let off = (addr - ram_base) as usize;
-                    let len = len as usize;
+                for &(addr, len_u32, writable) in chain.get(1..chain.len().saturating_sub(1))? {
+                    let len = len_u32 as usize;
+                    let disk_range = pos
+                        .and_then(|start| start.checked_add(len).map(|end| (start, end)))
+                        .filter(|&(_, end)| end <= disk.len());
                     match req_type {
                         VIRTIO_BLK_T_IN if writable => {
-                            if pos + len <= disk.len() {
-                                ram[off..off + len].copy_from_slice(&disk[pos..pos + len]);
-                            } else {
+                            if !disk_range.is_some_and(|(start, end)| {
+                                guest_write(ram, ram_base, addr, &disk[start..end], jit)
+                            }) {
                                 ok = false;
                             }
                             written += len as u32;
                         }
                         VIRTIO_BLK_T_OUT if !writable => {
-                            if pos + len <= disk.len() {
-                                disk[pos..pos + len].copy_from_slice(&ram[off..off + len]);
+                            let source = guest_slice(ram, ram_base, addr, len_u32);
+                            if let (Some((start, end)), Some(source)) = (disk_range, source) {
+                                disk[start..end].copy_from_slice(source);
                             } else {
                                 ok = false;
                             }
                         }
                         _ => ok = false,
                     }
-                    pos += len;
+                    pos = pos.and_then(|position| position.checked_add(len));
                 }
 
                 // status byte in the last descriptor
                 if let Some(&(saddr, _, _)) = chain.last() {
-                    let soff = (saddr - ram_base) as usize;
-                    ram[soff] = if ok { 0 } else { 1 };
+                    let _ = guest_write(ram, ram_base, saddr, &[if ok { 0 } else { 1 }], jit);
                     written += 1;
                 }
                 Some(written)
@@ -535,9 +588,8 @@ impl VirtioDev {
                         continue;
                     }
                     let n = (reply.len() - pos).min(len as usize);
-                    match guest_slice_mut(ram, ram_base, addr, n as u32) {
-                        Some(d) => d.copy_from_slice(&reply[pos..pos + n]),
-                        None => break,
+                    if !guest_write(ram, ram_base, addr, &reply[pos..pos + n], jit) {
+                        break;
                     }
                     pos += n;
                 }
@@ -556,9 +608,8 @@ impl VirtioDev {
                             continue;
                         }
                         let n = (reply.len() - pos).min(len as usize);
-                        match guest_slice_mut(ram, ram_base, addr, n as u32) {
-                            Some(d) => d.copy_from_slice(&reply[pos..pos + n]),
-                            None => break,
+                        if !guest_write(ram, ram_base, addr, &reply[pos..pos + n], jit) {
+                            break;
                         }
                         pos += n;
                     }
@@ -611,9 +662,8 @@ impl VirtioDev {
                             continue;
                         }
                         let n = (src.len() - written).min(len as usize);
-                        match guest_slice_mut(ram, ram_base, addr, n as u32) {
-                            Some(d) => d.copy_from_slice(&src[written..written + n]),
-                            None => break,
+                        if !guest_write(ram, ram_base, addr, &src[written..written + n], jit) {
+                            break;
                         }
                         written += n;
                     }
@@ -648,13 +698,31 @@ impl VirtioDev {
 /// Guest-physical view of a descriptor, or `None` if it does not lie entirely
 /// within RAM.
 fn guest_slice(ram: &[u8], ram_base: u64, addr: u64, len: u32) -> Option<&[u8]> {
-    let off = addr.checked_sub(ram_base)? as usize;
-    ram.get(off..off.checked_add(len as usize)?)
+    let range = checked_ram_range(ram.len(), ram_base, addr, len as usize)?;
+    Some(&ram[range])
 }
 
-fn guest_slice_mut(ram: &mut [u8], ram_base: u64, addr: u64, len: u32) -> Option<&mut [u8]> {
-    let off = addr.checked_sub(ram_base)? as usize;
-    ram.get_mut(off..off.checked_add(len as usize)?)
+fn guest_slice_mut(ram: &mut [u8], ram_base: u64, addr: u64, len: usize) -> Option<&mut [u8]> {
+    let range = checked_ram_range(ram.len(), ram_base, addr, len)?;
+    Some(&mut ram[range])
+}
+
+/// The only device-to-guest memory write primitive. Keeping DMA observation at
+/// this boundary prevents a new backend from silently bypassing JIT code-page
+/// invalidation.
+fn guest_write(
+    ram: &mut [u8],
+    ram_base: u64,
+    addr: u64,
+    bytes: &[u8],
+    jit: &mut JitPageState,
+) -> bool {
+    let Some(dst) = guest_slice_mut(ram, ram_base, addr, bytes.len()) else {
+        return false;
+    };
+    dst.copy_from_slice(bytes);
+    jit.note_write(addr, bytes.len());
+    true
 }
 
 fn set_lo(v: &mut u64, val: u32) {
@@ -664,25 +732,26 @@ fn set_hi(v: &mut u64, val: u32) {
     *v = (*v & 0xffff_ffff) | ((val as u64) << 32);
 }
 
-fn read16(ram: &[u8], base: u64, addr: u64) -> u16 {
-    let o = (addr - base) as usize;
-    u16::from_le_bytes(ram[o..o + 2].try_into().unwrap())
+fn read16(ram: &[u8], base: u64, addr: u64) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        guest_slice(ram, base, addr, 2)?.try_into().ok()?,
+    ))
 }
-fn read32(ram: &[u8], base: u64, addr: u64) -> u32 {
-    let o = (addr - base) as usize;
-    u32::from_le_bytes(ram[o..o + 4].try_into().unwrap())
+fn read32(ram: &[u8], base: u64, addr: u64) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        guest_slice(ram, base, addr, 4)?.try_into().ok()?,
+    ))
 }
-fn read64(ram: &[u8], base: u64, addr: u64) -> u64 {
-    let o = (addr - base) as usize;
-    u64::from_le_bytes(ram[o..o + 8].try_into().unwrap())
+fn read64(ram: &[u8], base: u64, addr: u64) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        guest_slice(ram, base, addr, 8)?.try_into().ok()?,
+    ))
 }
-fn write16(ram: &mut [u8], base: u64, addr: u64, v: u16) {
-    let o = (addr - base) as usize;
-    ram[o..o + 2].copy_from_slice(&v.to_le_bytes());
+fn write16(ram: &mut [u8], base: u64, addr: u64, v: u16, jit: &mut JitPageState) {
+    let _ = guest_write(ram, base, addr, &v.to_le_bytes(), jit);
 }
-fn write32(ram: &mut [u8], base: u64, addr: u64, v: u32) {
-    let o = (addr - base) as usize;
-    ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+fn write32(ram: &mut [u8], base: u64, addr: u64, v: u32, jit: &mut JitPageState) {
+    let _ = guest_write(ram, base, addr, &v.to_le_bytes(), jit);
 }
 
 #[cfg(test)]
@@ -788,6 +857,11 @@ mod tests {
         u32::from_le_bytes(ram[off..off + 4].try_into().unwrap())
     }
 
+    fn process(dev: &mut VirtioDev, qi: usize, ram: &mut [u8]) {
+        let mut jit = JitPageState::new(ram.len());
+        dev.process(qi, ram, BASE, &mut jit);
+    }
+
     /// Body builder for T-messages.
     #[derive(Default)]
     struct B(Vec<u8>);
@@ -824,7 +898,7 @@ mod tests {
         publish(ram, &RING0, 0, n);
 
         assert_eq!(dev.write(0x050, 0), Some(0), "QueueNotify selects queue 0");
-        dev.process(0, ram, BASE);
+        process(dev, 0, ram);
 
         // The device must have published exactly one more used entry.
         assert_eq!(u16_at(ram, USED + 2), n, "used.idx after request {n}");
@@ -870,7 +944,7 @@ mod tests {
         put_desc(&mut ram, 1, REPLY, 4096, 2, 0);
         publish(&mut ram, &RING0, 0, 1);
 
-        dev.process(0, &mut ram, BASE);
+        process(&mut dev, 0, &mut ram);
         assert_eq!(u16_at(&ram, USED + 2), 0);
         assert_eq!(
             dev.fs_external_take_request().as_deref(),
@@ -881,7 +955,7 @@ mod tests {
             None,
             "request is emitted once"
         );
-        dev.process(0, &mut ram, BASE);
+        process(&mut dev, 0, &mut ram);
         assert_eq!(
             dev.fs_external_take_request(),
             None,
@@ -890,7 +964,7 @@ mod tests {
 
         let reply = [7, 0, 0, 0, 101, 3, 0];
         assert!(dev.fs_external_reply(reply.to_vec()));
-        dev.process(0, &mut ram, BASE);
+        process(&mut dev, 0, &mut ram);
         assert_eq!(u16_at(&ram, USED + 2), 1);
         assert_eq!(&ram[REPLY..REPLY + reply.len()], &reply);
         assert!(dev.irq_pending());
@@ -913,6 +987,28 @@ mod tests {
         assert_eq!(dev.read(0x008), 3);
         dev.write(0x014, 0);
         assert_eq!(dev.read(0x010), 0, "console offers no feature bits");
+    }
+
+    #[test]
+    fn console_tx_rejects_out_of_ram_and_wasm32_alias_descriptors() {
+        let mut dev = VirtioDev::new(Backend::Console {
+            rx_buf: Vec::new(),
+            tx_out: Vec::new(),
+        });
+        let mut ram = vec![0u8; 64 * 1024];
+        setup_ring(&mut dev, 1, &RING1);
+        ram[REQ..REQ + 4].copy_from_slice(b"nope");
+
+        for (submission, address) in [(1, 0xdead_0000), (2, BASE + (1u64 << 32) + REQ as u64)] {
+            put_desc_in(&mut ram, &RING1, 0, REQ, 4, 0, 0);
+            ram[RING1.desc..RING1.desc + 8].copy_from_slice(&address.to_le_bytes());
+            publish(&mut ram, &RING1, 0, submission);
+
+            process(&mut dev, 1, &mut ram);
+
+            assert_eq!(u16_at(&ram, RING1.used + 2), submission);
+            assert!(dev.console_take_output().is_empty());
+        }
     }
 
     #[test]
@@ -972,7 +1068,7 @@ mod tests {
         ram[o..o + 8].copy_from_slice(&0xdead_0000u64.to_le_bytes());
         put_desc(&mut ram, 1, REPLY, 4096, 2, 0);
         publish(&mut ram, &RING0, 0, 1);
-        dev.process(0, &mut ram, BASE);
+        process(&mut dev, 0, &mut ram);
         assert_eq!(u16_at(&ram, USED + 2), 1, "chain consumed");
     }
 
@@ -1031,7 +1127,7 @@ mod tests {
         publish(&mut ram, &RING1, 0, 1);
 
         assert_eq!(dev.write(0x050, 1), Some(1), "notify selects the TX queue");
-        dev.process(1, &mut ram, BASE);
+        process(&mut dev, 1, &mut ram);
 
         assert_eq!(u16_at(&ram, RING1.used + 2), 1, "TX chain consumed");
         let out = dev.net_take_output();
@@ -1051,7 +1147,7 @@ mod tests {
         put_desc_in(&mut ram, &RING1, 0, FRAME, NET_HDR_LEN as u32, 1, 1);
         put_desc_in(&mut ram, &RING1, 1, RXBUF, payload.len() as u32, 0, 0);
         publish(&mut ram, &RING1, 0, 1);
-        dev.process(1, &mut ram, BASE);
+        process(&mut dev, 1, &mut ram);
         assert_eq!(dev.net_take_output()[0], payload);
     }
 
@@ -1066,7 +1162,7 @@ mod tests {
 
         put_desc_in(&mut ram, &RING0, 0, RXBUF, 2048, 2 /* WRITE */, 0);
         publish(&mut ram, &RING0, 0, 1);
-        dev.process(0, &mut ram, BASE);
+        process(&mut dev, 0, &mut ram);
 
         let (head, len) = used_entry(&ram, &RING0, 1);
         assert_eq!(head, 0);
@@ -1084,19 +1180,54 @@ mod tests {
     }
 
     #[test]
+    fn dma_write_invalidates_a_compiled_guest_page() {
+        let (mut dev, mut ram) = net_device();
+        setup_ring(&mut dev, 0, &RING0);
+        dev.net_input(&[1, 2, 3, 4]);
+        put_desc_in(&mut ram, &RING0, 0, RXBUF, 2048, 2, 0);
+        publish(&mut ram, &RING0, 0, 1);
+
+        let mut jit = JitPageState::new(ram.len());
+        let page = RXBUF as u64 >> 12;
+        jit.mark_address(BASE + RXBUF as u64);
+        dev.process(0, &mut ram, BASE, &mut jit);
+
+        assert!(jit.is_dirty(page));
+        assert_eq!(jit.page_generation(page), Some(1));
+        assert_eq!(jit.take_dirty(), vec![page]);
+    }
+
+    #[test]
+    fn dma_rejects_addresses_that_alias_low_ram_on_wasm32() {
+        let mut ram = vec![0u8; 64];
+        let mut jit = JitPageState::new(ram.len());
+        jit.mark_address(BASE + 4);
+
+        assert!(!guest_write(
+            &mut ram,
+            BASE,
+            BASE + (1u64 << 32) + 4,
+            &[1, 2, 3, 4],
+            &mut jit,
+        ));
+        assert_eq!(&ram[4..8], &[0, 0, 0, 0]);
+        assert!(!jit.has_dirty());
+    }
+
+    #[test]
     fn an_rx_buffer_with_no_frame_is_left_on_the_ring() {
         let (mut dev, mut ram) = net_device();
         setup_ring(&mut dev, 0, &RING0);
         put_desc_in(&mut ram, &RING0, 0, RXBUF, 2048, 2, 0);
         publish(&mut ram, &RING0, 0, 1);
-        dev.process(0, &mut ram, BASE);
+        process(&mut dev, 0, &mut ram);
         // Nothing to deliver: the buffer stays available for the next frame
         // rather than being consumed empty.
         assert_eq!(u16_at(&ram, RING0.used + 2), 0);
         assert!(!dev.irq_pending());
         // It is still there when a frame turns up.
         dev.net_input(b"late frame");
-        dev.process(0, &mut ram, BASE);
+        process(&mut dev, 0, &mut ram);
         assert_eq!(u16_at(&ram, RING0.used + 2), 1);
     }
 
@@ -1107,7 +1238,7 @@ mod tests {
         dev.net_input(&vec![7u8; 1500]);
         put_desc_in(&mut ram, &RING0, 0, RXBUF, 64, 2, 0);
         publish(&mut ram, &RING0, 0, 1);
-        dev.process(0, &mut ram, BASE);
+        process(&mut dev, 0, &mut ram);
         // Keeping an unsendable frame at the head would stall the queue forever.
         assert!(!dev.net_rx_pending(), "oversized frame dropped");
         assert_eq!(u16_at(&ram, RING0.used + 2), 0, "buffer not consumed");
@@ -1130,7 +1261,7 @@ mod tests {
         for n in 1..=(NET_QUEUE_LIMIT as u16 + 50) {
             put_desc_in(&mut ram, &RING1, 0, FRAME, (NET_HDR_LEN + 4) as u32, 0, 0);
             publish(&mut ram, &RING1, 0, n);
-            dev.process(1, &mut ram, BASE);
+            process(&mut dev, 1, &mut ram);
         }
         assert_eq!(dev.net_take_output().len(), NET_QUEUE_LIMIT);
     }

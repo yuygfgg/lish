@@ -21,6 +21,19 @@ function check(name, ok, detail = "") {
   if (!ok) failures++;
 }
 
+function runUserWithinBudget(vm, budget) {
+  let remaining = BigInt(budget);
+  while (remaining > 0n) {
+    const before = vm.userInsnCount();
+    const stop = vm.runUser(remaining);
+    const retired = vm.userInsnCount() - before;
+    if (stop !== Stop.YIELD || retired >= remaining) return stop;
+    assert.ok(retired > 0n, "user-mode yield made no progress");
+    remaining -= retired;
+  }
+  return Stop.YIELD;
+}
+
 // This project instantiates plain wasm32-unknown-unknown with a deliberately
 // small raw ABI. In particular, TLS dependencies must not smuggle in
 // wasm-bindgen/externref support that web/rv64.js does not provide.
@@ -82,7 +95,7 @@ for (const [name, argv, wantExit, wantOut] of guests) {
     out += new TextDecoder().decode(b);
   };
   vm.loadElf(new Uint8Array(await readFile(path)), argv);
-  const stop = vm.runUser(2_000_000_000n);
+  const stop = runUserWithinBudget(vm, 2_000_000_000n);
   const ok =
     stop === Stop.EXITED &&
     vm.userExitCode() === wantExit &&
@@ -106,12 +119,14 @@ for (const [name, argv, wantExit, wantOut] of guests) {
     vm.onWrite = () => {};
     vm.loadElf(new Uint8Array(await readFile(path)), ["bench", "fast"]);
     // warm up so hot loops are compiled, then meter single-instruction budgets
-    vm.runUser(50_000_000n);
+    assert.equal(runUserWithinBudget(vm, 50_000_000n), Stop.YIELD);
     let worst = 0n;
     for (let i = 0; i < 2000; i++) {
       const before = vm.ex.user_insn_count();
-      vm.runUser(1n);
+      const stop = vm.runUser(1n);
       const d = vm.ex.user_insn_count() - before;
+      assert.equal(stop, Stop.YIELD, "single-instruction budget did not yield");
+      assert.ok(d > 0n, "single-instruction budget made no progress");
       if (d > worst) worst = d;
     }
     check("budget contract user_run(1)", worst <= 128n, `worst overshoot=${worst}`);
@@ -137,7 +152,7 @@ for (const [name, argv, wantExit, wantOut] of guests) {
       vm.ex.jit_set_enabled(jit);
       vm.onWrite = () => {};
       vm.loadElf(new Uint8Array(await readFile(path)), ["bench", "fast"]);
-      const stop = vm.runUser(2_000_000_000n);
+      const stop = runUserWithinBudget(vm, 2_000_000_000n);
       counts.push(stop === Stop.EXITED ? vm.ex.user_insn_count() : -1n);
     }
     check(
@@ -168,7 +183,7 @@ for (const [name, argv, wantExit, wantOut] of guests) {
     vm.onWrite = () => {};
     for (let generation = 0; generation < 4; generation++) {
       vm.loadElf(elf, ["bench", "fast"]);
-      const stop = vm.runUser(2_000_000_000n);
+      const stop = runUserWithinBudget(vm, 2_000_000_000n);
       assert.equal(stop, Stop.EXITED);
       const metrics = vm.jitMetrics();
       assert.equal(metrics.liveSlots, metrics.rustLiveSlots);

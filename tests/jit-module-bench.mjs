@@ -32,9 +32,14 @@ assert.equal(
   true,
 );
 
-let stop = Stop.BUDGET;
-for (let slice = 0; slice < 20_000 && stop === Stop.BUDGET; slice++) {
+let stop = Stop.YIELD;
+for (let slice = 0; slice < 20_000 && stop === Stop.YIELD; slice++) {
+  const before = vm.userInsnCount();
   stop = vm.runUser(100_000n);
+  assert.ok(
+    stop !== Stop.YIELD || vm.userInsnCount() > before,
+    "benchmark yielded without retiring an instruction",
+  );
 }
 const metrics = vm.jitMetrics();
 assert.equal(stop, Stop.EXITED, "benchmark did not exit");

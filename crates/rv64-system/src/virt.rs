@@ -19,8 +19,14 @@
 use crate::dtb::Fdt;
 use crate::rtc::GoldfishRtc;
 use crate::virtio::{Backend, VirtioDev};
+use crate::{
+    checked_ram_range, run_cpu_until, InterpreterStop, JitPageState, RunSliceOutcome,
+    INTERPRETER_SYNC_INTERVAL,
+};
 use rv64_core::csr::{Mode, IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP, IRQ_SSIP, IRQ_STIP};
 use rv64_core::{Bus, Cpu, Exception, StopReason};
+
+pub use crate::RAM_BASE;
 
 fn plic_dbg() -> bool {
     use std::sync::OnceLock;
@@ -28,7 +34,6 @@ fn plic_dbg() -> bool {
     *ON.get_or_init(|| std::env::var("RV_PLIC_DEBUG").is_ok())
 }
 
-pub const RAM_BASE: u64 = 0x8000_0000;
 pub const TEST_BASE: u64 = 0x0010_0000;
 pub const CLINT_BASE: u64 = 0x0200_0000;
 pub const CLINT_SIZE: u64 = 0x1_0000;
@@ -305,9 +310,7 @@ pub struct VirtBus {
     pub virtio: Vec<VirtioDev>,
     pub power_off: bool,
     direct_sbi: bool,
-    // JIT support (mirrors crate::SystemBus)
-    pub jit_pages: Vec<u64>,
-    pub jit_dirty_pages: Vec<u64>,
+    pub jit: JitPageState,
 }
 
 impl VirtBus {
@@ -340,42 +343,35 @@ impl VirtBus {
     }
 
     pub fn jit_mark_page(&mut self, pa: u64) {
-        if pa >= RAM_BASE {
-            let page = ((pa - RAM_BASE) >> 12) as usize;
-            if let Some(w) = self.jit_pages.get_mut(page / 64) {
-                *w |= 1 << (page % 64);
-            }
-        }
+        self.jit.mark_address(pa);
+    }
+    pub fn jit_page_marked(&self, page: u64) -> bool {
+        self.jit.page_marked(page)
     }
     pub fn jit_unmark_page(&mut self, page: u64) {
-        if let Some(w) = self.jit_pages.get_mut(page as usize / 64) {
-            *w &= !(1 << (page % 64));
-        }
+        self.jit.unmark_page(page);
     }
     pub fn jit_take_dirty(&mut self) -> Vec<u64> {
-        core::mem::take(&mut self.jit_dirty_pages)
+        self.jit.take_dirty()
+    }
+    pub fn jit_has_dirty(&self) -> bool {
+        self.jit.has_dirty()
+    }
+    pub fn jit_page_dirty(&self, page: u64) -> bool {
+        self.jit.is_dirty(page)
+    }
+    pub fn jit_page_generation(&self, page: u64) -> Option<u64> {
+        self.jit.page_generation(page)
     }
     #[inline]
     fn jit_check_store(&mut self, addr: u64) {
-        if addr >= RAM_BASE {
-            let page = ((addr - RAM_BASE) >> 12) as usize;
-            if let Some(w) = self.jit_pages.get(page / 64) {
-                if w & (1 << (page % 64)) != 0 {
-                    self.jit_dirty_pages.push(page as u64);
-                }
-            }
-        }
+        self.jit.note_store(addr);
     }
 
     #[inline]
     fn ram_slice(&mut self, addr: u64, len: usize) -> Option<&mut [u8]> {
-        if addr >= RAM_BASE {
-            let off = (addr - RAM_BASE) as usize;
-            if off + len <= self.ram.len() {
-                return Some(&mut self.ram[off..off + len]);
-            }
-        }
-        None
+        let range = checked_ram_range(self.ram.len(), RAM_BASE, addr, len)?;
+        Some(&mut self.ram[range])
     }
 
     fn mmio_read(&mut self, addr: u64, size: u32) -> Option<u64> {
@@ -447,7 +443,7 @@ impl VirtBus {
                 if i < self.virtio.len() {
                     if let Some(q) = self.virtio[i].write(off, val as u32) {
                         let mut dev = self.virtio.remove(i);
-                        dev.process(q as usize, &mut self.ram, RAM_BASE);
+                        dev.process(q as usize, &mut self.ram, RAM_BASE, &mut self.jit);
                         self.virtio.insert(i, dev);
                     }
                 }
@@ -465,7 +461,7 @@ impl VirtBus {
         for i in 0..self.virtio.len() {
             let mut dev = self.virtio.remove(i);
             for qi in 0..2 {
-                dev.process(qi, &mut self.ram, RAM_BASE);
+                dev.process(qi, &mut self.ram, RAM_BASE, &mut self.jit);
             }
             self.virtio.insert(i, dev);
         }
@@ -520,6 +516,16 @@ impl Bus for VirtBus {
             lines |= IRQ_SEIP;
         }
         lines
+    }
+
+    fn jit_fast_off(&self, va: u64, pa: u64, store: bool) -> Option<i64> {
+        if pa < RAM_BASE || (pa | 0xfff) >= RAM_BASE + self.ram.len() as u64 {
+            return None;
+        }
+        if store && self.jit.address_marked(pa) {
+            return None;
+        }
+        Some(self.ram.as_ptr() as i64 + (pa as i64 - RAM_BASE as i64) - va as i64)
     }
 }
 
@@ -700,8 +706,7 @@ impl VirtMachine {
                 virtio,
                 power_off: false,
                 direct_sbi,
-                jit_pages: vec![0u64; (ram_size as usize >> 12).div_ceil(64)],
-                jit_dirty_pages: Vec::new(),
+                jit: JitPageState::new(ram_size as usize),
             },
             insns_per_tick: 100,
             idle_ticks: 0,
@@ -764,7 +769,7 @@ impl VirtMachine {
         {
             dev.console_input(bytes);
             let mut dev = self.bus.virtio.remove(index);
-            dev.process(0, &mut self.bus.ram, RAM_BASE);
+            dev.process(0, &mut self.bus.ram, RAM_BASE, &mut self.bus.jit);
             self.bus.virtio.insert(index, dev);
         }
     }
@@ -791,10 +796,19 @@ impl VirtMachine {
 
     pub fn sync_devices(&mut self) {
         let instruction_time = self.cpu.insn_count / self.insns_per_tick + self.idle_ticks;
+        let visible_time = self.cpu.sys.as_ref().map_or(self.bus.mtime, |sys| {
+            self.cpu
+                .insn_count
+                .checked_div(sys.time_scale)
+                .map_or(sys.mtime, |time| time.wrapping_add(sys.time_offset))
+        });
         self.bus.mtime = match self.realtime_ticks {
-            // Never move backwards if a run slice predicted slightly beyond
-            // the next host sample while executing a guest rdtime loop.
-            Some(wall) => self.bus.mtime.max(wall),
+            // Preserve the value already visible through rdtime. Re-anchoring
+            // only to the last host sample would move the guest clock backward
+            // after instruction-based interpolation between host samples. If
+            // interpolation ran ahead, freeze it below until wall time catches
+            // up instead of carrying the speculative lead into every slice.
+            Some(wall) => self.bus.mtime.max(wall).max(visible_time),
             None => instruction_time,
         };
         if let Some(sys) = self.cpu.sys.as_mut() {
@@ -806,15 +820,36 @@ impl VirtMachine {
                     sys.mip &= !IRQ_STIP;
                 }
             }
-            // Let rdtime advance every instruction (not just per slice) so
-            // busy-wait loops reading `time` make progress: same clock as the
-            // CLINT, derived live from insn_count.
-            sys.time_scale = self.insns_per_tick;
-            sys.time_offset = self
-                .bus
-                .mtime
-                .saturating_sub(self.cpu.insn_count / self.insns_per_tick);
+            let instruction_ticks = self.cpu.insn_count / self.insns_per_tick;
+            let wall_caught_up = self
+                .realtime_ticks
+                .is_none_or(|wall| self.bus.mtime <= wall);
+            if wall_caught_up {
+                if let Some(offset) = self.bus.mtime.checked_sub(instruction_ticks) {
+                    // Let rdtime advance between host samples so a short
+                    // busy-wait loop can make progress without a JS call.
+                    sys.time_scale = self.insns_per_tick;
+                    sys.time_offset = offset;
+                } else {
+                    sys.time_scale = 0;
+                    sys.time_offset = 0;
+                }
+            } else {
+                // The guest already observed a speculative value ahead of the
+                // host clock. A zero scale makes TIME read sys.mtime verbatim;
+                // the next host sample can re-enable interpolation.
+                sys.time_scale = 0;
+                sys.time_offset = 0;
+            }
         }
+    }
+
+    /// Poll DMA-capable devices and synchronize interrupt/time state before a
+    /// full-system JIT dispatch quantum.
+    pub fn sync_jit_devices(&mut self) {
+        self.bus.poll_virtio();
+        self.sync_devices();
+        self.power_off |= self.bus.power_off;
     }
 
     fn service_sbi(&mut self) {
@@ -915,10 +950,8 @@ impl VirtMachine {
 
     /// Read a u16 from guest RAM (little-endian), for ring inspection.
     fn ram_u16(&self, pa: u64) -> u16 {
-        let off = (pa - RAM_BASE) as usize;
-        self.bus
-            .ram
-            .get(off..off + 2)
+        checked_ram_range(self.bus.ram.len(), RAM_BASE, pa, 2)
+            .map(|range| &self.bus.ram[range])
             .map(|s| u16::from_le_bytes([s[0], s[1]]))
             .unwrap_or(0)
     }
@@ -965,37 +998,94 @@ impl VirtMachine {
     }
 
     pub fn run_slice(&mut self, max_insns: u64) -> u64 {
+        self.run_slice_outcome(max_insns).retired
+    }
+
+    pub fn run_slice_outcome(&mut self, max_insns: u64) -> RunSliceOutcome {
+        self.run_slice_inner::<fn(u64) -> bool>(max_insns, None)
+    }
+
+    /// Interpret up to `max_insns`, but return as soon as an executed
+    /// instruction reaches a successor PC for which `compiled` returns true.
+    /// Direct SBI calls remain host-serviced and do not escape this method.
+    pub fn run_slice_until(&mut self, max_insns: u64, compiled: impl FnMut(u64) -> bool) -> u64 {
+        self.run_slice_until_outcome(max_insns, compiled).retired
+    }
+
+    pub fn run_slice_until_outcome(
+        &mut self,
+        max_insns: u64,
+        compiled: impl FnMut(u64) -> bool,
+    ) -> RunSliceOutcome {
+        self.run_slice_inner(max_insns, Some(compiled))
+    }
+
+    #[inline]
+    fn run_slice_inner<F>(&mut self, max_insns: u64, mut compiled: Option<F>) -> RunSliceOutcome
+    where
+        F: FnMut(u64) -> bool,
+    {
         let start = self.cpu.insn_count;
         self.bus.poll_virtio();
         self.sync_devices();
         let mut remaining = max_insns;
-        let mut stop = StopReason::Budget;
+        let mut stop = InterpreterStop::Cpu(StopReason::Budget);
         while remaining != 0 && !self.power_off {
+            let chunk = if compiled.is_some() {
+                remaining.min(INTERPRETER_SYNC_INTERVAL)
+            } else {
+                remaining
+            };
             let before = self.cpu.insn_count;
-            stop = self.cpu.run(&mut self.bus, remaining);
+            stop = run_cpu_until(&mut self.cpu, &mut self.bus, chunk, &mut compiled);
             remaining = remaining.saturating_sub(self.cpu.insn_count - before);
-            if stop == StopReason::Ecall && self.bus.direct_sbi {
-                self.service_sbi();
-                if self.unsupported_sbi.is_some() {
-                    self.power_off = true;
-                    break;
+
+            match stop {
+                InterpreterStop::Cpu(StopReason::Ecall) if self.bus.direct_sbi => {
+                    self.service_sbi();
+                    if self.unsupported_sbi.is_some() {
+                        self.power_off = true;
+                        break;
+                    }
+                    if self.power_off {
+                        break;
+                    }
+                    if compiled
+                        .as_mut()
+                        .is_some_and(|compiled| compiled(self.cpu.pc))
+                    {
+                        stop = InterpreterStop::Compiled;
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                InterpreterStop::Cpu(StopReason::Budget)
+                    if compiled.is_some() && remaining != 0 =>
+                {
+                    self.sync_devices();
+                    continue;
+                }
+                _ => break,
             }
-            break;
         }
-        if stop == StopReason::Wfi {
+        let mut idle = false;
+        if stop == InterpreterStop::Cpu(StopReason::Wfi) {
             // Halted: fast-forward the guest clock to the next timer
             // deadline via `idle_ticks` (not `insn_count`, which must
             // stay a true retired-instruction count for budgets/perf).
             let next = self.bus.mtimecmp;
             if self.realtime_ticks.is_none() && next != u64::MAX && next > self.bus.mtime {
                 self.idle_ticks += next - self.bus.mtime;
+            } else {
+                idle = true;
             }
         }
         self.sync_devices();
-        self.power_off = self.bus.power_off;
-        self.cpu.insn_count - start
+        self.power_off |= self.bus.power_off;
+        RunSliceOutcome {
+            retired: self.cpu.insn_count - start,
+            idle,
+        }
     }
 }
 
@@ -1184,6 +1274,14 @@ mod tests {
         )
     }
 
+    fn write_program(machine: &mut VirtMachine, instructions: &[u32]) {
+        let start = KERNEL_OFFSET as usize;
+        for (index, instruction) in instructions.iter().enumerate() {
+            let offset = start + index * 4;
+            machine.bus.ram[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+    }
+
     fn sbi(machine: &mut VirtMachine, ext: u64, function: u64, arg0: u64, arg1: u64) {
         machine.cpu.x[17] = ext;
         machine.cpu.x[16] = function;
@@ -1230,8 +1328,121 @@ mod tests {
     #[test]
     fn direct_sbi_reset_powers_off() {
         let mut machine = direct_machine();
-        sbi(&mut machine, 0x5352_5354, 0, 0, 0);
+        write_program(&mut machine, &[0x0000_0073]); // ecall
+        machine.cpu.x[17] = 0x5352_5354;
+        machine.cpu.x[16] = 0;
+        machine.cpu.x[10] = 0;
+        machine.run_slice_until(10, |_| false);
         assert!(machine.power_off);
         assert!(machine.bus.power_off);
+    }
+
+    #[test]
+    fn run_slice_until_services_sbi_before_stopping_at_compiled_code() {
+        let mut machine = direct_machine();
+        write_program(&mut machine, &[0x0000_0073, 0x0012_8293]); // ecall; addi x5,x5,1
+        machine.cpu.x[17] = 0x10;
+        machine.cpu.x[16] = 0;
+
+        let target = RAM_BASE + KERNEL_OFFSET + 4;
+        let retired = machine.run_slice_until(10, |pc| pc == target);
+
+        assert_eq!(retired, 1);
+        assert_eq!(machine.cpu.pc, target);
+        assert_eq!(machine.cpu.x[5], 0);
+        assert_eq!(machine.cpu.x[11], 2 << 24);
+        assert_eq!(machine.sbi_calls[0], 1);
+    }
+
+    #[test]
+    fn run_slice_until_keeps_unsupported_sbi_stopped() {
+        let mut machine = direct_machine();
+        write_program(&mut machine, &[0x0000_0073]); // ecall
+        machine.cpu.x[17] = 0xdead_beef;
+        machine.cpu.x[16] = 7;
+
+        machine.run_slice_until(10, |_| false);
+
+        assert_eq!(machine.unsupported_sbi, Some((0xdead_beef, 7)));
+        assert!(machine.power_off);
+    }
+
+    #[test]
+    fn run_slice_until_fast_forwards_wfi_without_faking_retired_instructions() {
+        let mut machine = direct_machine();
+        write_program(&mut machine, &[0x1050_0073]); // wfi
+        machine.bus.mtimecmp = 50;
+
+        let retired = machine.run_slice_until(10, |_| false);
+
+        assert_eq!(retired, 1);
+        assert_eq!(machine.cpu.insn_count, 1);
+        assert_eq!(machine.idle_ticks, 50);
+        assert_eq!(machine.bus.mtime, 50);
+    }
+
+    #[test]
+    fn realtime_wfi_reports_idle_to_the_embedding() {
+        let mut machine = direct_machine();
+        write_program(&mut machine, &[0x1050_0073]); // wfi
+        machine.advance_realtime_ns(0);
+
+        let outcome = machine.run_slice_until_outcome(10, |_| false);
+
+        assert_eq!(outcome.retired, 1);
+        assert!(outcome.idle);
+        assert_eq!(machine.idle_ticks, 0);
+    }
+
+    #[test]
+    fn realtime_sync_does_not_move_rdtime_backward() {
+        let rdtime = |machine: &VirtMachine| {
+            let sys = machine.cpu.sys.as_ref().unwrap();
+            machine
+                .cpu
+                .insn_count
+                .checked_div(sys.time_scale)
+                .map_or(sys.mtime, |ticks| ticks + sys.time_offset)
+        };
+        let mut machine = direct_machine();
+        machine.advance_realtime_ns(1_000_000);
+        machine.sync_devices();
+
+        machine.cpu.insn_count = 6_400;
+        let before = rdtime(&machine);
+        machine.sync_devices();
+        let after = rdtime(&machine);
+
+        assert_eq!(before, 10_064);
+        assert_eq!(after, before);
+        assert_eq!(machine.bus.mtime, before);
+        assert_eq!(machine.cpu.sys.as_ref().unwrap().time_scale, 0);
+
+        machine.cpu.insn_count = 12_800;
+        machine.sync_devices();
+        let frozen = machine.cpu.sys.as_ref().unwrap().mtime;
+        assert_eq!(frozen, before, "speculative time must not accumulate");
+
+        machine.advance_realtime_ns(640_000);
+        machine.sync_devices();
+        let caught_up = machine.cpu.sys.as_ref().unwrap();
+        assert_eq!(caught_up.mtime, 16_400);
+        assert_eq!(caught_up.time_scale, machine.insns_per_tick);
+    }
+
+    #[test]
+    fn virt_bus_jit_state_observes_guest_stores_once() {
+        let mut machine = direct_machine();
+        let code = RAM_BASE + KERNEL_OFFSET;
+        assert!(machine.bus.jit_fast_off(code, code, true).is_some());
+        machine.bus.jit_mark_page(code);
+        assert!(machine.bus.jit_fast_off(code, code, true).is_none());
+
+        machine.bus.write32(code, 1).unwrap();
+        machine.bus.write32(code + 4, 2).unwrap();
+
+        assert!(machine.bus.jit_page_marked(KERNEL_OFFSET >> 12));
+        assert!(machine.bus.jit_page_dirty(KERNEL_OFFSET >> 12));
+        assert_eq!(machine.bus.jit_take_dirty(), vec![KERNEL_OFFSET >> 12]);
     }
 }
