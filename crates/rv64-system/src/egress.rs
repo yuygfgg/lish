@@ -262,6 +262,7 @@ fn system_tls_config() -> Result<Arc<ClientConfig>, String> {
             "/etc/ssl/certs/ca-certificates.crt",
             "/etc/pki/tls/certs/ca-bundle.crt",
             "/etc/ssl/ca-bundle.pem",
+            "/etc/ssl/cert.pem",
         ]
         .into_iter()
         .map(std::path::PathBuf::from)

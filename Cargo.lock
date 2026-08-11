@@ -784,7 +784,9 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom",
+ "libc",
  "oxitls-rustcrypto-provider",
+ "pem-rfc7468",
  "rcgen",
  "rustls",
  "rustls-pki-types",

@@ -73,6 +73,7 @@ pub struct TlsAuthority {
     ca_params: CertificateParams,
     ca_key: EdKey,
     ca_der: Vec<u8>,
+    ca_pem: String,
     leaf_key: EdKey,
     configs: HashMap<String, Arc<rustls::ServerConfig>>,
 }
@@ -94,16 +95,19 @@ impl TlsAuthority {
             KeyUsagePurpose::CrlSign,
         ];
         ca_params.key_identifier_method = KeyIdMethod::PreSpecified(ca_key.key_id());
-        let ca_der = ca_params
+        let ca = ca_params
             .self_signed(&ca_key)
-            .map_err(|e| format!("CA certificate: {e}"))?
-            .der()
-            .to_vec();
+            .map_err(|e| format!("CA certificate: {e}"))?;
+        let ca_der = ca.der().to_vec();
+        let ca_pem =
+            pem_rfc7468::encode_string("CERTIFICATE", pem_rfc7468::LineEnding::LF, &ca_der)
+                .map_err(|e| format!("CA PEM: {e}"))?;
 
         Ok(Self {
             ca_params,
             ca_key,
             ca_der,
+            ca_pem,
             leaf_key,
             configs: HashMap::new(),
         })
@@ -111,6 +115,10 @@ impl TlsAuthority {
 
     pub fn ca_der(&self) -> &[u8] {
         &self.ca_der
+    }
+
+    pub fn ca_pem(&self) -> &str {
+        &self.ca_pem
     }
 
     pub fn server(&mut self, host: &str) -> Result<rustls::ServerConnection, String> {
@@ -169,6 +177,8 @@ mod tests {
     fn mints_a_server_config_and_reuses_it() {
         let mut ca = TlsAuthority::new().unwrap();
         assert!(ca.ca_der().len() > 200);
+        assert!(ca.ca_pem().starts_with("-----BEGIN CERTIFICATE-----\n"));
+        assert!(ca.ca_pem().ends_with("-----END CERTIFICATE-----\n"));
         let a = ca.server("example.test").unwrap();
         let b = ca.server("example.test").unwrap();
         assert!(a.is_handshaking());

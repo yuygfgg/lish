@@ -87,7 +87,14 @@ fi
 note "7/8 wasm build + smoke"
 if command -v node >/dev/null 2>&1; then
     node tests/vs-v86/harness-selftest.mjs || FAILED=1
+    node tests/jit-code-store.mjs || FAILED=1
+    if command -v zig >/dev/null 2>&1 || command -v "${PREFIX}gcc" >/dev/null 2>&1; then
+        tools/build-guest-benchmarks.sh || FAILED=1
+    else
+        skip "zig or ${PREFIX}gcc not found; JIT module benchmark unavailable"
+    fi
     cargo build --release -q -p rv64-wasm --target wasm32-unknown-unknown || FAILED=1
+    node tests/jit-module-bench.mjs || FAILED=1
     node tests/http-relay.mjs || FAILED=1
     node tests/wasm-smoke.mjs || FAILED=1
     node tests/jit-differential.mjs || FAILED=1

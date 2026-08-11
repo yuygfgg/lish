@@ -61,6 +61,7 @@ jobs:
           for guest in hello-nostd hello-std fpu-test bench; do
             (cd "guests/$guest" && cargo build --release)
           done
+          tools/build-guest-benchmarks.sh
 
       - name: Test debug workspace
         run: cargo test --workspace
@@ -75,6 +76,8 @@ jobs:
         run: |
           node tests/public-api.mjs
           node tests/worker-api.mjs
+          node tests/jit-code-store.mjs
+          node tests/jit-module-bench.mjs
           node tests/site-asset-source.mjs
           node tests/direct-boot.mjs
           node tests/alpine-boot.mjs

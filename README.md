@@ -67,6 +67,14 @@ For a non-interactive smoke test, stop after a known boot marker:
 RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs
 ```
 
+The generated Alpine image includes `rv64-jit-bench`. The program creates,
+warms, rewrites, and reruns executable guest pages. Optional arguments select
+the page count, rewrite rounds, and calls per page:
+
+```sh
+rv64-jit-bench 1024 8 2304
+```
+
 The browser and Node examples use the typed public API from `web/rv64.js`:
 
 ```js
@@ -258,7 +266,8 @@ wget -O- http://example.com/
 ```
 
 HTTPS uses CONNECT through an ephemeral local CA. The `--proxy` option exposes
-its public certificate as `/ca.der` on the read-only 9p tag `rv64-proxy`.
+its public certificate as `/ca.der` and `/ca.pem` on the read-only 9p tag
+`rv64-proxy`.
 
 ### Browser HTTP relay internals
 
@@ -276,8 +285,13 @@ details.
 
 ### Alpine/Linux machine
 
+The Alpine image builder runs as an unprivileged user on macOS and Linux. It
+requires `curl`, `gzip`, `genext2fs`, a SHA-256 tool, and one supported RISC-V
+cross compiler. It does not require host `apk`, `fakeroot`, `debugfs`, or a
+guest runner.
+
 ```sh
-nix develop -c tests/virt-smoke/mk-alpine-rootfs.sh target/bench
+tests/virt-smoke/mk-alpine-rootfs.sh target/bench
 node tests/alpine-boot.mjs
 ```
 

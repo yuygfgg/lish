@@ -156,10 +156,7 @@ fn main() {
     };
 
     let _raw = RawTerm::enable();
-    let mut stdin = {
-        libcish::set_nonblocking(0);
-        std::io::stdin()
-    };
+    let mut stdin = std::io::stdin();
     let mut ctrl_a = false;
     let t0 = std::time::Instant::now();
     let max_insns: Option<u64> = std::env::var("VBOOT_MAX_INSNS")
@@ -247,7 +244,8 @@ fn main() {
             }
         }
         let mut buf = [0u8; 256];
-        if let Ok(n) = stdin.read(&mut buf) {
+        if libcish::stdin_ready() {
+            let n = stdin.read(&mut buf).unwrap_or(0);
             if n > 0 {
                 let mut fwd = Vec::new();
                 for &b in &buf[..n] {
@@ -395,53 +393,42 @@ impl Drop for RawTerm {
 }
 
 mod libcish {
-    #[repr(C)]
-    #[derive(Clone)]
-    pub struct Termios {
-        pub c_iflag: u32,
-        pub c_oflag: u32,
-        pub c_cflag: u32,
-        pub c_lflag: u32,
-        pub c_line: u8,
-        pub c_cc: [u8; 32],
-        pub c_ispeed: u32,
-        pub c_ospeed: u32,
-    }
-    extern "C" {
-        fn tcgetattr(fd: i32, t: *mut Termios) -> i32;
-        fn tcsetattr(fd: i32, act: i32, t: *const Termios) -> i32;
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-        fn isatty(fd: i32) -> i32;
-    }
-    const ICANON: u32 = 0o000002;
-    const ECHO: u32 = 0o000010;
-    const ISIG: u32 = 0o000001;
+    pub type Termios = libc::termios;
+
     pub fn raw_mode() -> Option<Termios> {
         unsafe {
-            if isatty(0) == 0 {
+            if libc::isatty(libc::STDIN_FILENO) == 0 {
                 return None;
             }
             let mut t = core::mem::zeroed::<Termios>();
-            if tcgetattr(0, &mut t) != 0 {
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
                 return None;
             }
-            let orig = t.clone();
-            t.c_lflag &= !(ICANON | ECHO | ISIG);
-            t.c_cc[6] = 0;
-            t.c_cc[5] = 0;
-            tcsetattr(0, 0, &t);
+            let orig = t;
+            libc::cfmakeraw(&mut t);
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) != 0 {
+                return None;
+            }
             Some(orig)
         }
     }
+
     pub fn restore(t: &Termios) {
         unsafe {
-            tcsetattr(0, 0, t);
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
         }
     }
-    pub fn set_nonblocking(fd: i32) {
+
+    pub fn stdin_ready() -> bool {
+        // Do not set O_NONBLOCK. A PTY can share file status flags between
+        // stdin and stdout, which would make console writes fail with EAGAIN.
         unsafe {
-            let fl = fcntl(fd, 3, 0);
-            fcntl(fd, 4, fl | 0o4000);
+            let mut fd = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            libc::poll(&mut fd, 1, 0) > 0 && fd.revents & libc::POLLIN != 0
         }
     }
 }

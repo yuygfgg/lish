@@ -38,6 +38,9 @@ extern "C" {
     /// inside the module, so nothing imports the table and registration
     /// stays O(1) per batch.
     fn host_jit_register_batch(n: u32) -> i32;
+    /// Queue a dead table slot for cleanup after the current Wasm entry
+    /// returns to JavaScript. reason=1 identifies policy eviction.
+    fn host_jit_retire(idx: i32, reason: u32);
     /// One Ethernet frame the guest transmitted, for the page to forward over
     /// its WebSocket relay. Called at quantum granularity, like host_write.
     fn host_net_send(ptr: *const u8, len: usize);
@@ -263,6 +266,9 @@ struct JitBlock {
     alu: [u16; 5],
     /// Physical address of the code (full-system: verified per dispatch).
     pa: u64,
+    /// Sampled recency stamp. Updating this on every dispatch would defeat the
+    /// direct-mapped fast path, so dispatchers touch one block per 256 calls.
+    last_used: u64,
 }
 
 /// Direct-mapped dispatch line: `pc` is the full key. A slot with
@@ -295,6 +301,13 @@ struct JitState {
     /// pc -> compiled block; None = tried and not translatable (blacklist).
     /// Authoritative store (iterated for per-page invalidation).
     cache: std::collections::HashMap<u64, Option<JitBlock>>,
+    /// Number of cache entries that reference each raw table index. Region
+    /// functions have many references. Ordinary and batch members have one.
+    slot_refs: std::collections::HashMap<i32, u32>,
+    /// A compiled module can own one slot, a contiguous batch, or one region
+    /// function. Policy eviction retires the complete owner as one unit.
+    owner_slots: std::collections::HashMap<i32, Vec<i32>>,
+    slot_owner: std::collections::HashMap<i32, i32>,
     hot: std::collections::HashMap<u64, u32>,
     /// Fast dispatch cache: direct-mapped, populated lazily from `cache`.
     dispatch: Vec<DispatchLine>,
@@ -406,6 +419,9 @@ impl JitState {
     fn new() -> JitState {
         JitState {
             cache: Default::default(),
+            slot_refs: Default::default(),
+            owner_slots: Default::default(),
+            slot_owner: Default::default(),
             hot: Default::default(),
             dispatch: vec![
                 DispatchLine {
@@ -432,7 +448,14 @@ impl JitState {
         }
     }
     fn clear(&mut self) {
+        let slots: Vec<i32> = self.slot_owner.keys().copied().collect();
+        for idx in slots {
+            retire_table_slot(idx, false);
+        }
         self.cache.clear();
+        self.slot_refs.clear();
+        self.owner_slots.clear();
+        self.slot_owner.clear();
         self.hot.clear();
         self.page_entries.clear();
         self.superblocked.clear();
@@ -454,6 +477,190 @@ impl JitState {
         self.ic_done.clear();
         self.page_blocks.clear();
         self.clear_dispatch();
+    }
+
+    fn track_owner(&mut self, slots: impl IntoIterator<Item = i32>) -> Option<i32> {
+        let slots: Vec<i32> = slots.into_iter().filter(|&idx| idx >= 0).collect();
+        let owner = slots.first().copied()?;
+        for &idx in &slots {
+            register_table_slot(idx);
+            self.slot_owner.insert(idx, owner);
+        }
+        self.owner_slots.insert(owner, slots);
+        Some(owner)
+    }
+
+    fn cache_insert(&mut self, pc: u64, entry: Option<JitBlock>) -> Option<Option<JitBlock>> {
+        let previous = self.cache.insert(pc, entry);
+        let old_idx = previous
+            .flatten()
+            .map(|block| block.idx)
+            .filter(|&idx| idx >= 0);
+        let new_idx = entry.map(|block| block.idx).filter(|&idx| idx >= 0);
+        if let Some(Some(block)) = previous {
+            self.unindex_block(pc, block);
+        }
+        if let Some(block) = entry {
+            self.index_block(pc, block);
+        }
+        if old_idx != new_idx {
+            if let Some(idx) = new_idx {
+                *self.slot_refs.entry(idx).or_insert(0) += 1;
+            }
+            if let Some(idx) = old_idx {
+                self.release_slot(idx, false);
+            }
+        }
+        previous
+    }
+
+    fn cache_remove(&mut self, pc: &u64) -> Option<Option<JitBlock>> {
+        self.cache_remove_with_reason(pc, false)
+    }
+
+    fn cache_remove_with_reason(&mut self, pc: &u64, evicted: bool) -> Option<Option<JitBlock>> {
+        let previous = self.cache.remove(pc);
+        if let Some(Some(block)) = previous {
+            self.unindex_block(*pc, block);
+            if block.idx >= 0 {
+                self.release_slot(block.idx, evicted);
+            }
+        }
+        previous
+    }
+
+    fn block_physical_pages(&self, block: JitBlock) -> Vec<u64> {
+        if let Some(pages) = self.regions.get(&block.idx) {
+            return pages
+                .iter()
+                .map(|&(_, physical)| (physical - rv64_system::RAM_BASE) >> 12)
+                .collect();
+        }
+        if block.pa >= rv64_system::RAM_BASE {
+            vec![(block.pa - rv64_system::RAM_BASE) >> 12]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn index_block(&mut self, pc: u64, block: JitBlock) {
+        for page in self.block_physical_pages(block) {
+            let pcs = self.page_blocks.entry(page).or_default();
+            if !pcs.contains(&pc) {
+                pcs.push(pc);
+            }
+        }
+    }
+
+    fn unindex_block(&mut self, pc: u64, block: JitBlock) {
+        for page in self.block_physical_pages(block) {
+            let mut empty = false;
+            if let Some(pcs) = self.page_blocks.get_mut(&page) {
+                pcs.retain(|&entry| entry != pc);
+                empty = pcs.is_empty();
+            }
+            if empty {
+                self.page_blocks.remove(&page);
+            }
+        }
+    }
+
+    fn release_slot(&mut self, idx: i32, evicted: bool) {
+        let Some(refs) = self.slot_refs.get_mut(&idx) else {
+            return;
+        };
+        *refs -= 1;
+        if *refs != 0 {
+            return;
+        }
+        self.slot_refs.remove(&idx);
+        self.retire_owned_slot(idx, evicted);
+    }
+
+    fn retire_owned_slot(&mut self, idx: i32, evicted: bool) {
+        let Some(owner) = self.slot_owner.remove(&idx) else {
+            return;
+        };
+        let mut remove_owner = false;
+        if let Some(slots) = self.owner_slots.get_mut(&owner) {
+            slots.retain(|&slot| slot != idx);
+            remove_owner = slots.is_empty();
+        }
+        if remove_owner {
+            self.owner_slots.remove(&owner);
+        }
+        self.regions.remove(&idx);
+        self.region_exits.remove(&idx);
+        self.ext_queue.retain(|&slot| slot != idx);
+        retire_table_slot(idx, evicted);
+    }
+
+    fn retire_unreferenced_slots(&mut self, owner: i32) {
+        let slots = self.owner_slots.get(&owner).cloned().unwrap_or_default();
+        for idx in slots {
+            if !self.slot_refs.contains_key(&idx) {
+                self.retire_owned_slot(idx, false);
+            }
+        }
+    }
+
+    fn touch(&mut self, pc: u64) {
+        let stamp = next_jit_use_stamp();
+        if let Some(Some(block)) = self.cache.get_mut(&pc) {
+            block.last_used = stamp;
+        }
+    }
+
+    /// Evict the coldest module owner. The scan is intentionally infrequent:
+    /// it runs only after the JavaScript store rejects a registration.
+    fn evict_cold_owner(&mut self) -> usize {
+        let mut recency: std::collections::HashMap<i32, u64> = Default::default();
+        for block in self.cache.values().flatten().filter(|block| block.idx >= 0) {
+            let owner = self
+                .slot_owner
+                .get(&block.idx)
+                .copied()
+                .unwrap_or(block.idx);
+            recency
+                .entry(owner)
+                .and_modify(|stamp| *stamp = (*stamp).max(block.last_used))
+                .or_insert(block.last_used);
+        }
+        let Some(owner) = recency
+            .into_iter()
+            .min_by_key(|&(_, stamp)| stamp)
+            .map(|v| v.0)
+        else {
+            return 0;
+        };
+        let slots = self.owner_slots.get(&owner).cloned().unwrap_or_default();
+        let pcs: Vec<u64> = self
+            .cache
+            .iter()
+            .filter_map(|(&pc, entry)| {
+                let block = entry.as_ref()?;
+                let block_owner = self.slot_owner.get(&block.idx).copied()?;
+                (block_owner == owner).then_some(pc)
+            })
+            .collect();
+        for pc in pcs {
+            let dispatch = Self::dslot(pc);
+            if self.dispatch[dispatch].pc == pc {
+                self.dispatch[dispatch].pc = NO_PC;
+            }
+            self.cache_remove_with_reason(&pc, true);
+        }
+        // An owner can contain batch exports that never entered the cache.
+        for idx in slots.iter().copied() {
+            if !self.slot_refs.contains_key(&idx) {
+                self.retire_owned_slot(idx, true);
+            }
+        }
+        unsafe {
+            JIT_EVICTED_OWNERS += 1;
+            JIT_EVICTED_SLOTS += slots.len() as u64;
+        }
+        slots.len()
     }
     #[inline]
     fn clear_dispatch(&mut self) {
@@ -495,18 +702,67 @@ fn copystat_addr() -> u32 {
     (&raw const COPY_CHUNKS) as u32
 }
 
-/// Wasm function-table entries are unreclaimable (invalidated blocks become
-/// unreachable but their slots persist), so unbounded compilation — reboots,
-/// address-space churn, self-modifying code — would grow the table forever
-/// (PERFORMANCE_PROGRESS.md). Above this bound the JIT stops COMPILING new blocks
-/// (existing blocks keep running; the interpreter covers the rest). 1M
-/// entries ~= a few hundred MB of compiled code, far beyond any observed
-/// workload (fib ~20k, boot ~2k, tcc ~15k) but a hard stop for runaways.
-const JIT_TABLE_CAP: u64 = 1_000_000;
-static mut JIT_TABLE_ENTRIES: u64 = 0;
+/// The JavaScript code store owns the hard module, byte, and slot limits. A
+/// capacity rejection retires one cold owner and pauses compilation until the
+/// current Wasm call returns, when JavaScript can safely reuse its slots.
+const JIT_REGISTER_CAPACITY: i32 = -2;
+static mut JIT_LIVE_SLOTS: Option<std::collections::HashSet<i32>> = None;
+static mut JIT_TABLE_PEAK: u64 = 0;
+static mut JIT_TABLE_RETIRED: u64 = 0;
+static mut JIT_EVICTED_OWNERS: u64 = 0;
+static mut JIT_EVICTED_SLOTS: u64 = 0;
+static mut JIT_CAPACITY_REJECTIONS: u64 = 0;
+static mut JIT_CAPACITY_BLOCKED: bool = false;
+static mut JIT_USE_STAMP: u64 = 0;
 
-fn jit_table_full() -> bool {
-    unsafe { JIT_TABLE_ENTRIES >= JIT_TABLE_CAP }
+fn next_jit_use_stamp() -> u64 {
+    unsafe {
+        JIT_USE_STAMP = JIT_USE_STAMP.wrapping_add(1);
+        JIT_USE_STAMP
+    }
+}
+
+#[allow(static_mut_refs)]
+fn register_table_slot(idx: i32) {
+    if idx < 0 {
+        return;
+    }
+    unsafe {
+        let live = JIT_LIVE_SLOTS.get_or_insert_with(Default::default);
+        live.insert(idx);
+        JIT_TABLE_PEAK = JIT_TABLE_PEAK.max(live.len() as u64);
+    }
+}
+
+#[allow(static_mut_refs)]
+fn retire_table_slot(idx: i32, evicted: bool) {
+    if idx < 0 {
+        return;
+    }
+    unsafe {
+        let Some(live) = JIT_LIVE_SLOTS.as_mut() else {
+            return;
+        };
+        if live.remove(&idx) {
+            host_jit_retire(idx, u32::from(evicted));
+            JIT_TABLE_RETIRED += 1;
+        }
+    }
+}
+
+fn jit_compilation_allowed() -> bool {
+    unsafe { !JIT_CAPACITY_BLOCKED }
+}
+
+fn handle_jit_capacity(jit: &mut JitState) {
+    unsafe {
+        JIT_CAPACITY_REJECTIONS += 1;
+        JIT_CAPACITY_BLOCKED = true;
+    }
+    // One owner is enough to make the next registration progress. Larger
+    // bursts reclaim incrementally and cannot evict a full working set in one
+    // long execution slice before JavaScript can reuse the first slot.
+    jit.evict_cold_owner();
 }
 
 /// Longest compiled-code residency between interrupt/device checks, in guest
@@ -560,7 +816,8 @@ const EXT_TRIGGER: u32 = 16;
 const EXT_TARGET_CAP: usize = 8;
 /// Dispatch-line idx bit marking a region function, so the chain loop can
 /// attribute the following exit without a cache probe. Table indices stay
-/// far below this bit (JIT_TABLE_CAP = 1M); blacklist (-1) keeps its sign.
+/// far below this bit (the host store defaults to 65536 slots); blacklist (-1)
+/// keeps its sign.
 /// Shared with the emitter, whose chain transfers mask it off.
 const SB_IDX_BIT: i32 = rv64_jit::SB_IDX_BIT;
 /// Measured average stay (retired insns per dispatch of a region function)
@@ -995,6 +1252,14 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             55..=64 => DPROF_TRACE_MEM[(which - 55) as usize],
             65..=67 => DPROF_TRACE_CONTROL[(which - 65) as usize],
             68..=72 => DPROF_TRACE_ALU[(which - 68) as usize],
+            73 => JIT_LIVE_SLOTS
+                .as_ref()
+                .map_or(0, |slots| slots.len() as u64),
+            74 => JIT_TABLE_PEAK,
+            75 => JIT_TABLE_RETIRED,
+            76 => JIT_EVICTED_OWNERS,
+            77 => JIT_EVICTED_SLOTS,
+            78 => JIT_CAPACITY_REJECTIONS,
             _ => 0,
         }
     }
@@ -1215,6 +1480,7 @@ pub extern "C" fn sbtest() -> u64 {
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn user_run(budget: u64) -> i32 {
+    unsafe { JIT_CAPACITY_BLOCKED = false };
     let e = unsafe { USER.as_mut().expect("call user_load() first") };
     let jit = unsafe { USER_JIT.get_or_insert_with(JitState::new) };
     let mut host = JsHost;
@@ -1243,6 +1509,9 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
             if idx < 0 {
                 break; // blacklisted (user mode never blacklists with pa, but keep the invariant)
             }
+            if chained & 0xff == 0 {
+                jit.touch(pc);
+            }
             call_block(idx, m as *mut _ as *mut u8);
             // Read the dynamic retired count the block wrote: self-loop blocks
             // (Phase 3) run a runtime-variable number of iterations, so their
@@ -1262,7 +1531,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
 
         // --- hot counting + compile ---
         let pc = m.cpu.pc;
-        if !jit_table_full() && !jit.cache.contains_key(&pc) {
+        if jit_compilation_allowed() && !jit.cache.contains_key(&pc) {
             let c = jit.hot.entry(pc).or_insert(0);
             *c += 1;
             if *c >= unsafe { JIT_THRESHOLD } {
@@ -1288,11 +1557,20 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     map_gen_addr: 0,
                 };
                 let end = (pc as usize + 1024).min(m.mem.len());
+                let mut capacity = false;
                 let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
                     .and_then(|blk| {
                         unsafe { JIT_OUT = blk.wasm };
                         let idx = unsafe { host_jit_register() };
-                        (idx >= 0).then_some(JitBlock {
+                        if idx == JIT_REGISTER_CAPACITY {
+                            capacity = true;
+                            return None;
+                        }
+                        if idx < 0 {
+                            return None;
+                        }
+                        jit.track_owner([idx]);
+                        Some(JitBlock {
                             fp: false,
                             idx,
                             n: blk.n_insns,
@@ -1301,9 +1579,14 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                             control: blk.trace_control,
                             alu: blk.trace_alu,
                             pa: pc,
+                            last_used: next_jit_use_stamp(),
                         })
                     });
-                jit.cache.insert(pc, entry);
+                if capacity {
+                    handle_jit_capacity(jit);
+                } else {
+                    jit.cache_insert(pc, entry);
+                }
                 if entry.is_some() {
                     continue; // dispatch it immediately
                 }
@@ -2373,7 +2656,7 @@ fn demote_region(jit: &mut JitState, idx: i32) {
     unsafe { SB_DEMOTED += 1 };
     for &e in &r.entries {
         if matches!(jit.cache.get(&e), Some(Some(b)) if b.idx == idx) {
-            jit.cache.remove(&e);
+            jit.cache_remove(&e);
             let slot = JitState::dslot(e);
             if jit.dispatch[slot].pc == e {
                 jit.dispatch[slot].pc = NO_PC;
@@ -2530,6 +2813,7 @@ fn try_extend_region(m: &mut rv64_system::Machine, jit: &mut JitState, idx: i32)
 #[allow(static_mut_refs)]
 #[allow(clippy::needless_range_loop)] // avoids references to mutable profiling statics
 pub extern "C" fn sys_run(max_insns: u64) -> i32 {
+    unsafe { JIT_CAPACITY_BLOCKED = false };
     let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
     m.set_rtc_unix_ns(unsafe { host_unix_ms() } as u64 * 1_000_000);
     let jit = unsafe { SYS_JIT.get_or_insert_with(JitState::new) };
@@ -2599,7 +2883,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                     for pc in pcs {
                         unsafe { DIRTY_DROPPED += 1 };
                         dirty_vpages.insert(pc & !0xfff);
-                        jit.cache.remove(&pc);
+                        jit.cache_remove(&pc);
                         let slot = JitState::dslot(pc);
                         if jit.dispatch[slot].pc == pc {
                             jit.dispatch[slot].pc = NO_PC;
@@ -2688,7 +2972,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     DROP_REGION += 1;
                                 }
                             }
-                            jit.cache.remove(&pc);
+                            jit.cache_remove(&pc);
                             jit.dispatch[slot].pc = NO_PC;
                             break;
                         }
@@ -2713,6 +2997,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             if idx < 0 {
                 break; // blacklisted (pa-verified for the current mapping)
             }
+            if chained & 0xff == 0 {
+                jit.touch(pc);
+            }
             call_block(idx & !SB_IDX_BIT, mptr);
             // Observed successor + stability count (JitState::succ). A
             // trace ends at its first indirect jump, so this records where
@@ -2732,7 +3019,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 }
                 if e.2 == unsafe { IC_EXTEND_TRIGGER } && !jit.ic_done.contains(&pc) {
                     jit.ic_done.insert(pc);
-                    jit.cache.remove(&pc);
+                    jit.cache_remove(&pc);
                     jit.dispatch[sl].pc = NO_PC;
                     unsafe { IC_EXTENDS += 1 };
                     break; // recompile on the next pass through tier-up
@@ -2906,7 +3193,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 }
             }
         }
-        if !jit_table_full() && !jit.cache.contains_key(&pc) {
+        if jit_compilation_allowed() && !jit.cache.contains_key(&pc) {
             let hot = {
                 let c = jit.hot.entry(pc).or_insert(0);
                 *c += 1;
@@ -3236,9 +3523,11 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 unsafe { JIT_OUT = wasm };
                                 let bbase = unsafe { host_jit_register_batch(n) };
                                 if bbase >= 0 {
+                                    let owner = jit
+                                        .track_owner((0..n).map(|offset| bbase + offset as i32))
+                                        .expect("non-empty JIT batch");
                                     unsafe {
                                         BATCH_BASE_POOL[cell] = bbase as u32;
-                                        JIT_TABLE_ENTRIES += n as u64;
                                         BATCHES += 1;
                                         BATCH_MEMBERS += n as u64;
                                     }
@@ -3286,15 +3575,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                             control: mb.trace_control,
                                             alu: mb.trace_alu,
                                             pa: mpa,
+                                            last_used: next_jit_use_stamp(),
                                         };
-                                        if jit.cache.insert(mb.pc, Some(b)).is_none() {
-                                            for &(_, pp) in &spanned {
-                                                jit.page_blocks
-                                                    .entry((pp - rv64_system::RAM_BASE) >> 12)
-                                                    .or_default()
-                                                    .push(mb.pc);
-                                            }
-                                        }
+                                        jit.cache_insert(mb.pc, Some(b));
                                         if unsafe { SYS_SUPERBLOCK } {
                                             for &sd in &mb.seeds {
                                                 let e = jit
@@ -3307,8 +3590,12 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                             }
                                         }
                                     }
+                                    jit.retire_unreferenced_slots(owner);
                                     m.cpu.clear_store_jtlb();
                                     continue; // dispatch the seed member now
+                                } else if bbase == JIT_REGISTER_CAPACITY {
+                                    handle_jit_capacity(jit);
+                                    continue;
                                 }
                             }
                         }
@@ -3334,6 +3621,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 &next,
                             )
                         };
+                        let mut capacity = false;
                         let entry = blk.and_then(|blk| {
                             // Pages the emitted code actually came from
                             // ((0,0) span = wholly within [pc, pc+len)).
@@ -3354,10 +3642,14 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             }
                             unsafe { JIT_OUT = blk.wasm };
                             let idx = unsafe { host_jit_register() };
+                            if idx == JIT_REGISTER_CAPACITY {
+                                capacity = true;
+                                return None;
+                            }
                             if idx < 0 {
                                 return None;
                             }
-                            unsafe { JIT_TABLE_ENTRIES += 1 };
+                            jit.track_owner([idx]);
                             for &(_, pp) in &spanned {
                                 m.bus.jit_mark_page(pp);
                             }
@@ -3375,14 +3667,18 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     control: blk.trace_control,
                                     alu: blk.trace_alu,
                                     pa,
+                                    last_used: next_jit_use_stamp(),
                                 },
-                                spanned,
                                 blk.seeds,
                             ))
                         });
+                        if capacity {
+                            handle_jit_capacity(jit);
+                            continue;
+                        }
                         if missed_here {
                             let short = match &entry {
-                                Some((b, _, _)) => b.n < unsafe { TRACE_KEEP_MIN },
+                                Some((b, _)) => b.n < unsafe { TRACE_KEEP_MIN },
                                 None => true, // untranslatable: function coverage wanted
                             };
                             if short {
@@ -3391,7 +3687,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             }
                         }
                         match entry {
-                            Some((b, spanned, seeds)) => {
+                            Some((b, seeds)) => {
                                 // Trace exit targets are hot-path block
                                 // leaders: feed them to superblock discovery,
                                 // which trace compilation otherwise starves
@@ -3411,14 +3707,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                         }
                                     }
                                 }
-                                if jit.cache.insert(pc, Some(b)).is_none() {
-                                    for &(_, pp) in &spanned {
-                                        jit.page_blocks
-                                            .entry((pp - rv64_system::RAM_BASE) >> 12)
-                                            .or_default()
-                                            .push(pc);
-                                    }
-                                }
+                                jit.cache_insert(pc, Some(b));
                                 continue;
                             }
                             // Untranslatable at THESE code bytes: blacklist with
@@ -3440,13 +3729,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     control: [0; 3],
                                     alu: [0; 5],
                                     pa,
+                                    last_used: 0,
                                 };
-                                if jit.cache.insert(pc, Some(jb)).is_none() {
-                                    jit.page_blocks
-                                        .entry((pa - rv64_system::RAM_BASE) >> 12)
-                                        .or_default()
-                                        .push(pc);
-                                }
+                                jit.cache_insert(pc, Some(jb));
                             }
                         }
                     }
@@ -3654,14 +3939,50 @@ pub extern "C" fn sys_pending_builds() -> u32 {
 pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
     unsafe {
         let Some(pos) = PENDING_SB.iter().position(|p| p.ticket == ticket) else {
+            // JavaScript can finish a compile after a reboot cleared the
+            // ticket. Adopt and retire the returned slot so it cannot leak.
+            if idx >= 0 {
+                register_table_slot(idx);
+                retire_table_slot(idx, false);
+            }
             return;
         };
         let p = PENDING_SB.swap_remove(pos);
-        if idx < 0 || p.boot_gen != BOOT_GEN {
+        if idx == JIT_REGISTER_CAPACITY {
+            for &(va, _) in &p.pages {
+                if let Some(jit) = SYS_JIT.as_mut() {
+                    jit.superblocked.remove(&(p.aspace, va));
+                }
+            }
+            if let Some(jit) = SYS_JIT.as_mut() {
+                handle_jit_capacity(jit);
+            }
             return;
         }
-        let Some(m) = SYS.as_mut() else { return };
-        let Some(jit) = SYS_JIT.as_mut() else { return };
+        if idx < 0 {
+            if let Some(jit) = SYS_JIT.as_mut() {
+                for &(va, _) in &p.pages {
+                    jit.superblocked.remove(&(p.aspace, va));
+                }
+            }
+            return;
+        }
+        if p.boot_gen != BOOT_GEN {
+            register_table_slot(idx);
+            retire_table_slot(idx, false);
+            return;
+        }
+        let Some(m) = SYS.as_mut() else {
+            register_table_slot(idx);
+            retire_table_slot(idx, false);
+            return;
+        };
+        let Some(jit) = SYS_JIT.as_mut() else {
+            register_table_slot(idx);
+            retire_table_slot(idx, false);
+            return;
+        };
+        let owner = jit.track_owner([idx]).expect("valid async JIT slot");
         // Page written (dirtied/unmarked) while compiling → drop; un-superblock
         // so the region can retry with fresh bytes. `marked && !dirty` on every
         // page means no store has touched these code bytes since the compile
@@ -3688,11 +4009,10 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
             for &(va, _) in &p.pages {
                 jit.superblocked.remove(&(p.aspace, va));
             }
-
+            jit.retire_unreferenced_slots(owner);
             return;
         }
         SB_LANDED += 1;
-        JIT_TABLE_ENTRIES += 1;
         if p.pages.len() > 1 {
             jit.regions.insert(idx, p.pages.clone());
         }
@@ -3734,8 +4054,9 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
                 control: [0; 3],
                 alu: [0; 5],
                 pa: epa,
+                last_used: next_jit_use_stamp(),
             };
-            let prev = jit.cache.insert(e, Some(jb));
+            let prev = jit.cache_insert(e, Some(jb));
             SB_ENTRIES_IN += 1;
             if e == TRACE_PC {
                 TRACE_SB_INSTALL += 1;
@@ -3743,22 +4064,13 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
             if matches!(prev, Some(Some(b)) if b.n != 0) {
                 SB_REPLACED += 1;
             }
-            let fresh = prev.is_none();
-            for (k, &(_, pp)) in p.pages.iter().enumerate() {
-                if k == pi && !fresh {
-                    continue; // already registered under its own page
-                }
-                jit.page_blocks
-                    .entry((pp - rv64_system::RAM_BASE) >> 12)
-                    .or_default()
-                    .push(e);
-            }
             // Invalidate any line still pointing at the old individual block.
             let slot = JitState::dslot(e);
             if jit.dispatch[slot].pc == e {
                 jit.dispatch[slot].pc = NO_PC;
             }
         }
+        jit.retire_unreferenced_slots(owner);
     }
 }
 

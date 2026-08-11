@@ -109,6 +109,13 @@ export type RV64EventListeners = {
 export interface RV64Options {
   wasm: ImageSource;
   memoryMB?: number;
+  /** Bounds for dynamically compiled WebAssembly code owned by this VM. */
+  jit?: {
+    maxModules?: number;
+    maxSlots?: number;
+    maxBytes?: number;
+    growSlots?: number;
+  };
   boot: BootConfig;
   /** Linux defaults to the built-in fetch backend; bare metal defaults to none. */
   network?: NetworkConfig;

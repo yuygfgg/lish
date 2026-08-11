@@ -13,10 +13,9 @@ cargo build --manifest-path "$root/Cargo.toml" \
 
 install -m 0644 "$root/target/wasm32-unknown-unknown/release/rv64_wasm.wasm" "$out/rv64_wasm.wasm"
 install -m 0644 "$root/web/images/alpine/Image" "$out/modern-Image"
-disk="$(readlink -f "$root/web/images/alpine/alpine.ext4")"
-install -m 0644 "$disk" "$out/modern-alpine.ext4"
+install -m 0644 "$root/web/images/alpine/alpine.ext4" "$out/modern-alpine.ext4"
 
-(cd "$out" && sha256sum \
+(cd "$out" && "$root/tools/sha256.sh" \
     rv64_wasm.wasm modern-Image modern-alpine.ext4 > SHA256SUMS)
 
 echo "demo release assets ready in $out"

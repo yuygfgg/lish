@@ -76,7 +76,9 @@ with lib.kernel;
   VIRTIO_NET = yes;
   VIRTIO_CONSOLE = yes;
 
-  # Alpine root disk and the host-provided proxy-CA mount.
+  # Alpine root disk and the host-provided proxy-CA mount. The release image
+  # uses ext2 because genext2fs can build it without root on macOS and Linux.
+  EXT2_FS = yes;
   EXT4_FS = yes;
   NET_9P = yes;
   NET_9P_VIRTIO = yes;

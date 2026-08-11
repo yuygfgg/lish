@@ -145,19 +145,19 @@
 
             # modern-system bring-up (virt machine): OpenSBI + kernel + rootfs
             cpio # initramfs packing
-            e2fsprogs # mke2fs/debugfs/resize2fs — guest disk images
-            util-linux # sfdisk/losetup helpers
+            genext2fs # unprivileged rootfs images on Linux and macOS
             zstd # image (de)compression
-
-            # Debian rootfs bring-up (build-essential in the guest)
-            debootstrap # build a riscv64 Debian rootfs (--foreign)
-            apk-tools # install Alpine riscv64 packages into an offline root
-            fakeroot # run debootstrap without real root
-            dpkg # dpkg-deb -x for offline .deb extraction
-            gnutar
             gzip
             gnused
-            wget
+          ] ++ lib.optionals stdenv.isLinux [
+            # Legacy Debian benchmark image tooling. The release Alpine image
+            # does not use these Linux-only packages.
+            e2fsprogs
+            util-linux
+            debootstrap
+            fakeroot
+            dpkg
+            gnutar
           ];
 
           shellHook = ''

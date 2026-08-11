@@ -197,6 +197,8 @@ const CA_URL_HTTPS: &str = "https://rv64-proxy.invalid/ca.der";
 pub const CA_9P_TAG: &str = "rv64-proxy";
 /// Path of the DER-encoded public proxy CA inside [`CA_9P_TAG`].
 pub const CA_9P_DER_PATH: &str = "/ca.der";
+/// Path of the PEM-encoded public proxy CA inside [`CA_9P_TAG`].
+pub const CA_9P_PEM_PATH: &str = "/ca.pem";
 
 /// Headers that describe *this* hop and must not be forwarded (RFC 7230 §6.1),
 /// plus `proxy-connection`, which is the pre-standard spelling clients still
@@ -280,12 +282,15 @@ impl Proxy {
     /// Build a tiny 9p export containing this proxy's public root certificate.
     ///
     /// Calling this eagerly creates the same authority later used for CONNECT
-    /// tunnels. Only the public DER certificate enters the guest; the signing
-    /// key remains private inside [`TlsAuthority`].
+    /// tunnels. Only the public certificate enters the guest; the signing
+    /// key remains private inside [`TlsAuthority`]. DER remains available for
+    /// existing guests. PEM lets small guests install the CA without OpenSSL.
     pub fn ca_9p_server(&mut self) -> Result<crate::p9::Server, String> {
         let der = self.ca_der()?.to_vec();
+        let pem = self.ca_pem()?.as_bytes().to_vec();
         let mut fs = crate::p9fs::MemFs::new();
         fs.add_file(CA_9P_DER_PATH, &der, 0o444);
+        fs.add_file(CA_9P_PEM_PATH, &pem, 0o444);
         Ok(crate::p9::Server::new(CA_9P_TAG, Box::new(fs)))
     }
 
@@ -297,6 +302,16 @@ impl Proxy {
             .as_ref()
             .expect("TLS authority initialized")
             .ca_der())
+    }
+
+    /// The PEM form of [`Self::ca_der`].
+    pub fn ca_pem(&mut self) -> Result<&str, String> {
+        self.ensure_tls()?;
+        Ok(self
+            .tls
+            .as_ref()
+            .expect("TLS authority initialized")
+            .ca_pem())
     }
 
     fn ensure_tls(&mut self) -> Result<(), String> {

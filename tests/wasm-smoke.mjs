@@ -3,6 +3,7 @@
 // Run via tests/run-all.sh, or directly:
 //   node tests/wasm-smoke.mjs
 import { readFile } from "node:fs/promises";
+import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -29,6 +30,7 @@ function check(name, ok, detail = "") {
     "host_jit_register",
     "host_jit_register_async",
     "host_jit_register_batch",
+    "host_jit_retire",
     "host_net_send",
     "host_now_ms",
     "host_random",
@@ -143,6 +145,42 @@ for (const [name, argv, wantExit, wantOut] of guests) {
       counts[0] === counts[1] && counts[0] > 0n,
       `interp=${counts[0]} jit=${counts[1]}`,
     );
+  }
+}
+
+// ---- code-store lifecycle: repeated address spaces must reuse table slots ----
+{
+  const path = join(
+    root,
+    "guests/bench/target/riscv64gc-unknown-linux-musl/release/bench",
+  );
+  if (!existsSync(path)) {
+    console.log("SKIP JIT slot reuse (bench guest not built)");
+  } else {
+    const vm = await RV64.create(wasmBytes, {
+      maxModules: 4096,
+      maxSlots: 4096,
+      maxBytes: 32 * 1024 * 1024,
+      growSlots: 64,
+    });
+    const elf = new Uint8Array(await readFile(path));
+    const highWater = [];
+    vm.onWrite = () => {};
+    for (let generation = 0; generation < 4; generation++) {
+      vm.loadElf(elf, ["bench", "fast"]);
+      const stop = vm.runUser(2_000_000_000n);
+      assert.equal(stop, Stop.EXITED);
+      const metrics = vm.jitMetrics();
+      assert.equal(metrics.liveSlots, metrics.rustLiveSlots);
+      highWater.push(metrics.tableHighWater);
+    }
+    const stable = highWater.every((value) => value === highWater[0]);
+    check(
+      "JIT table slots reused across address spaces",
+      stable && vm.jitMetrics().retiredSlots > 0,
+      `high-water=${highWater.join(",")} retired=${vm.jitMetrics().retiredSlots}`,
+    );
+    vm.destroyJit();
   }
 }
 

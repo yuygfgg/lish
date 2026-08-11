@@ -11,6 +11,230 @@ export const Stop = Object.freeze({
   EXITED: 4,
 });
 
+const DEFAULT_JIT_LIMITS = Object.freeze({
+  maxModules: 32_768,
+  maxSlots: 65_536,
+  maxBytes: 128 * 1024 * 1024,
+  growSlots: 4096,
+});
+
+/**
+ * Owns all dynamically compiled WebAssembly functions for one VM.
+ *
+ * Rust retires table indexes while a VM slice is active. This store clears
+ * and reuses those indexes only after control returns to JavaScript. A module
+ * remains live until its final exported function leaves the table.
+ */
+export class JitCodeStore {
+  constructor(table, limits = {}) {
+    if (!(table instanceof WebAssembly.Table)) {
+      throw new TypeError("JitCodeStore requires a WebAssembly.Table");
+    }
+    this.table = table;
+    this.base = table.length;
+    this.next = this.base;
+    this.limits = Object.freeze({ ...DEFAULT_JIT_LIMITS, ...limits });
+    for (const name of ["maxModules", "maxSlots", "maxBytes", "growSlots"]) {
+      const value = this.limits[name];
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new RangeError(`jit.${name} must be a positive safe integer`);
+      }
+    }
+    this.free = [];
+    this.owners = new Map();
+    this.slotOwners = new Map();
+    this.pending = new Map();
+    this.nextOwner = 1;
+    this.generation = 0;
+    this.liveSlots = 0;
+    this.liveBytes = 0;
+    this.peakModules = 0;
+    this.peakSlots = 0;
+    this.peakBytes = 0;
+    this.emittedBytes = 0;
+    this.registeredModules = 0;
+    this.retiredModules = 0;
+    this.retiredSlots = 0;
+    this.evictedModules = 0;
+    this.evictedSlots = 0;
+    this.capacityRejects = 0;
+    this.registrationFailures = 0;
+  }
+
+  canRegister(slotCount, byteLength) {
+    return Number.isSafeInteger(slotCount) &&
+      slotCount > 0 &&
+      this.owners.size < this.limits.maxModules &&
+      this.liveSlots + slotCount <= this.limits.maxSlots &&
+      this.liveBytes + byteLength <= this.limits.maxBytes &&
+      this.#hasRun(slotCount);
+  }
+
+  register(instance, exportNames, byteLength) {
+    if (!this.canRegister(exportNames.length, byteLength)) {
+      this.capacityRejects++;
+      return -2;
+    }
+    const functions = exportNames.map((name) => instance.exports[name]);
+    if (functions.some((fn) => typeof fn !== "function")) {
+      this.registrationFailures++;
+      throw new TypeError("JIT module has a missing function export");
+    }
+    const base = this.#allocate(functions.length);
+    const ownerId = this.nextOwner++;
+    const owner = {
+      bytes: byteLength,
+      evicted: false,
+      slots: new Set(),
+    };
+    try {
+      for (let i = 0; i < functions.length; i++) {
+        const slot = base + i;
+        this.table.set(slot, functions[i]);
+        owner.slots.add(slot);
+        this.slotOwners.set(slot, ownerId);
+      }
+    } catch (error) {
+      for (const slot of owner.slots) {
+        this.table.set(slot, null);
+        this.slotOwners.delete(slot);
+      }
+      this.#releaseRun(base, functions.length);
+      this.registrationFailures++;
+      throw error;
+    }
+    this.owners.set(ownerId, owner);
+    this.liveSlots += functions.length;
+    this.liveBytes += byteLength;
+    this.emittedBytes += byteLength;
+    this.registeredModules++;
+    this.peakModules = Math.max(this.peakModules, this.owners.size);
+    this.peakSlots = Math.max(this.peakSlots, this.liveSlots);
+    this.peakBytes = Math.max(this.peakBytes, this.liveBytes);
+    return base;
+  }
+
+  /** Queue one slot for cleanup. reason=1 identifies policy eviction. */
+  retire(slot, reason = 0) {
+    if (!this.slotOwners.has(slot)) return;
+    this.pending.set(slot, Math.max(this.pending.get(slot) ?? 0, reason));
+  }
+
+  /** Clear queued slots at a JavaScript boundary, never in a Wasm import. */
+  flushRetired() {
+    if (this.pending.size === 0) return;
+    const slots = [...this.pending].sort((a, b) => a[0] - b[0]);
+    this.pending.clear();
+    const released = [];
+    for (const [slot, reason] of slots) {
+      const ownerId = this.slotOwners.get(slot);
+      if (ownerId === undefined) continue;
+      const owner = this.owners.get(ownerId);
+      this.table.set(slot, null);
+      this.slotOwners.delete(slot);
+      owner.slots.delete(slot);
+      owner.evicted ||= reason === 1;
+      this.liveSlots--;
+      this.retiredSlots++;
+      if (reason === 1) this.evictedSlots++;
+      released.push(slot);
+      if (owner.slots.size === 0) {
+        this.owners.delete(ownerId);
+        this.liveBytes -= owner.bytes;
+        this.retiredModules++;
+        if (owner.evicted) this.evictedModules++;
+      }
+    }
+    for (let i = 0; i < released.length;) {
+      let end = i + 1;
+      while (end < released.length && released[end] === released[end - 1] + 1) end++;
+      this.#releaseRun(released[i], end - i);
+      i = end;
+    }
+  }
+
+  clear() {
+    this.generation++;
+    for (const slot of this.slotOwners.keys()) this.pending.set(slot, 0);
+    this.flushRetired();
+  }
+
+  snapshot() {
+    return Object.freeze({
+      liveModules: this.owners.size,
+      liveSlots: this.liveSlots,
+      freeSlots: this.free.reduce((sum, run) => sum + run.length, 0),
+      tableHighWater: this.next - this.base,
+      tableCapacity: this.table.length - this.base,
+      liveBytes: this.liveBytes,
+      emittedBytes: this.emittedBytes,
+      peakModules: this.peakModules,
+      peakSlots: this.peakSlots,
+      peakBytes: this.peakBytes,
+      registeredModules: this.registeredModules,
+      retiredModules: this.retiredModules,
+      retiredSlots: this.retiredSlots,
+      evictedModules: this.evictedModules,
+      evictedSlots: this.evictedSlots,
+      capacityRejects: this.capacityRejects,
+      registrationFailures: this.registrationFailures,
+      limits: this.limits,
+    });
+  }
+
+  #hasRun(length) {
+    return this.free.some((run) => run.length >= length) ||
+      this.next + length <= this.base + this.limits.maxSlots;
+  }
+
+  #allocate(length) {
+    const freeIndex = this.free.findIndex((run) => run.length >= length);
+    if (freeIndex >= 0) {
+      const run = this.free[freeIndex];
+      const base = run.start;
+      run.start += length;
+      run.length -= length;
+      if (run.length === 0) this.free.splice(freeIndex, 1);
+      return base;
+    }
+    const base = this.next;
+    const required = base + length;
+    if (required > this.table.length) {
+      const maximum = this.base + this.limits.maxSlots;
+      const growth = Math.min(
+        Math.max(this.limits.growSlots, required - this.table.length),
+        maximum - this.table.length,
+      );
+      if (growth <= 0) throw new RangeError("JIT table capacity exhausted");
+      this.table.grow(growth);
+    }
+    this.next = required;
+    return base;
+  }
+
+  #releaseRun(start, length) {
+    if (length === 0) return;
+    let index = this.free.findIndex((run) => run.start > start);
+    if (index < 0) index = this.free.length;
+    this.free.splice(index, 0, { start, length });
+    if (index > 0) {
+      const previous = this.free[index - 1];
+      const current = this.free[index];
+      if (previous.start + previous.length === current.start) {
+        previous.length += current.length;
+        this.free.splice(index, 1);
+        index--;
+      }
+    }
+    const current = this.free[index];
+    const next = this.free[index + 1];
+    if (next && current.start + current.length === next.start) {
+      current.length += next.length;
+      this.free.splice(index + 1, 1);
+    }
+  }
+}
+
 // Low-level bindings used by rv64.js itself and the repository's architecture
 // and differential tests. This is intentionally not the supported embedding
 // API; applications should use RV64 below.
@@ -38,10 +262,11 @@ export class RV64Debug {
     this.p9Pending = false;
     /** Origins known to require the relay, avoiding a failed fetch every time. */
     this.httpRelayOrigins = new Set();
+    this.jitRetirementFlushScheduled = false;
   }
 
   /** Instantiate from wasm bytes (ArrayBuffer/TypedArray/Response). */
-  static async create(wasmSource) {
+  static async create(wasmSource, jitOptions = {}) {
     let vm;
     const imports = {
       env: {
@@ -92,6 +317,10 @@ export class RV64Debug {
             crypto.getRandomValues(buf.subarray(off, Math.min(off + 65536, len)));
           }
         },
+        host_jit_retire: (idx, reason) => {
+          vm.jitCodeStore.retire(idx, reason);
+          vm.scheduleJitRetirementFlush();
+        },
         // JIT: instantiate the module the core just emitted (JIT_OUT),
         // register its `run` function in the core's function table, and
         // return the table index for call_indirect dispatch.
@@ -105,6 +334,10 @@ export class RV64Debug {
             ).slice();
             vm.jitRegCount = (vm.jitRegCount ?? 0) + 1;
             vm.jitRegBytes = (vm.jitRegBytes ?? 0) + bytes.length;
+            if (!vm.jitCodeStore.canRegister(1, bytes.length)) {
+              vm.jitCodeStore.capacityRejects++;
+              return -2;
+            }
             const mod = new WebAssembly.Module(bytes);
             vm.jitRegMs = (vm.jitRegMs ?? 0) + (performance.now() - t0);
             const inst = new WebAssembly.Instance(mod, {
@@ -118,17 +351,7 @@ export class RV64Debug {
                 __indirect_function_table: vm.ex.__indirect_function_table,
               },
             });
-            const table = vm.ex.__indirect_function_table;
-            // Bulk pre-growth: growing a shared table forces V8 to rewire
-            // EVERY instance that imports it, so one grow(1) per block was
-            // O(instances) each — quadratic across a workload like tcc
-            // (7.5k chain-bearing modules), and the reason every chaining
-            // configuration measured 2-3x slower there. Grow in 4096-slot
-            // steps and hand out indices from a cursor instead.
-            vm.tableNext ??= table.length;
-            if (vm.tableNext >= table.length) table.grow(4096);
-            const idx = vm.tableNext++;
-            table.set(idx, inst.exports.run);
+            const idx = vm.jitCodeStore.register(inst, ["run"], bytes.length);
             vm.jitRegTotalMs = (vm.jitRegTotalMs ?? 0) + (performance.now() - t0);
             vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
             return idx;
@@ -147,15 +370,16 @@ export class RV64Debug {
               vm.ex.jit_out_ptr(),
               vm.ex.jit_out_len(),
             ).slice();
+            if (!vm.jitCodeStore.canRegister(n, bytes.length)) {
+              vm.jitCodeStore.capacityRejects++;
+              return -2;
+            }
             const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
               env: { memory: vm.ex.memory, tlb_fill: vm.ex.jit_tlb_fill },
             });
-            const table = vm.ex.__indirect_function_table;
-            vm.tableNext ??= table.length;
-            if (vm.tableNext + n > table.length) table.grow(Math.max(4096, n));
-            const base = vm.tableNext;
-            for (let j = 0; j < n; j++) table.set(base + j, inst.exports["r" + j]);
-            vm.tableNext += n;
+            const names = Array.from({ length: n }, (_, j) => "r" + j);
+            const base = vm.jitCodeStore.register(inst, names, bytes.length);
+            if (base < 0) return base;
             vm.jitBlocks = (vm.jitBlocks ?? 0) + n;
             vm.jitBatches = (vm.jitBatches ?? 0) + 1;
             return base;
@@ -176,6 +400,13 @@ export class RV64Debug {
             vm.ex.jit_out_ptr(),
             vm.ex.jit_out_len(),
           ).slice();
+          const generation = vm.jitCodeStore.generation;
+          if (!vm.jitCodeStore.canRegister(1, bytes.length)) {
+            vm.jitCodeStore.capacityRejects++;
+            vm.ex.sys_sb_ready(ticket, -2);
+            vm.flushJitRetirements();
+            return;
+          }
           WebAssembly.compile(bytes)
             .then((mod) =>
               WebAssembly.instantiate(mod, {
@@ -188,18 +419,23 @@ export class RV64Debug {
               }),
             )
             .then((inst) => {
-              const table = vm.ex.__indirect_function_table;
-              vm.tableNext ??= table.length;
-              if (vm.tableNext >= table.length) table.grow(4096);
-              const idx = vm.tableNext++;
-              table.set(idx, inst.exports.run);
+              if (generation !== vm.jitCodeStore.generation) {
+                vm.ex.sys_sb_ready(ticket, -1);
+                return;
+              }
+              const idx = vm.jitCodeStore.register(inst, ["run"], bytes.length);
+              if (idx < 0) {
+                vm.ex.sys_sb_ready(ticket, idx);
+                return;
+              }
               vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
               vm.ex.sys_sb_ready(ticket, idx);
             })
             .catch((e) => {
               console.warn("async jit register failed:", e);
               vm.ex.sys_sb_ready(ticket, -1);
-            });
+            })
+            .finally(() => vm.flushJitRetirements());
         },
       },
     };
@@ -208,6 +444,7 @@ export class RV64Debug {
         ? await WebAssembly.instantiateStreaming(wasmSource, imports)
         : await WebAssembly.instantiate(wasmSource, imports);
     vm = new RV64Debug(instance);
+    vm.jitCodeStore = new JitCodeStore(vm.ex.__indirect_function_table, jitOptions);
     // Hardware FMA: use f64x2.relaxed_madd for the guest's FMADD family iff
     // the engine validates it AND it is fused on this hardware (the spec
     // allows unfused; only fused is bit-exact). Probe empirically:
@@ -266,6 +503,33 @@ export class RV64Debug {
     return vm;
   }
 
+  flushJitRetirements() {
+    this.jitRetirementFlushScheduled = false;
+    this.jitCodeStore.flushRetired();
+  }
+
+  scheduleJitRetirementFlush() {
+    if (this.jitRetirementFlushScheduled) return;
+    this.jitRetirementFlushScheduled = true;
+    queueMicrotask(() => this.flushJitRetirements());
+  }
+
+  jitMetrics() {
+    return Object.freeze({
+      ...this.jitCodeStore.snapshot(),
+      rustLiveSlots: Number(this.ex.jit_stat(73)),
+      rustPeakSlots: Number(this.ex.jit_stat(74)),
+      rustRetiredSlots: Number(this.ex.jit_stat(75)),
+      rustEvictedOwners: Number(this.ex.jit_stat(76)),
+      rustEvictedSlots: Number(this.ex.jit_stat(77)),
+      rustCapacityRejects: Number(this.ex.jit_stat(78)),
+    });
+  }
+
+  destroyJit() {
+    this.jitCodeStore.clear();
+  }
+
   // ---- user-mode Linux API ----
 
   /** Copy bytes into the wasm staging buffer. */
@@ -285,12 +549,16 @@ export class RV64Debug {
       this.ex.user_arg_push();
     }
     this.#stage(elfBytes);
-    return this.ex.user_load(memMB << 20) === 0;
+    const loaded = this.ex.user_load(memMB << 20) === 0;
+    this.flushJitRetirements();
+    return loaded;
   }
 
   /** Run the loaded program; returns a Stop.* code (EXITED when done). */
   runUser(budget = 10_000_000_000n) {
-    return this.ex.user_run(BigInt(budget));
+    const stop = this.ex.user_run(BigInt(budget));
+    this.flushJitRetirements();
+    return stop;
   }
 
   userExitCode() {
@@ -326,7 +594,9 @@ export class RV64Debug {
 
   /** Run up to `budget` instructions; returns a Stop.* code. */
   run(budget = 1_000_000n) {
-    return this.ex.run(BigInt(budget));
+    const stop = this.ex.run(BigInt(budget));
+    this.flushJitRetirements();
+    return stop;
   }
 
   get pc() {
@@ -401,7 +671,9 @@ RV64Debug.prototype.bootLinux = function ({
   this.ex.sys_net_enable(net ? 1 : 0);
   // The proxy implies a NIC: the guest reaches it over ordinary TCP.
   if (proxy) this.ex.sys_proxy_enable(1, proxyUpgradeHttps ? 1 : 0);
+  this.jitCodeStore.generation++;
   this.ex.sys_boot(ramMB);
+  this.flushJitRetirements();
 };
 
 /**
@@ -661,7 +933,9 @@ RV64Debug.prototype.performHttpViaRelay = async function (id, encodedRequest) {
 
 /** Run a slice of the booted system. Returns true when powered off. */
 RV64Debug.prototype.runSystem = function (maxInsns = 10_000_000n) {
-  return this.ex.sys_run(BigInt(maxInsns)) === 1;
+  const stopped = this.ex.sys_run(BigInt(maxInsns)) === 1;
+  this.flushJitRetirements();
+  return stopped;
 };
 
 /** Send keyboard input to the guest console. */
@@ -708,6 +982,7 @@ RV64Debug.prototype.bootVirtLinux = function ({
   this.ex.virt_net_enable(net || proxy ? 1 : 0);
   this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
   this.ex.virt_boot(ramMB);
+  this.flushJitRetirements();
 };
 
 /** Assemble riscv-virt and enter Linux directly in S-mode. */
@@ -741,11 +1016,13 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
   this.ex.virt_net_enable(net || proxy ? 1 : 0);
   this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
   this.ex.virt_boot_direct(ramMB);
+  this.flushJitRetirements();
 };
 
 /** Run a slice of the modern virt machine. Returns true when powered off. */
 RV64Debug.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
   const stopped = this.ex.virt_run(BigInt(maxInsns)) === 1;
+  this.flushJitRetirements();
   this.pumpP9();
   return stopped;
 };
@@ -1291,7 +1568,7 @@ export class RV64 {
     if (options.execution?.mode !== undefined && options.execution.mode !== "local") {
       throw new TypeError(`unknown execution mode: ${options.execution.mode}`);
     }
-    const { wasm, boot, memoryMB, events } = options;
+    const { wasm, boot, memoryMB, events, jit } = options;
     if (!wasm) throw new TypeError("RV64.create requires wasm");
     if (!boot?.mode) throw new TypeError("RV64.create requires boot.mode");
 
@@ -1316,7 +1593,7 @@ export class RV64 {
       }
     }
     const network = normalizeNetwork(options.network, boot.mode);
-    const core = await RV64Debug.create(wasmBytes);
+    const core = await RV64Debug.create(wasmBytes, jit);
     const vm = new RV64(core, { ...resolved, memoryMB }, network, events);
     vm.#assemble();
     vm.#emit("ready", undefined);
@@ -1379,6 +1656,7 @@ export class RV64 {
     this.#wisp?.close();
     this.#wisp = null;
     this.#core.disconnectHttpRelay();
+    this.#core.destroyJit();
     this.#listeners.clear();
     this.#core = null;
   }
@@ -1828,6 +2106,7 @@ function cloneWorkerOptions(options) {
       wasm: cloneImage(options.wasm, "wasm"),
       boot,
       memoryMB: options.memoryMB,
+      ...(options.jit ? { jit: { ...options.jit } } : {}),
       ...(network ? { network } : {}),
       execution: { mode: "local" },
     },
