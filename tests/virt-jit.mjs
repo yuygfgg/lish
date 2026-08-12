@@ -347,6 +347,9 @@ async function runKernel(kernel, configure = () => {}) {
   const instructionLimit = 30_000_000n;
   while (!poweredOff && vm.virtInsnCount() < instructionLimit) {
     poweredOff = vm.runVirtSystem(1_000_000n);
+    if (vm.ex.sys_pending_builds() !== 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
   }
   return { vm, poweredOff };
 }
@@ -434,17 +437,22 @@ for (const [stopInstruction, expectedPowerOff] of [
 console.log("PASS final host I/O flush preserves power-off and realtime WFI state");
 
 {
-  const vm = await RV64Debug.create(wasm);
+  const vm = await RV64Debug.create(wasm, { asyncCompilers: 1 });
   const originalCompile = WebAssembly.compile;
   let releaseCompile;
   const compileGate = new Promise((resolve) => {
     releaseCompile = resolve;
   });
   let compileCalls = 0;
+  let heldRegion = false;
   WebAssembly.compile = async function gatedCompile(source) {
     compileCalls++;
+    const holdThisCompile = !heldRegion && vm.ex.jit_stat(81) !== 0n;
     const module = await originalCompile.call(WebAssembly, source);
-    await compileGate;
+    if (holdThisCompile) {
+      heldRegion = true;
+      await compileGate;
+    }
     return module;
   };
 
@@ -455,12 +463,21 @@ console.log("PASS final host I/O flush preserves power-off and realtime WFI stat
     vm.bootVirtLinuxDirect({ kernel: asyncStaleKernel(), ramMB: 32 });
 
     const issuedBefore = vm.ex.jit_stat(12);
-    for (let slice = 0; slice < 100 && vm.ex.sys_pending_builds() === 0; slice++) {
+    for (let slice = 0; slice < 5000 && vm.ex.jit_stat(81) === 0n; slice++) {
       vm.runVirtSystem(100_000n);
+      await new Promise((resolve) => setImmediate(resolve));
     }
-    assert.equal(vm.ex.sys_pending_builds(), 1, "no async superblock build was issued");
-    assert.equal(compileCalls, 1, "the superblock did not enter async WebAssembly compilation");
-    assert.equal(vm.ex.jit_stat(12), issuedBefore + 1n);
+    for (let turn = 0; turn < 100 && vm.ex.sys_pending_builds() > 1; turn++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    for (let turn = 0; turn < 100 && !heldRegion; turn++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(vm.ex.sys_pending_builds(), 1, "unrelated async builds did not drain");
+    assert.equal(vm.ex.jit_stat(81), 1n, "the superblock did not enter async WebAssembly compilation");
+    assert.equal(heldRegion, true, "the test did not hold the region compile");
+    assert.ok(compileCalls >= 1, "no full-system module entered async WebAssembly compilation");
+    assert.ok(vm.ex.jit_stat(12) >= issuedBefore + 1n);
 
     const beforeMutation = {
       dirty: vm.ex.jit_stat(23),
@@ -471,25 +488,21 @@ console.log("PASS final host I/O flush preserves power-off and realtime WFI stat
     vm.virtConsoleInput(Uint8Array.of(1));
 
     let dirtyDrained = false;
-    let pageRecompiled = false;
-    for (let step = 0; step < 10_000 && !pageRecompiled; step++) {
+    for (let step = 0; step < 10_000 && !dirtyDrained; step++) {
       vm.runVirtSystem(1n);
       dirtyDrained ||= vm.ex.jit_stat(23) > beforeMutation.dirty;
-      pageRecompiled =
-        dirtyDrained && (vm.jitBlocks ?? 0) > beforeMutation.registrations;
     }
     assert.equal(dirtyDrained, true, "the guest code-page write was not drained");
     assert.ok(
       vm.ex.jit_stat(24) > beforeMutation.dropped,
       "dirty-page drain removed no compiled block",
     );
-    assert.equal(pageRecompiled, true, "the drained code page was not synchronously recompiled");
     assert.equal(
       vm.ex.jit_stat(12),
       beforeMutation.issued,
-      "a second async build obscured the generation under test",
+      "a second region build obscured the generation under test",
     );
-    assert.equal(vm.ex.sys_pending_builds(), 1, "the old async result completed before release");
+    assert.ok(vm.ex.sys_pending_builds() >= 1, "the old async result completed before release");
 
     const landedBefore = vm.ex.jit_stat(13);
     const staleBefore = vm.ex.jit_stat(14);
@@ -505,8 +518,14 @@ console.log("PASS final host I/O flush preserves power-off and realtime WFI stat
     assert.equal(vm.ex.jit_stat(14), staleBefore + 1n, "generation mismatch was not rejected");
     assert.equal(metricsAfter.liveSlots, metricsBefore.liveSlots, "stale JIT slot leaked");
     assert.equal(metricsAfter.rustLiveSlots, metricsBefore.rustLiveSlots);
-    assert.equal(metricsAfter.registeredModules, metricsBefore.registeredModules + 1);
-    assert.equal(metricsAfter.retiredSlots, metricsBefore.retiredSlots + 1);
+    assert.ok(
+      metricsAfter.registeredModules >= metricsBefore.registeredModules + 1,
+      "the held async module did not complete",
+    );
+    assert.ok(
+      metricsAfter.retiredSlots >= metricsBefore.retiredSlots + 1,
+      "stale async slots were not retired",
+    );
   } finally {
     releaseCompile();
     WebAssembly.compile = originalCompile;

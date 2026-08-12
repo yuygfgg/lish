@@ -350,11 +350,16 @@ assert.equal(vm.jitCodeStore.generation, generation + 2);
       "a synchronous compile error escaped through the Wasm host import",
     );
     assert.equal(throwingVm.ex.ready_status(), 7, "sync failure reentered Wasm");
-    assert.equal(throwingVm.jitCodeStore.snapshot().pendingModules, 0);
+    assert.equal(
+      throwingVm.jitCodeStore.snapshot().pendingModules,
+      1,
+      "serialized compilation did not retain its reservation",
+    );
     await waitFor(
       () => throwingVm.ex.ready_status() === -1,
       "synchronous compile failure did not complete the Rust ticket",
     );
+    assert.equal(throwingVm.jitCodeStore.snapshot().pendingModules, 0);
     assert.ok(
       warnings.some(([, error]) => error === syncFailure),
       "synchronous compile failure was not reported",
@@ -459,12 +464,16 @@ async function checkTerminalDestroy(disableWeakRef) {
   const compileGate = new Promise((resolve) => {
     releaseCompile = resolve;
   });
+  let compileCalls = 0;
   let compileSettled = false;
   let instanceCalls = 0;
-  WebAssembly.compile = () => compileGate.then((module) => {
-    compileSettled = true;
-    return module;
-  });
+  WebAssembly.compile = () => {
+    compileCalls++;
+    return compileGate.then((module) => {
+      compileSettled = true;
+      return module;
+    });
+  };
   WebAssembly.Instance = new Proxy(OriginalInstance, {
     construct(target, args) {
       instanceCalls++;
@@ -488,11 +497,9 @@ async function checkTerminalDestroy(disableWeakRef) {
       "terminal destroy retained a never-settling compile reservation",
     );
     releaseCompile(compiled);
-    await waitFor(
-      () => compileSettled,
-      "late compile completion did not settle",
-    );
     await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(compileCalls, 0, "destroyed VM started a queued compilation");
+    assert.equal(compileSettled, false, "cancelled compilation unexpectedly settled");
     assert.equal(instanceCalls, 0, "late compile completion instantiated a module");
     assert.equal(destroyedVm.ex.ready_status(), 7, "late compile completion reached Rust");
     const afterSettle = destroyedVm.jitCodeStore.snapshot();

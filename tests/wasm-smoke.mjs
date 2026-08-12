@@ -42,7 +42,6 @@ function runUserWithinBudget(vm, budget) {
     "host_http_request",
     "host_jit_register",
     "host_jit_register_async",
-    "host_jit_register_batch",
     "host_jit_retire",
     "host_net_send",
     "host_now_ms",

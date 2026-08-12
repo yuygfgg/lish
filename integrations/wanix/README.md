@@ -22,13 +22,9 @@ RISC-V. The small build patch only teaches WANIX's platform-stat helper about
 Go's `linux/riscv64` `Stat_t`; it does not require a WANIX checkout to be
 modified or committed.
 
-The adapter enables rv64.js's browser `fetch` network backend. It uses the
-hosted Cloudflare Worker at
-`wss://rv64-http-relay.darren-e4d.workers.dev/relay` as the default CORS
-fallback; set `RV64_RELAY_URL` in the WANIX VM environment to override it.
-The guest is configured as `10.0.2.15`, uses `10.0.2.2:8080` as its HTTP(S)
-proxy, and installs the per-VM proxy CA from the `rv64-proxy` 9P export so
-HTTPS clients such as `apk` can use the fetch backend.
+The adapter does not enable the legacy browser HTTP translation backend.
+WANIX must select a raw Ethernet or WISP transport explicitly when it needs
+guest networking. The guest owns DHCP, DNS, TCP, and TLS.
 
 Serve the two files from `dist/` and bind them from otherwise stock WANIX:
 

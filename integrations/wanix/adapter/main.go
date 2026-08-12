@@ -16,8 +16,6 @@ import (
 //go:embed lib.js
 var assets embed.FS
 
-const defaultRelayURL = "wss://rv64-http-relay.darren-e4d.workers.dev/relay"
-
 func main() {
 	cfg, err := parseFlags(os.Args[1:])
 	if err != nil {
@@ -36,11 +34,6 @@ func main() {
 	module := importLibrary()
 	p9 := newP9Handler()
 	exportPort, exportOutput := newExportChannel()
-	relayURL := os.Getenv("RV64_RELAY_URL")
-	if relayURL == "" {
-		relayURL = defaultRelayURL
-	}
-
 	events := map[string]any{
 		"console": js.FuncOf(func(_ js.Value, args []js.Value) any {
 			bytes := make([]byte, args[0].Get("byteLength").Int())
@@ -57,7 +50,9 @@ func main() {
 		"wasm":      wasm,
 		"memoryMB":  cfg.memoryMB,
 		"execution": map[string]any{"mode": "local"},
-		"network":   map[string]any{"mode": "fetch", "relayURL": relayURL},
+		// WANIX does not silently select the legacy HTTP translation backend.
+		// Select a raw Ethernet or WISP transport in the embedding application.
+		"network": map[string]any{"mode": "none"},
 		"boot": map[string]any{
 			"mode": "linux-direct", "kernel": kernel, "cmdline": cfg.cmdline,
 			"p9":            map[string]any{"tag": "host9p", "handle": p9},

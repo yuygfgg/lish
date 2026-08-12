@@ -87,7 +87,6 @@ export type BootConfig =
 
 export type NetworkConfig =
   | { mode: "none" }
-  | { mode: "fetch"; upgradeHttps?: boolean; relayURL?: string; mac?: Uint8Array }
   | { mode: "wsproxy"; url: string; protocols?: string | string[]; mac?: Uint8Array }
   | { mode: "wisp"; url: string; protocols?: string | string[]; mac?: Uint8Array }
   | { mode: "inbrowser"; channel?: string; mac?: Uint8Array }
@@ -110,7 +109,7 @@ const vm = await RV64.create({
     disk: { url: "./root.ext4" },
     cmdline: "console=ttyS0 root=/dev/vda rw",
   },
-  network: { mode: "fetch" },
+  network: { mode: "none" },
   execution: { mode: "worker" },
 });
 
@@ -143,15 +142,14 @@ The event map should cover at least `ready`, `start`, `stop`, `error`,
 returns an unsubscribe function. The xterm.js integration belongs in a small
 adapter or the demo, not in the emulator core.
 
-Linux defaults to `fetch`: the guest receives a virtio NIC and reaches the
-host-side request proxy at `http://10.0.2.2:8080`. `wsproxy` connects the NIC
-to a websockproxy-compatible layer-2 relay, `wisp` maps guest TCP/UDP payloads
-to WISP v1 streams, `inbrowser` provides a BroadcastChannel LAN, and `external`
-exposes outbound frames through `networkTransmit` and accepts inbound frames through
-`vm.network.receive()`, and `none` omits the NIC. The optional HTTP
-`relayURL` is a request-level CORS fallback and is deliberately distinct from
-the layer-2 WebSocket mode. `vm.network.proxyURL` reports the configured proxy
-address without callers hardcoding it.
+Networking defaults to `none`. A caller must select every network backend
+explicitly. `wsproxy` connects the NIC to a websockproxy-compatible layer-2
+relay. `wisp` maps guest TCP/UDP payloads to WISP v1 streams. `inbrowser`
+provides a BroadcastChannel LAN. `external` exposes outbound frames through
+`networkTransmit` and accepts inbound frames through `vm.network.receive()`.
+`none` omits the NIC. The stable API does not expose
+the legacy HTTP translation path. Low-level debug helpers retain that path only
+for protocol regression tests.
 
 The public surface must not include raw Wasm exports, staging helpers, HTTP
 implementation helpers, relay internals, or JIT experiment counters. Tests may

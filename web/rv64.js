@@ -21,6 +21,19 @@ const DEFAULT_JIT_LIMITS = Object.freeze({
   growSlots: 4096,
 });
 
+const MAX_ASYNC_JIT_COMPILERS = 2;
+const MAX_FULL_SYSTEM_PENDING_JIT = 4;
+
+function asyncJitCompilerCount(value) {
+  if (value === undefined) return MAX_ASYNC_JIT_COMPILERS;
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_FULL_SYSTEM_PENDING_JIT) {
+    throw new RangeError(
+      `jit.asyncCompilers must be an integer from 1 to ${MAX_FULL_SYSTEM_PENDING_JIT}`,
+    );
+  }
+  return value;
+}
+
 // These exports can emit a large stream of host events. Deliver their queued
 // events before the public run method returns. All other Wasm entries use the
 // microtask fallback so a host import never calls application code reentrantly.
@@ -439,6 +452,14 @@ export class RV64Debug {
   #deferredHostFailure;
   #hasDeferredHostFailure = false;
   #asyncOwners = new Set();
+  #jitCompileQueue = [];
+  #jitCompileActive = 0;
+  #jitCompileQueued = 0;
+  #peakJitCompileQueued = 0;
+  #jitCompileCount = 0;
+  #jitCompileMs = 0;
+  #maxJitCompileMs = 0;
+  #maxAsyncJitCompilers = MAX_ASYNC_JIT_COMPILERS;
 
   /** @param {WebAssembly.Instance} instance */
   constructor(instance) {
@@ -503,6 +524,52 @@ export class RV64Debug {
     const target = owner.deref();
     if (!target || target.jitCodeStore.destroyed) return -1;
     return new WebAssembly.Instance(module, target.#jitModuleImports());
+  }
+
+  #enqueueAsyncJit(bytes, owner) {
+    this.#jitCompileQueued++;
+    this.#peakJitCompileQueued = Math.max(
+      this.#peakJitCompileQueued,
+      this.#jitCompileQueued,
+    );
+    const completion = new Promise((resolve, reject) => {
+      this.#jitCompileQueue.push({ bytes, owner, reject, resolve });
+    });
+    this.#pumpAsyncJit();
+    return completion;
+  }
+
+  #pumpAsyncJit() {
+    while (
+      this.#jitCompileActive < this.#maxAsyncJitCompilers &&
+      this.#jitCompileQueue.length !== 0
+    ) {
+      const job = this.#jitCompileQueue.shift();
+      this.#jitCompileQueued--;
+      if (this.jitCodeStore.destroyed || !job.owner.deref()) {
+        job.resolve(-1);
+        continue;
+      }
+      this.#jitCompileActive++;
+      const started = performance.now();
+      Promise.resolve()
+        .then(() => {
+          if (this.jitCodeStore.destroyed || !job.owner.deref()) return -1;
+          return WebAssembly.compile(job.bytes);
+        })
+        .then((module) => typeof module === "number"
+          ? module
+          : RV64Debug.#instantiateAsyncJit(job.owner, module))
+        .then(job.resolve, job.reject)
+        .finally(() => {
+          const elapsed = performance.now() - started;
+          this.#jitCompileCount++;
+          this.#jitCompileMs += elapsed;
+          this.#maxJitCompileMs = Math.max(this.#maxJitCompileMs, elapsed);
+          this.#jitCompileActive--;
+          this.#pumpAsyncJit();
+        });
+    }
   }
 
   #callWasm(fn, args, synchronousDrain) {
@@ -635,7 +702,7 @@ export class RV64Debug {
     }
   }
 
-  static async #completeAsyncJit(ticket, completion, reservation, owner) {
+  static async #completeAsyncJit(ticket, slotCount, completion, reservation, owner) {
     try {
       let result;
       try {
@@ -652,12 +719,18 @@ export class RV64Debug {
       let idx = typeof result === "number" ? result : -1;
       if (typeof result !== "number") {
         try {
+          const names = slotCount === 1
+            ? ["run"]
+            : Array.from({ length: slotCount }, (_, index) => `r${index}`);
           idx = target.jitCodeStore.registerReserved(
             reservation,
             result,
-            ["run"],
+            names,
           );
-          if (idx >= 0) target.jitBlocks = (target.jitBlocks ?? 0) + 1;
+          if (idx >= 0) {
+            target.jitBlocks = (target.jitBlocks ?? 0) + slotCount;
+            if (slotCount > 1) target.jitBatches = (target.jitBatches ?? 0) + 1;
+          }
         } catch (error) {
           target.#reportAsyncJitError("async jit register failed:", error);
           idx = -1;
@@ -668,7 +741,11 @@ export class RV64Debug {
       try {
         // Installation and Rust ownership handoff share this Promise job, so
         // clear/reset cannot reuse the slot between the two operations.
-        target.#callWasm(target.#wasmExports.sys_sb_ready, [ticket, idx], false);
+        const ready = target.#wasmExports.sys_jit_ready ?? target.#wasmExports.sys_sb_ready;
+        const args = target.#wasmExports.sys_jit_ready
+          ? [ticket, idx, slotCount]
+          : [ticket, idx];
+        target.#callWasm(ready, args, false);
         orphan = -1;
       } catch (error) {
         if (orphan >= 0) target.jitCodeStore.retire(orphan);
@@ -696,6 +773,7 @@ export class RV64Debug {
 
   /** Instantiate from wasm bytes (ArrayBuffer/TypedArray/Response). */
   static async create(wasmSource, jitOptions = {}) {
+    const { asyncCompilers, ...jitStoreOptions } = jitOptions;
     let vm;
     const imports = {
       env: {
@@ -785,42 +863,10 @@ export class RV64Debug {
             return -1;
           }
         },
-        // Batch registration: one module carrying N trace bodies that
-        // tail-call each other directly. Its exports go into CONTIGUOUS
-        // table slots so emitted links can verify `line.idx == base + j`.
-        host_jit_register_batch: (n) => {
-          try {
-            const bytes = new Uint8Array(
-              vm.#wasmExports.memory.buffer,
-              vm.#wasmExports.jit_out_ptr(),
-              vm.#wasmExports.jit_out_len(),
-            ).slice();
-            if (!vm.jitCodeStore.canRegister(n, bytes.length)) {
-              vm.jitCodeStore.capacityRejects++;
-              return -2;
-            }
-            const inst = new WebAssembly.Instance(
-              new WebAssembly.Module(bytes),
-              vm.#jitModuleImports(),
-            );
-            const names = Array.from({ length: n }, (_, j) => "r" + j);
-            const base = vm.jitCodeStore.register(inst, names, bytes.length);
-            if (base < 0) return base;
-            vm.jitBlocks = (vm.jitBlocks ?? 0) + n;
-            vm.jitBatches = (vm.jitBatches ?? 0) + 1;
-            return base;
-          } catch (e) {
-            console.warn("batch jit register failed:", e);
-            return -1;
-          }
-        },
-        // Async variant for LARGE modules (page superblocks): compiles on
-        // V8's background threads via WebAssembly.compile so guest execution
-        // never stalls on a big synchronous Module build. When ready, the
-        // function lands in the table and sys_sb_ready(ticket, idx) is
-        // invoked — on the JS microtask queue, i.e. strictly BETWEEN
-        // runSystem calls, never during wasm execution.
-        host_jit_register_async: (ticket) => {
+        // All full-system modules use this path. WebAssembly.compile can run
+        // outside the guest slice; the reservation keeps every batch's table
+        // slots contiguous until its exports are installed atomically.
+        host_jit_register_async: (ticket, slotCount = 1) => {
           let reservation = null;
           let completion;
           const owner = vm.#retainAsyncOwner();
@@ -830,12 +876,11 @@ export class RV64Debug {
               vm.#wasmExports.jit_out_ptr(),
               vm.#wasmExports.jit_out_len(),
             ).slice();
-            reservation = vm.jitCodeStore.reserve(1, bytes.length);
+            reservation = vm.jitCodeStore.reserve(slotCount, bytes.length);
             if (reservation === null) {
               completion = Promise.resolve(-2);
             } else {
-              const instantiate = RV64Debug.#instantiateAsyncJit.bind(undefined, owner);
-              completion = WebAssembly.compile(bytes).then(instantiate);
+              completion = vm.#enqueueAsyncJit(bytes, owner);
             }
           } catch (error) {
             if (reservation !== null) {
@@ -844,7 +889,13 @@ export class RV64Debug {
             vm.#reportAsyncJitError("async jit register failed:", error);
             completion = Promise.resolve(-1);
           }
-          const task = RV64Debug.#completeAsyncJit(ticket, completion, reservation, owner);
+          const task = RV64Debug.#completeAsyncJit(
+            ticket,
+            slotCount,
+            completion,
+            reservation,
+            owner,
+          );
           void task.catch(RV64Debug.#reportAsyncJitTaskFailure);
         },
       },
@@ -854,7 +905,11 @@ export class RV64Debug {
         ? await WebAssembly.instantiateStreaming(wasmSource, imports)
         : await WebAssembly.instantiate(wasmSource, imports);
     vm = new RV64Debug(instance);
-    vm.jitCodeStore = new JitCodeStore(vm.#wasmExports.__indirect_function_table, jitOptions);
+    vm.jitCodeStore = new JitCodeStore(
+      vm.#wasmExports.__indirect_function_table,
+      jitStoreOptions,
+    );
+    vm.#maxAsyncJitCompilers = asyncJitCompilerCount(asyncCompilers);
     // Hardware FMA: use f64x2.relaxed_madd for the guest's FMADD family iff
     // the engine validates it AND it is fused on this hardware (the spec
     // allows unfused; only fused is bit-exact). Probe empirically:
@@ -933,13 +988,28 @@ export class RV64Debug {
       rustEvictedOwners: Number(this.ex.jit_stat(76)),
       rustEvictedSlots: Number(this.ex.jit_stat(77)),
       rustCapacityRejects: Number(this.ex.jit_stat(78)),
+      rustPendingBuilds: Number(this.ex.sys_pending_builds?.() ?? 0),
+      pendingBlocks: Number(this.ex.jit_stat(79)),
+      pendingBatches: Number(this.ex.jit_stat(80)),
+      pendingRegions: Number(this.ex.jit_stat(81)),
+      asyncCompileActive: this.#jitCompileActive,
+      asyncCompileQueued: this.#jitCompileQueued,
+      peakAsyncCompileQueued: this.#peakJitCompileQueued,
+      asyncCompileCount: this.#jitCompileCount,
+      asyncCompileMs: this.#jitCompileMs,
+      maxAsyncCompileMs: this.#maxJitCompileMs,
     });
+  }
+
+  pendingJitBuilds() {
+    return Number(this.ex.sys_pending_builds?.() ?? 0);
   }
 
   destroyJit() {
     for (const owner of this.#asyncOwners) owner.clear();
     this.#asyncOwners.clear();
     this.jitCodeStore.destroy();
+    this.#pumpAsyncJit();
   }
 
   // ---- user-mode Linux API ----
@@ -1907,10 +1977,154 @@ class WispClient {
   }
 }
 
+const RAW_ETHERNET_MAX_FRAME_SIZE = 1_600;
+const RAW_ETHERNET_MAX_QUEUED_FRAMES = 256;
+const RAW_ETHERNET_MAX_BUFFERED_BYTES =
+  RAW_ETHERNET_MAX_FRAME_SIZE * RAW_ETHERNET_MAX_QUEUED_FRAMES;
+
+class RawEthernetWebSocket {
+  #socket;
+  #pending = [];
+  #incoming = [];
+  #drainingIncoming = false;
+  #pumpTimer = null;
+  #closed = false;
+  #failed = false;
+  #opened = false;
+  #onFrame;
+  #onFailure;
+
+  constructor(url, protocols, onFrame, onFailure) {
+    this.#onFrame = onFrame;
+    this.#onFailure = onFailure;
+    const socket = new WebSocket(url, protocols);
+    socket.binaryType = "arraybuffer";
+    socket.onopen = () => {
+      this.#opened = true;
+      this.#pump();
+    };
+    socket.onmessage = (event) => {
+      if (this.#incoming.length === RAW_ETHERNET_MAX_QUEUED_FRAMES) {
+        this.#fail(new Error("raw Ethernet WebSocket receive queue is full"));
+        return;
+      }
+      this.#incoming.push(event.data);
+      this.#drainIncoming();
+    };
+    // The WebSocket API exposes the useful close status only in `close`.
+    // Closing here would discard it and collapse every failure into one
+    // unactionable message.
+    socket.onerror = () => {};
+    socket.onclose = (event) => {
+      if (!this.#closed) {
+        const phase = this.#opened ? "closed unexpectedly" : "failed to connect";
+        const detail = event.reason ? `: ${event.reason}` : ` (code ${event.code})`;
+        this.#fail(new Error(`raw Ethernet WebSocket ${phase}${detail}`));
+      }
+    };
+    this.#socket = socket;
+  }
+
+  send(frame) {
+    if (this.#closed) return;
+    if (frame.length === 0 || frame.length > RAW_ETHERNET_MAX_FRAME_SIZE) {
+      this.#fail(new Error(`guest emitted a ${frame.length}-byte Ethernet frame`));
+      return;
+    }
+    if (this.#pending.length === RAW_ETHERNET_MAX_QUEUED_FRAMES) {
+      this.#fail(new Error("raw Ethernet WebSocket transmit queue is full"));
+      return;
+    }
+    this.#pending.push(frame);
+    this.#pump();
+  }
+
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#pending.length = 0;
+    this.#incoming.length = 0;
+    if (this.#pumpTimer !== null) clearTimeout(this.#pumpTimer);
+    this.#pumpTimer = null;
+    const socket = this.#socket;
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    socket.close();
+  }
+
+  #drainIncoming() {
+    if (this.#closed || this.#drainingIncoming) return;
+    this.#drainingIncoming = true;
+    const consume = (bytes) => {
+      const frame = new Uint8Array(bytes);
+      if (frame.length === 0 || frame.length > RAW_ETHERNET_MAX_FRAME_SIZE) {
+        this.#fail(new Error(`raw Ethernet WebSocket received a ${frame.length}-byte frame`));
+        return;
+      }
+      this.#onFrame(frame);
+    };
+    const next = () => {
+      if (this.#closed) {
+        this.#incoming.length = 0;
+        this.#drainingIncoming = false;
+        return;
+      }
+      const data = this.#incoming.shift();
+      if (data === undefined) {
+        this.#drainingIncoming = false;
+        return;
+      }
+      if (typeof data === "string") {
+        this.#fail(new Error("raw Ethernet WebSocket received a text message"));
+        this.#drainingIncoming = false;
+        return;
+      }
+      if (typeof Blob !== "undefined" && data instanceof Blob) {
+        data.arrayBuffer().then((bytes) => {
+          consume(bytes);
+          next();
+        }, (error) => {
+          this.#drainingIncoming = false;
+          this.#fail(error);
+        });
+      } else {
+        consume(data);
+        next();
+      }
+    };
+    next();
+  }
+
+  #pump() {
+    if (this.#closed || this.#socket.readyState !== WebSocket.OPEN) return;
+    while (
+      this.#pending.length !== 0 &&
+      this.#socket.bufferedAmount <= RAW_ETHERNET_MAX_BUFFERED_BYTES
+    ) {
+      this.#socket.send(this.#pending.shift());
+    }
+    if (this.#pending.length !== 0 && this.#pumpTimer === null) {
+      this.#pumpTimer = setTimeout(() => {
+        this.#pumpTimer = null;
+        this.#pump();
+      }, 1);
+    }
+  }
+
+  #fail(error) {
+    if (this.#closed || this.#failed) return;
+    this.#failed = true;
+    this.#onFailure(error);
+    this.close();
+  }
+}
+
 function normalizeNetwork(network, bootMode) {
-  const value = network ?? { mode: bootMode === "bare-metal" ? "none" : "fetch" };
+  const value = network ?? { mode: "none" };
   if (!value || typeof value !== "object") throw new TypeError("network must be an object");
-  if (!["none", "fetch", "wsproxy", "wisp", "inbrowser", "external"].includes(value.mode)) {
+  if (!["none", "wsproxy", "wisp", "inbrowser", "external"].includes(value.mode)) {
     throw new TypeError(`unknown network mode: ${value.mode}`);
   }
   if (bootMode === "bare-metal" && value.mode !== "none") {
@@ -1941,7 +2155,7 @@ export class RV64 {
   #instructions;
   #networkConfig;
   #networkInput;
-  #networkSocket;
+  #rawEthernet;
   #networkChannel;
   #wisp;
 
@@ -1956,7 +2170,7 @@ export class RV64 {
     this.export = Object.freeze({ send: (data) => this.#sendExport(data) });
     this.network = Object.freeze({
       mode: network.mode,
-      get proxyURL() { return network.mode === "fetch" ? core.proxyURL() : undefined; },
+      get proxyURL() { return undefined; },
       receive: (frame) => this.#receiveNetwork(frame),
     });
   }
@@ -2016,6 +2230,11 @@ export class RV64 {
     return this.#instructions();
   }
 
+  jitMetrics() {
+    this.#assertLive();
+    return this.#core.jitMetrics();
+  }
+
   on(event, listener) {
     if (!PUBLIC_EVENTS.has(event)) throw new TypeError(`unknown event: ${event}`);
     if (typeof listener !== "function") throw new TypeError("listener must be a function");
@@ -2056,8 +2275,8 @@ export class RV64 {
     if (this.#running) await this.stop();
     this.#destroyed = true;
     ++this.#generation;
-    this.#networkSocket?.close();
-    this.#networkSocket = null;
+    this.#rawEthernet?.close();
+    this.#rawEthernet = null;
     this.#networkChannel?.close();
     this.#networkChannel = null;
     this.#wisp?.close();
@@ -2073,12 +2292,9 @@ export class RV64 {
     const memoryMB = boot.memoryMB;
     const network = this.#networkConfig;
     const net = network.mode !== "none";
-    const proxy = network.mode === "fetch";
     const networkOptions = {
       net,
       netMac: network.mac,
-      proxy,
-      proxyUpgradeHttps: network.upgradeHttps ?? true,
     };
     const modernCmdline = `${boot.cmdline ?? "console=ttyS0 root=/dev/vda rw"} rv64.network=${network.mode}`;
     const legacyCmdline = `${boot.cmdline ?? "console=hvc0 root=/dev/vda rw"} rv64.network=${network.mode}`;
@@ -2201,20 +2417,20 @@ export class RV64 {
 
   #connectNetwork() {
     const network = this.#networkConfig;
-    this.#networkSocket?.close();
-    this.#networkSocket = null;
+    this.#rawEthernet?.close();
+    this.#rawEthernet = null;
     this.#networkChannel?.close();
     this.#networkChannel = null;
     this.#wisp?.close();
     this.#wisp = null;
     this.#core.disconnectHttpRelay();
     if (network.mode === "wsproxy") {
-      const socket = new WebSocket(network.url, network.protocols);
-      socket.binaryType = "arraybuffer";
-      socket.onmessage = (event) => {
-        if (typeof event.data !== "string") this.#networkInput?.(new Uint8Array(event.data));
-      };
-      this.#networkSocket = socket;
+      this.#rawEthernet = new RawEthernetWebSocket(
+        network.url,
+        network.protocols,
+        (frame) => this.#networkInput?.(frame),
+        (error) => this.#emit("networkTraffic", { type: "error", message: error.message }),
+      );
     } else if (network.mode === "inbrowser") {
       if (typeof BroadcastChannel === "undefined") {
         throw new Error("inbrowser networking requires BroadcastChannel");
@@ -2235,15 +2451,12 @@ export class RV64 {
       this.#core.onWispDatagram = (id, address, port, bytes) =>
         wisp.datagram(id, address, port, bytes);
       this.#wisp = wisp;
-    } else if (network.mode === "fetch" && network.relayURL) {
-      this.#core.connectHttpRelay(network.relayURL);
     }
   }
 
   #transmitNetwork(frame) {
     if (this.#networkChannel) this.#networkChannel.postMessage(frame);
-    const socket = this.#networkSocket;
-    if (socket?.readyState === WebSocket.OPEN) socket.send(frame);
+    this.#rawEthernet?.send(frame);
     this.#emit("networkTransmit", frame);
   }
 
@@ -2272,9 +2485,12 @@ class RV64WorkerProxy {
   #nextRequest = 1;
   #running = false;
   #instructions = 0n;
+  #jitMetrics = null;
+  #statisticsIntervalMs = 500;
+  #statisticsRequestPending = false;
+  #statisticsTimer = null;
   #destroyed = false;
   #networkMode;
-  #proxyURL;
 
   constructor(worker, networkMode, listeners) {
     this.#worker = worker;
@@ -2286,9 +2502,6 @@ class RV64WorkerProxy {
     const proxy = this;
     this.network = Object.freeze({
       mode: networkMode,
-      get proxyURL() {
-        return proxy.#proxyURL;
-      },
       receive: (frame) => this.#receiveNetwork(frame),
     });
   }
@@ -2306,8 +2519,7 @@ class RV64WorkerProxy {
     const { options: clonedOptions, transfers } = cloneWorkerOptions(options);
     const worker = new Worker(workerURL, { name: "rv64.js", type: "module" });
     const networkMode =
-      options.network?.mode ??
-      (options.boot?.mode === "bare-metal" ? "none" : "fetch");
+      options.network?.mode ?? "none";
     const proxy = new RV64WorkerProxy(worker, networkMode, options.events);
     const created = new Promise((resolve, reject) => {
       let settled = false;
@@ -2332,16 +2544,13 @@ class RV64WorkerProxy {
         } else proxy.#handleMessage(event.data);
       };
     });
-    worker.postMessage(
-      {
-        type: "create",
-        options: clonedOptions,
-        statisticsIntervalMs: execution.statisticsIntervalMs ?? 500,
-      },
-      transfers,
-    );
+    worker.postMessage({ type: "create", options: clonedOptions }, transfers);
     try {
       proxy.#applyState(await created);
+      const interval = Number(execution.statisticsIntervalMs);
+      proxy.#statisticsIntervalMs =
+        Number.isFinite(interval) && interval >= 50 ? interval : 500;
+      proxy.#scheduleStatistics();
       return proxy;
     } catch (error) {
       proxy.#destroyed = true;
@@ -2357,6 +2566,11 @@ class RV64WorkerProxy {
   get instructions() {
     this.#assertLive();
     return this.#instructions;
+  }
+
+  jitMetrics() {
+    this.#assertLive();
+    return this.#jitMetrics;
   }
 
   on(event, listener) {
@@ -2389,6 +2603,8 @@ class RV64WorkerProxy {
     try {
       await this.#call("destroy", undefined, true);
     } finally {
+      clearTimeout(this.#statisticsTimer);
+      this.#statisticsTimer = null;
       this.#worker.terminate();
       this.#listeners.clear();
       for (const { reject } of this.#pending.values()) reject(new Error("RV64 instance destroyed"));
@@ -2415,7 +2631,9 @@ class RV64WorkerProxy {
       return;
     }
     if (message.type === "state") {
+      this.#statisticsRequestPending = false;
       this.#applyState(message.state);
+      this.#scheduleStatistics();
       return;
     }
     if (message.type === "result") {
@@ -2433,7 +2651,21 @@ class RV64WorkerProxy {
     if (!state) return;
     this.#running = state.running;
     this.#instructions = BigInt(state.instructions);
-    this.#proxyURL = state.proxyURL;
+    this.#jitMetrics = state.jitMetrics ?? null;
+  }
+
+  #scheduleStatistics() {
+    if (
+      this.#destroyed ||
+      this.#statisticsRequestPending ||
+      this.#statisticsTimer !== null
+    ) return;
+    this.#statisticsTimer = setTimeout(() => {
+      this.#statisticsTimer = null;
+      if (this.#destroyed) return;
+      this.#statisticsRequestPending = true;
+      this.#worker.postMessage({ type: "state-request" });
+    }, this.#statisticsIntervalMs);
   }
 
   #sendConsole(data) {
@@ -2461,6 +2693,9 @@ class RV64WorkerProxy {
   #fail(error) {
     if (this.#destroyed) return;
     this.#running = false;
+    clearTimeout(this.#statisticsTimer);
+    this.#statisticsTimer = null;
+    this.#statisticsRequestPending = false;
     this.#emit("error", error);
     this.#emit("stop", { reason: "error" });
     for (const { reject } of this.#pending.values()) reject(error);

@@ -1,6 +1,6 @@
 import { RV64 } from "./rv64.js?v=2";
 import { resolveAssetOverride } from "./asset-source.mjs";
-import { defaultAssetURL, defaultRelayURL } from "./site-config.js?v=2";
+import { defaultAssetURL } from "./site-config.js?v=3";
 import { Terminal } from "https://esm.sh/@xterm/xterm@6.0.0";
 import { FitAddon } from "https://esm.sh/@xterm/addon-fit@0.11.0";
 
@@ -46,6 +46,21 @@ let active = null;
 let generation = 0;
 const requestedExecution = new URLSearchParams(location.search).get("execution");
 const executionMode = requestedExecution === "local" ? "local" : "worker";
+const pageParameters = new URLSearchParams(location.search);
+
+function networkConfiguration() {
+  const url = pageParameters.get("network");
+  if (!url) return { mode: "none" };
+  const parsed = new URL(url, location.href);
+  if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+    throw new Error("network must use ws:// or wss:// raw Ethernet transport");
+  }
+  const protocols = ["lish.raw-ethernet.v1"];
+  const capability = pageParameters.get("capability");
+  if (!capability) throw new Error("raw Ethernet networking requires capability");
+  protocols.push(capability);
+  return { mode: "wsproxy", url: parsed.href, protocols };
+}
 
 function cpuStatus(text) {
   status.textContent = `${text} · ${executionMode}`;
@@ -147,10 +162,7 @@ async function start(presetName) {
       memoryMB: preset.ramMB,
       execution: { mode: executionMode },
       boot: bootConfig,
-      network: {
-        mode: "fetch",
-        relayURL: new URLSearchParams(location.search).get("relay") || defaultRelayURL || undefined,
-      },
+      network: networkConfiguration(),
       events: {
         console: (data) => write(data),
         networkTraffic: (() => {
@@ -195,14 +207,23 @@ async function start(presetName) {
     active = vm;
     const started = performance.now();
     let lastStatus = 0;
+    let lastInstructions = 0;
     const frame = () => {
       if (myGeneration !== generation || !active) return;
       if (!active.running) return;
       const now = performance.now();
       if (now - lastStatus > 500) {
-        lastStatus = now;
         const insns = Number(active.instructions);
-        cpuStatus(`${(insns / 1e6).toFixed(0)} Minsns · ${(insns / (now - started) / 1000).toFixed(1)} Minsn/s`);
+        const elapsed = lastStatus === 0 ? now - started : now - lastStatus;
+        const delta = lastStatus === 0 ? insns : insns - lastInstructions;
+        const rate = elapsed > 0 ? delta / elapsed / 1000 : 0;
+        const jit = active.jitMetrics?.();
+        const pending = jit?.rustPendingBuilds ?? 0;
+        cpuStatus(
+          `${(insns / 1e6).toFixed(0)} Minsns · ${rate.toFixed(1)} Minsn/s · JIT ${pending} pending`,
+        );
+        lastStatus = now;
+        lastInstructions = insns;
       }
       setTimeout(frame, 500);
     };

@@ -27,7 +27,6 @@ const vm = await RV64.create({
 
 assert.equal(vm.running, false);
 assert.equal(vm.network.mode, "none");
-assert.equal(vm.network.proxyURL, undefined);
 assert.deepEqual(events, ["ready"]);
 assert.equal("ex" in vm, false);
 for (const removed of [
@@ -69,10 +68,21 @@ const direct = await RV64.create({
 });
 assert.equal(direct.running, false);
 assert.equal(direct.instructions, 0n);
-assert.equal(direct.network.mode, "fetch");
-assert.match(direct.network.proxyURL, /^http:\/\/10\.0\.2\.2:/);
+assert.equal(direct.network.mode, "none");
 assert.throws(() => direct.network.receive(new Uint8Array(14)), /external mode/);
 await direct.destroy();
+
+await assert.rejects(
+  RV64.create({
+    wasm,
+    boot: {
+      mode: "linux-direct",
+      kernel: new Uint8Array([0x73, 0x00, 0x10, 0x00]),
+    },
+    network: { mode: "fetch" },
+  }),
+  /unknown network mode: fetch/,
+);
 
 const external = await RV64.create({
   wasm,

@@ -16,7 +16,6 @@ if (![wasmPath, kernelPath, diskPath].every(existsSync)) {
 }
 
 let output = "";
-let sentApk = false;
 let observedError;
 const decoder = new TextDecoder();
 const vm = await RV64.create({
@@ -28,24 +27,20 @@ const vm = await RV64.create({
     disk: await readFile(diskPath),
     cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
   },
+  network: { mode: "none" },
   events: {
     console(bytes) {
       output += decoder.decode(bytes, { stream: true });
       if (process.env.RV64_BOOT_TRACE) process.stdout.write(bytes);
-      if (!sentApk && output.includes("ALPINE_READY")) {
-        sentApk = true;
-        vm.console.send("apk update && echo APK_UPDATE_OK\n");
-      }
     },
     error(error) { observedError = error; },
   },
 });
 
-assert.equal(vm.network.mode, "fetch");
-assert.equal(vm.network.proxyURL, "http://10.0.2.2:8080");
+assert.equal(vm.network.mode, "none");
 await vm.start();
 const deadline = performance.now() + 240_000;
-while (vm.running && !output.includes("\r\nAPK_UPDATE_OK\r\n") && performance.now() < deadline) {
+while (vm.running && !output.includes("ALPINE_READY") && performance.now() < deadline) {
   await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
 }
 await vm.stop();
@@ -54,8 +49,5 @@ await vm.destroy();
 assert.ifError(observedError);
 assert.match(output, /Linux version/);
 assert.match(output, /ALPINE_READY/);
-assert.match(output, /PROXY_CA_READY/);
-assert.match(output, /OK: \d+ distinct packages available/);
-assert.match(output, /\r\nAPK_UPDATE_OK\r\n/);
 assert.doesNotMatch(output, /unexpected end of file/);
-console.log("PASS Alpine direct boot and apk update through default HTTP proxy");
+console.log("PASS Alpine direct boot with networking disabled");

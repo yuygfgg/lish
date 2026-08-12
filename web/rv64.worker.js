@@ -12,7 +12,6 @@ const EVENTS = [
 ];
 
 let vm = null;
-let statisticsTimer = null;
 
 function serializeError(error) {
   return {
@@ -25,8 +24,8 @@ function serializeError(error) {
 function state() {
   return {
     instructions: vm ? vm.instructions : 0n,
-    proxyURL: vm?.network.proxyURL,
     running: vm?.running ?? false,
+    jitMetrics: vm?.jitMetrics() ?? null,
   };
 }
 
@@ -47,10 +46,6 @@ async function create(message) {
     events,
     execution: { mode: "local" },
   });
-  const interval = Number(message.statisticsIntervalMs);
-  statisticsTimer = setInterval(() => {
-    if (vm) self.postMessage({ type: "state", state: state() });
-  }, Number.isFinite(interval) && interval >= 50 ? interval : 500);
   self.postMessage({ type: "created", state: state() });
 }
 
@@ -63,8 +58,6 @@ async function call(message) {
     else if (message.method === "destroy") {
       value = await vm.destroy();
       vm = null;
-      clearInterval(statisticsTimer);
-      statisticsTimer = null;
     } else throw new Error(`unknown Worker method: ${message.method}`);
     self.postMessage({ id: message.id, type: "result", value, state: state() });
   } catch (error) {
@@ -89,5 +82,7 @@ self.onmessage = (event) => {
     vm?.console.send(message.value);
   } else if (message?.type === "network-receive") {
     vm?.network.receive(message.value);
+  } else if (message?.type === "state-request" && vm) {
+    self.postMessage({ type: "state", state: state() });
   }
 };

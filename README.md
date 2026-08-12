@@ -29,7 +29,7 @@ Implemented and tested paths include:
 - WebAssembly JIT in both user-mode and full-system browser run loops
 - virtio console and block devices
 - virtio-9p host-directory and in-memory file sharing
-- virtio networking through fetch, WISP, wsproxy, or a browser-local LAN
+- virtio networking through raw Ethernet WebSocket, WISP, or a browser-local LAN
 
 Architecture details live in [DESIGN.md](DESIGN.md). See
 [ROADMAP.md](ROADMAP.md) for future work and
@@ -113,6 +113,7 @@ provides the same API to TypeScript without a separate `@types` package:
 ```ts
 import { RV64, type RV64Options } from "./web/rv64.js";
 
+const capability = "replace-with-a-random-256-bit-token";
 const options: RV64Options = {
   wasm: { url: "./rv64_wasm.wasm" },
   memoryMB: 512,
@@ -122,7 +123,9 @@ const options: RV64Options = {
     disk: { url: "./alpine.ext4" },
     cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
   },
-  network: { mode: "fetch", relayURL: "wss://relay.example/relay" },
+  network: { mode: "wsproxy", url: "ws://127.0.0.1:4199/", protocols: [
+    "lish.raw-ethernet.v1", capability,
+  ] },
   events: {
     downloadProgress: ({ image, loaded, total }) => {
       console.log(image, loaded, total);
@@ -197,18 +200,10 @@ The stable facade intentionally does not expose raw Wasm exports or JIT control
 methods. Architecture and emulator tests use the separately named
 `RV64Debug` API; applications should not depend on it.
 
-Linux machines use the `fetch` HTTP/HTTPS backend by default. The Alpine image
-configures `http_proxy`/`https_proxy` only when that backend is selected,
-attaches the NIC at `10.0.2.15`, and trusts the per-VM proxy CA automatically.
-`apk update` works directly in Node
-and native builds. Browsers can fetch CORS-enabled destinations directly;
-Alpine's package CDN currently requires the optional request relay, supplied as
-`relayURL` or to the demo as `?relay=wss://your-relay.example`.
-Networking can also be selected explicitly:
+Networking defaults to `none`. The stable API does not expose the legacy HTTP
+translation backend. Select a layer-2 or payload relay explicitly:
 
 ```js
-network: { mode: "fetch" }                            // Linux default
-network: { mode: "fetch", relayURL: "wss://…" }      // CORS fallback
 network: { mode: "wisp", url: "wisps://…" }          // TCP/UDP relay
 network: { mode: "wsproxy", url: "wss://…" }         // layer-2 relay
 network: { mode: "inbrowser", channel: "my-lan" }    // browser-local LAN
@@ -216,15 +211,11 @@ network: { mode: "external" }                         // advanced frame API
 network: { mode: "none" }
 ```
 
-`fetch` translates guest HTTP requests to the host's `fetch()` API. `wisp`
-provides outbound TCP and UDP through a WISP v1 relay. `wsproxy` carries raw
-Ethernet frames to a websockproxy-compatible relay. `inbrowser` joins VMs in
-the same browser to a local Ethernet segment using `BroadcastChannel` and has
-no Internet access.
-
-`vm.network.proxyURL` reports the guest proxy address in `fetch` mode. In
-`external` mode, outbound frames arrive through `networkTransmit` and inbound
-frames are passed to `vm.network.receive(frame)`.
+`wisp` provides outbound TCP and UDP through a WISP v1 relay. `wsproxy` carries
+raw Ethernet frames to a websockproxy-compatible relay. `inbrowser` joins VMs
+in the same browser to a local Ethernet segment using `BroadcastChannel` and
+has no Internet access. In `external` mode, outbound frames arrive through
+`networkTransmit` and inbound frames are passed to `vm.network.receive(frame)`.
 
 ### Native full-system emulator
 
@@ -249,39 +240,9 @@ Then mount it in the guest:
 mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
 ```
 
-Enable networking through the in-process HTTP proxy:
-
-```sh
-target/release/rv64-vboot --direct web/images/alpine/Image \
-  --disk web/images/alpine/alpine.ext4 --proxy --ram 0.5 \
-  -- 'console=ttyS0 root=/dev/vda rw init=/rv64-init rv64.network=fetch'
-```
-
-Configure the guest:
-
-```sh
-ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
-export http_proxy=http://10.0.2.2:8080
-wget -O- http://example.com/
-```
-
-HTTPS uses CONNECT through an ephemeral local CA. The `--proxy` option exposes
-its public certificate as `/ca.der` and `/ca.pem` on the read-only 9p tag
-`rv64-proxy`.
-
-### Browser HTTP relay internals
-
-```sh
-node web/http-relay.mjs --port 8090
-```
-
-The browser proxy implementation tries `fetch()` first, retaining its zero-infrastructure
-path. If a GET or HEAD fails before a response is exposed, an attached HTTP
-relay retries it and remembers that origin for later requests. Non-idempotent
-requests are never retried automatically. This transport is exercised by the
-repository tests and is exposed as `network: { mode: "fetch", relayURL }`. See
-[web/HTTP_RELAY.md](web/HTTP_RELAY.md) for the wire protocol and deployment
-details.
+The old in-process HTTP proxy and browser HTTP relay remain only as low-level
+debug fixtures. They are not part of the stable API and are not used by the
+product network path.
 
 ### Alpine/Linux machine
 

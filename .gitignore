@@ -12,3 +12,4 @@ tests/riscv-arch-test/
 tests/compile-bench/*.img
 tests/compile-bench/*.o
 .DS_Store
+.playwright-cli/

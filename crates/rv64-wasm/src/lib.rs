@@ -32,12 +32,6 @@ extern "C" {
     /// jit_out_ptr/jit_out_len), append its `run` function to this module's
     /// exported function table, and return the table index (-1 on failure).
     fn host_jit_register() -> i32;
-    /// Instantiate the BATCH module in JIT_OUT and append its `r0`..`r{n-1}`
-    /// exports to the function table CONTIGUOUSLY; returns the base index
-    /// (-1 on failure). Members transfer to each other by direct tail call
-    /// inside the module, so nothing imports the table and registration
-    /// stays O(1) per batch.
-    fn host_jit_register_batch(n: u32) -> i32;
     /// Queue a dead table slot for cleanup after the current Wasm entry
     /// returns to JavaScript. reason=1 identifies policy eviction.
     fn host_jit_retire(idx: i32, reason: u32);
@@ -54,10 +48,10 @@ extern "C" {
     fn host_wisp_data(id: u64, ptr: *const u8, len: usize);
     fn host_wisp_close(id: u64);
     fn host_wisp_datagram(id: u64, address: *const u8, port: u32, ptr: *const u8, len: usize);
-    /// Async variant for large modules (page superblocks): compiles on V8
-    /// background threads; sys_sb_ready(ticket, idx) fires between runSystem
-    /// calls when the function is in the table (idx -1 = failed).
-    fn host_jit_register_async(ticket: u64);
+    /// Compile the module in JIT_OUT asynchronously and reserve `slot_count`
+    /// contiguous table entries. JS calls sys_jit_ready between runSystem
+    /// calls after every export is installed (base -1/-2 = failure/capacity).
+    fn host_jit_register_async(ticket: u64, slot_count: u32);
 }
 
 // Host callbacks are copied into a JavaScript queue and delivered only after
@@ -846,7 +840,7 @@ impl JitState {
 
 #[cfg(test)]
 mod jit_state_tests {
-    use super::JitState;
+    use super::{block_should_replace_region, JitBlock, JitState};
     use std::collections::HashSet;
 
     #[test]
@@ -917,6 +911,39 @@ mod jit_state_tests {
         assert_eq!(super::jit_tlb_fill(1, 0, 0), -1);
         assert_eq!(super::jit_tlb_fill(0x1234, 0, 0), -1);
         super::chain_next(0x1234);
+    }
+
+    #[test]
+    fn async_trace_region_priority_is_completion_order_independent() {
+        let region = Some(JitBlock {
+            fp: false,
+            idx: 10,
+            n: 0,
+            mix: [0; 5],
+            mem: [0; 10],
+            control: [0; 3],
+            alu: [0; 5],
+            pa: 0x8000_0000,
+            last_used: 0,
+        });
+        let short = JitBlock {
+            fp: false,
+            idx: -1,
+            n: 15,
+            mix: [0; 5],
+            mem: [0; 10],
+            control: [0; 3],
+            alu: [0; 5],
+            pa: 0x8000_0000,
+            last_used: 0,
+        };
+        let long = JitBlock { n: 16, ..short };
+        let fp = JitBlock { fp: true, ..long };
+
+        assert!(!block_should_replace_region(Some(&region), short, 16));
+        assert!(block_should_replace_region(Some(&region), long, 16));
+        assert!(!block_should_replace_region(Some(&region), fp, 16));
+        assert!(block_should_replace_region(None, short, 16));
     }
 }
 
@@ -1016,14 +1043,27 @@ fn handle_jit_capacity(jit: &mut JitState) {
 /// caller's budget is larger (P0 interrupt-latency contract).
 const INTERRUPT_QUANTUM: u64 = 1 << 20;
 
-/// A page superblock compiling asynchronously on V8's background threads.
-/// Guest execution continues on individual blocks meanwhile; when JS calls
-/// sys_sb_ready the entries are repointed — after validating that the boot
-/// generation, the va→pa mapping, and the (dirty-tracked) code page are all
-/// still the ones the compile was issued against.
-struct PendingSb {
-    ticket: u64,
-    boot_gen: u64,
+#[derive(Clone)]
+struct PendingBlock {
+    aspace: u64,
+    pc: u64,
+    block: JitBlock,
+    pages: Vec<(u64, u64)>,
+    page_generations: Vec<u64>,
+    seeds: Vec<u64>,
+    missed_superblock: bool,
+}
+
+struct PendingBatch {
+    cell: usize,
+    sequence: u64,
+    members: Vec<PendingBlock>,
+}
+
+/// A page superblock compiling asynchronously on the browser's Wasm compiler.
+/// Guest execution continues on existing code until the completed module passes
+/// the boot, ownership, and physical-code-page checks below.
+struct PendingRegion {
     /// satp of the address space the region was discovered in.
     aspace: u64,
     /// The page whose threshold crossing owns this region (cooldown identity
@@ -1037,6 +1077,33 @@ struct PendingSb {
     page_generations: Vec<u64>,
     entries: Vec<u64>,
 }
+
+enum PendingJitKind {
+    Block(PendingBlock),
+    Batch(PendingBatch),
+    Region(PendingRegion),
+}
+
+struct PendingJit {
+    ticket: u64,
+    boot_gen: u64,
+    kind: PendingJitKind,
+}
+
+impl PendingJit {
+    fn slot_count(&self) -> u32 {
+        match &self.kind {
+            PendingJitKind::Block(_) | PendingJitKind::Region(_) => 1,
+            PendingJitKind::Batch(batch) => batch.members.len() as u32,
+        }
+    }
+}
+
+/// Keep a small discovery window. The browser host limits active compiler jobs
+/// separately; this queue hides Promise scheduling latency without allowing a
+/// compile storm to starve the guest.
+const MAX_PENDING_JIT: usize = 4;
+const MAX_JIT_ISSUES_PER_RUN: u32 = 1;
 
 /// Virtual pages a superblock region may span. Loops and functions straddle
 /// page boundaries constantly; a page-clamped region turns every crossing into
@@ -1162,8 +1229,85 @@ static mut SB_EXT_NO_TARGET: u64 = 0;
 static mut SB_EXT_PUSHED: u64 = 0;
 static mut SB_EXT_DRAIN_VISITS: u64 = 0;
 static mut SB_EXT_DRAIN_NOMATCH: u64 = 0;
-static mut PENDING_SB: Vec<PendingSb> = Vec::new();
-static mut NEXT_SB_TICKET: u64 = 1;
+static mut PENDING_JIT: Vec<PendingJit> = Vec::new();
+static mut NEXT_JIT_TICKET: u64 = 1;
+static mut JIT_ISSUES_THIS_RUN: u32 = 0;
+
+#[allow(static_mut_refs)]
+fn full_system_jit_issue_allowed() -> bool {
+    unsafe {
+        !JIT_CAPACITY_BLOCKED
+            && PENDING_JIT.len() < MAX_PENDING_JIT
+            && JIT_ISSUES_THIS_RUN < MAX_JIT_ISSUES_PER_RUN
+    }
+}
+
+#[allow(static_mut_refs)]
+fn pending_jit_contains_pc(aspace: u64, pc: u64) -> bool {
+    unsafe {
+        PENDING_JIT.iter().any(|pending| match &pending.kind {
+            PendingJitKind::Block(block) => block.aspace == aspace && block.pc == pc,
+            PendingJitKind::Batch(batch) => batch
+                .members
+                .iter()
+                .any(|member| member.aspace == aspace && member.pc == pc),
+            // A pending region deliberately does not suppress an individual
+            // block. Existing code remains fast while a region compiles.
+            PendingJitKind::Region(_) => false,
+        })
+    }
+}
+
+fn code_page_generations<M: FullSystemJitMachine>(m: &M, pages: &[(u64, u64)]) -> Option<Vec<u64>> {
+    pages
+        .iter()
+        .map(|&(_, physical)| {
+            let page = physical.checked_sub(rv64_system::RAM_BASE)? >> 12;
+            m.code_page_generation(page)
+        })
+        .collect()
+}
+
+fn pending_block<M: FullSystemJitMachine>(
+    m: &M,
+    aspace: u64,
+    pc: u64,
+    block: JitBlock,
+    pages: Vec<(u64, u64)>,
+    seeds: Vec<u64>,
+    missed_superblock: bool,
+) -> Option<PendingBlock> {
+    Some(PendingBlock {
+        aspace,
+        pc,
+        block,
+        page_generations: code_page_generations(m, &pages)?,
+        pages,
+        seeds,
+        missed_superblock,
+    })
+}
+
+#[allow(static_mut_refs)]
+fn submit_pending_jit(kind: PendingJitKind) -> Option<u64> {
+    if !full_system_jit_issue_allowed() {
+        return None;
+    }
+    unsafe {
+        let ticket = NEXT_JIT_TICKET;
+        NEXT_JIT_TICKET = NEXT_JIT_TICKET.wrapping_add(1);
+        let pending = PendingJit {
+            ticket,
+            boot_gen: BOOT_GEN,
+            kind,
+        };
+        let slot_count = pending.slot_count();
+        PENDING_JIT.push(pending);
+        JIT_ISSUES_THIS_RUN += 1;
+        host_jit_register_async(ticket, slot_count);
+        Some(ticket)
+    }
+}
 // Superblock lifecycle counters (diagnostic, jit_stat 10..14).
 static mut SB_TRIGGER: u64 = 0;
 static mut SB_XLATE_FAIL: u64 = 0;
@@ -1464,7 +1608,7 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             14 => SB_STALE,
             15 => ZERO_RETIRE,
             16 => SB_INDIV,
-            17 => PENDING_SB.len() as u64,
+            17 => PENDING_JIT.len() as u64,
             18 => ZR_NX,
             19 => ZR_FRM,
             20 => ZR_FS,
@@ -1509,6 +1653,18 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             76 => JIT_EVICTED_OWNERS,
             77 => JIT_EVICTED_SLOTS,
             78 => JIT_CAPACITY_REJECTIONS,
+            79 => PENDING_JIT
+                .iter()
+                .filter(|pending| matches!(pending.kind, PendingJitKind::Block(_)))
+                .count() as u64,
+            80 => PENDING_JIT
+                .iter()
+                .filter(|pending| matches!(pending.kind, PendingJitKind::Batch(_)))
+                .count() as u64,
+            81 => PENDING_JIT
+                .iter()
+                .filter(|pending| matches!(pending.kind, PendingJitKind::Region(_)))
+                .count() as u64,
             _ => 0,
         }
     }
@@ -2069,7 +2225,7 @@ unsafe fn reset_full_system_jit(kind: FullSystemKind) {
         end_full_system_dispatch();
         ACTIVE_FULL_SYSTEM = kind;
         BOOT_GEN = BOOT_GEN.wrapping_add(1);
-        PENDING_SB.clear();
+        PENDING_JIT.clear();
         if let Some(jit) = SYS_JIT.as_mut() {
             jit.clear();
         }
@@ -3054,6 +3210,9 @@ fn issue_region<M: FullSystemJitMachine>(
     unproductive: bool,
     regs_in_memory: bool,
 ) -> bool {
+    if !full_system_jit_issue_allowed() {
+        return false;
+    }
     // The build budget (sb_build_allowed) charges every issue attempt its
     // real host cost, translate failures included.
     let t0 = unsafe { host_now_ms() };
@@ -3160,16 +3319,22 @@ fn issue_region_inner<M: FullSystemJitMachine>(
                 .expect("compiled page must belong to guest RAM")
         })
         .collect();
-    let ticket = unsafe {
-        let ticket = NEXT_SB_TICKET;
-        NEXT_SB_TICKET += 1;
-        ticket
+    let claim_pages = pages.clone();
+    let pending = PendingJitKind::Region(PendingRegion {
+        aspace,
+        lead,
+        pages,
+        page_generations,
+        entries,
+    });
+    let Some(ticket) = submit_pending_jit(pending) else {
+        return false;
     };
     // Every page the region covers is claimed by the latest pending build.
     // A newer overlapping build supersedes this ticket without losing the
     // state that existed before either build started.
-    jit.claim_pending_superblock(ticket, aspace, &pages);
-    for &(pva, _) in &pages {
+    jit.claim_pending_superblock(ticket, aspace, &claim_pages);
+    for &(pva, _) in &claim_pages {
         jit.sb_missed.remove(&(aspace, pva));
     }
     // The recorded instruction count starts the lead page's build cooldown.
@@ -3183,16 +3348,6 @@ fn issue_region_inner<M: FullSystemJitMachine>(
     );
     m.cpu_mut().clear_store_jtlb(); // pages may now hold code
     unsafe {
-        PENDING_SB.push(PendingSb {
-            ticket,
-            boot_gen: BOOT_GEN,
-            aspace,
-            lead,
-            pages,
-            page_generations,
-            entries,
-        });
-        host_jit_register_async(ticket);
         SB_ISSUED += 1;
         SB_LAST_ICOUNT = m.cpu().insn_count;
     }
@@ -3289,6 +3444,7 @@ fn demote_region(jit: &mut JitState, idx: i32) {
 #[allow(static_mut_refs)]
 fn drain_ext_queue<M: FullSystemJitMachine>(m: &mut M, jit: &mut JitState) {
     if jit.ext_queue.is_empty()
+        || !full_system_jit_issue_allowed()
         || m.cpu().insn_count < unsafe { SB_EXT_NEXT_ICOUNT }
         || !sb_build_allowed(m.cpu().insn_count)
     {
@@ -3434,7 +3590,10 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
     max_insns: u64,
 ) -> i32 {
     begin_host_event_batch();
-    unsafe { JIT_CAPACITY_BLOCKED = false };
+    unsafe {
+        JIT_CAPACITY_BLOCKED = false;
+        JIT_ISSUES_THIS_RUN = 0;
+    }
     let context = m.execution_context(jit);
     unsafe { ACTIVE_JIT_CONTEXT = Some(context) };
     let mut remaining = max_insns;
@@ -3755,7 +3914,10 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
             // Then spend what's left on the oldest deferred page that still
             // resolves in the CURRENT address space (issuing an extension
             // above moved SB_LAST_ICOUNT, so at most one build per boundary).
-            if !jit.sb_queue.is_empty() && sb_build_allowed(m.cpu().insn_count) {
+            if !jit.sb_queue.is_empty()
+                && full_system_jit_issue_allowed()
+                && sb_build_allowed(m.cpu().insn_count)
+            {
                 let aspace = m.cpu().sys.as_ref().map_or(0, |c| c.satp);
                 if let Some(i) = jit.sb_queue.iter().position(|&(a, _)| a == aspace) {
                     let (_, vpage) = jit.sb_queue.remove(i);
@@ -3766,6 +3928,9 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                         }
                     }
                 }
+            }
+            if unsafe { JIT_ISSUES_THIS_RUN != 0 } {
+                break;
             }
             continue;
         }
@@ -3788,7 +3953,11 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                 }
             }
         }
-        if jit_compilation_allowed() && !jit.cache.contains_key(&pc) {
+        if jit_compilation_allowed()
+            && full_system_jit_issue_allowed()
+            && !jit.cache.contains_key(&pc)
+            && !pending_jit_contains_pc(aspace, pc)
+        {
             let hot = {
                 let c = jit.hot.entry(pc).or_insert(0);
                 *c += 1;
@@ -4033,6 +4202,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                                     && pages.iter().any(|&(va, _)| va == t & !0xfff)
                                     && hotmap.get(&t).is_some_and(|&c| c >= bar)
                                     && !matches!(cache.get(&t), Some(Some(b)) if b.n == 0)
+                                    && !pending_jit_contains_pc(aspace, t)
                                     && (!page_mode || t & !0xfff == seedpage)
                             };
                             let succ = &jit.succ;
@@ -4083,84 +4253,77 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                                     BATCH_ON = false;
                                 }
                             }
-                            if members.len() >= 2 {
-                                let n = members.len() as u32;
-                                unsafe { JIT_OUT = wasm };
-                                let bbase = unsafe { host_jit_register_batch(n) };
-                                if bbase >= 0 {
-                                    let owner = jit
-                                        .track_owner((0..n).map(|offset| bbase + offset as i32))
-                                        .expect("non-empty JIT batch");
-                                    unsafe {
-                                        BATCH_BASE_POOL[cell] = bbase as u32;
-                                        BATCHES += 1;
-                                        BATCH_MEMBERS += n as u64;
-                                    }
-                                    for (j, mb) in members.iter().enumerate() {
-                                        let (lo, hi) = if mb.span == (0, 0) {
-                                            (mb.pc, mb.pc + 2)
-                                        } else {
-                                            mb.span
+                            if members.len() >= 2 && full_system_jit_issue_allowed() {
+                                let mut pending_members = Vec::with_capacity(members.len());
+                                let mut valid_batch = true;
+                                for mb in members {
+                                    let (lo, hi) = if mb.span == (0, 0) {
+                                        (mb.pc, mb.pc + 2)
+                                    } else {
+                                        mb.span
+                                    };
+                                    let mut mpa = 0u64;
+                                    let mut spanned = Vec::new();
+                                    let mut va = lo & !0xfff;
+                                    while va <= (hi - 1) & !0xfff {
+                                        let Some(&(_, pp)) =
+                                            w.pages.iter().find(|&&(v, _)| v == va)
+                                        else {
+                                            valid_batch = false;
+                                            break;
                                         };
-                                        let mut mpa = 0u64;
-                                        let mut spanned: Vec<(u64, u64)> = Vec::new();
-                                        let mut va = lo & !0xfff;
-                                        let mut okp = true;
-                                        while va <= (hi - 1) & !0xfff {
-                                            match w.pages.iter().find(|&&(v, _)| v == va) {
-                                                Some(&(_, pp)) => {
-                                                    if va == mb.pc & !0xfff {
-                                                        mpa = pp + (mb.pc & 0xfff);
-                                                    }
-                                                    spanned.push((va, pp));
-                                                }
-                                                None => {
-                                                    okp = false;
-                                                    break;
-                                                }
-                                            }
-                                            va += 0x1000;
+                                        if va == mb.pc & !0xfff {
+                                            mpa = pp + (mb.pc & 0xfff);
                                         }
-                                        if !okp || mpa == 0 {
-                                            continue;
-                                        }
-                                        for &(_, pp) in &spanned {
+                                        spanned.push((va, pp));
+                                        va += 0x1000;
+                                    }
+                                    if !valid_batch || mpa == 0 {
+                                        valid_batch = false;
+                                        break;
+                                    }
+                                    let block = JitBlock {
+                                        fp: mb.uses_fp,
+                                        idx: -1,
+                                        n: mb.n_insns,
+                                        mix: mb.trace_mix,
+                                        mem: mb.trace_mem,
+                                        control: mb.trace_control,
+                                        alu: mb.trace_alu,
+                                        pa: mpa,
+                                        last_used: 0,
+                                    };
+                                    let Some(block) = pending_block(
+                                        m, aspace, mb.pc, block, spanned, mb.seeds, false,
+                                    ) else {
+                                        valid_batch = false;
+                                        break;
+                                    };
+                                    pending_members.push(block);
+                                }
+                                if valid_batch && pending_members.len() >= 2 {
+                                    for member in &pending_members {
+                                        for &(_, pp) in &member.pages {
                                             m.code_mark_page(pp);
                                         }
-                                        let idx = bbase + j as i32;
-                                        if spanned.len() > 1 {
-                                            jit.regions.insert(idx, spanned.clone());
-                                        }
-                                        let b = JitBlock {
-                                            fp: mb.uses_fp,
-                                            idx,
-                                            n: mb.n_insns,
-                                            mix: mb.trace_mix,
-                                            mem: mb.trace_mem,
-                                            control: mb.trace_control,
-                                            alu: mb.trace_alu,
-                                            pa: mpa,
-                                            last_used: next_jit_use_stamp(),
-                                        };
-                                        jit.cache_insert(mb.pc, Some(b));
-                                        if unsafe { SYS_SUPERBLOCK } {
-                                            for &sd in &mb.seeds {
-                                                let e = jit
-                                                    .page_entries
-                                                    .entry((aspace, sd & !0xfff))
-                                                    .or_default();
-                                                if let Err(i) = e.binary_search(&sd) {
-                                                    e.insert(i, sd);
-                                                }
-                                            }
-                                        }
                                     }
-                                    jit.retire_unreferenced_slots(owner);
-                                    m.cpu_mut().clear_store_jtlb();
-                                    continue; // dispatch the seed member now
-                                } else if bbase == JIT_REGISTER_CAPACITY {
-                                    handle_jit_capacity(jit);
-                                    continue;
+                                    let sequence = unsafe {
+                                        let sequence = NEXT_BATCH_SEQUENCE;
+                                        NEXT_BATCH_SEQUENCE = NEXT_BATCH_SEQUENCE.wrapping_add(1);
+                                        BATCH_CELL_SEQUENCE[cell] = sequence;
+                                        sequence
+                                    };
+                                    unsafe { JIT_OUT = wasm };
+                                    if submit_pending_jit(PendingJitKind::Batch(PendingBatch {
+                                        cell,
+                                        sequence,
+                                        members: pending_members,
+                                    }))
+                                    .is_some()
+                                    {
+                                        m.cpu_mut().clear_store_jtlb();
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -4186,7 +4349,6 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                                 &next,
                             )
                         };
-                        let mut capacity = false;
                         let entry = blk.and_then(|blk| {
                             // Pages the emitted code actually came from
                             // ((0,0) span = wholly within [pc, pc+len)).
@@ -4205,76 +4367,36 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                                 spanned.push((va, pp));
                                 va += 0x1000;
                             }
-                            unsafe { JIT_OUT = blk.wasm };
-                            let idx = unsafe { host_jit_register() };
-                            if idx == JIT_REGISTER_CAPACITY {
-                                capacity = true;
-                                return None;
-                            }
-                            if idx < 0 {
-                                return None;
-                            }
-                            jit.track_owner([idx]);
                             for &(_, pp) in &spanned {
                                 m.code_mark_page(pp);
                             }
                             m.cpu_mut().clear_store_jtlb(); // these pages may now hold code
-                            if spanned.len() > 1 {
-                                jit.regions.insert(idx, spanned.clone());
-                            }
-                            Some((
-                                JitBlock {
-                                    fp: blk.uses_fp,
-                                    idx,
-                                    n: blk.n_insns,
-                                    mix: blk.trace_mix,
-                                    mem: blk.trace_mem,
-                                    control: blk.trace_control,
-                                    alu: blk.trace_alu,
-                                    pa,
-                                    last_used: next_jit_use_stamp(),
-                                },
-                                blk.seeds,
-                            ))
-                        });
-                        if capacity {
-                            handle_jit_capacity(jit);
-                            continue;
-                        }
-                        if missed_here {
-                            let short = match &entry {
-                                Some((b, _)) => b.n < unsafe { TRACE_KEEP_MIN },
-                                None => true, // untranslatable: function coverage wanted
+                            let block = JitBlock {
+                                fp: blk.uses_fp,
+                                idx: -1,
+                                n: blk.n_insns,
+                                mix: blk.trace_mix,
+                                mem: blk.trace_mem,
+                                control: blk.trace_control,
+                                alu: blk.trace_alu,
+                                pa,
+                                last_used: 0,
                             };
-                            if short {
-                                *jit.sb_missed.entry((aspace, vpage)).or_insert(0) += 1;
-                                unsafe { SB_INDIV += 1 };
-                            }
-                        }
+                            let pending = pending_block(
+                                m,
+                                aspace,
+                                pc,
+                                block,
+                                spanned,
+                                blk.seeds,
+                                missed_here && block.n < unsafe { TRACE_KEEP_MIN },
+                            )?;
+                            unsafe { JIT_OUT = blk.wasm };
+                            submit_pending_jit(PendingJitKind::Block(pending))?;
+                            Some(())
+                        });
                         match entry {
-                            Some((b, seeds)) => {
-                                // Trace exit targets are hot-path block
-                                // leaders: feed them to superblock discovery,
-                                // which trace compilation otherwise starves
-                                // (interior pcs never tier up on their own,
-                                // so page functions built from a handful of
-                                // seeds covered fragments and measured
-                                // catastrophically without the demotion
-                                // safety valve).
-                                if unsafe { SYS_SUPERBLOCK } {
-                                    for &sd in &seeds {
-                                        let e = jit
-                                            .page_entries
-                                            .entry((aspace, sd & !0xfff))
-                                            .or_default();
-                                        if let Err(i) = e.binary_search(&sd) {
-                                            e.insert(i, sd);
-                                        }
-                                    }
-                                }
-                                jit.cache_insert(pc, Some(b));
-                                continue;
-                            }
+                            Some(()) => break,
                             // Untranslatable at THESE code bytes: blacklist with
                             // a pa-stamped sentinel (idx = -1). It's re-verified
                             // like a real block (map_gen / dispatch probe) so it
@@ -4283,6 +4405,15 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                             // dirty-page tracker naturally drops it if the code
                             // bytes are overwritten.
                             None => {
+                                // Pending capacity is temporary. Do not poison a
+                                // valid pc merely because the async queue is full.
+                                if !full_system_jit_issue_allowed() {
+                                    continue;
+                                }
+                                if missed_here {
+                                    *jit.sb_missed.entry((aspace, vpage)).or_insert(0) += 1;
+                                    unsafe { SB_INDIV += 1 };
+                                }
                                 m.code_mark_page(pa);
                                 m.cpu_mut().clear_store_jtlb();
                                 let jb = JitBlock {
@@ -4381,7 +4512,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
         // (v86 timestamps serial bytes as they arrive; symmetry demands we
         // surface output comparably; see PERFORMANCE_PROGRESS.md).
         m.flush_host_io();
-        if take_host_event() {
+        if unsafe { JIT_ISSUES_THIS_RUN != 0 } || take_host_event() {
             break;
         }
     }
@@ -4501,7 +4632,7 @@ pub extern "C" fn chain_next(context: i32) {
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn sys_pending_builds() -> u32 {
-    unsafe { PENDING_SB.len() as u32 }
+    unsafe { PENDING_JIT.len() as u32 }
 }
 
 /// Async superblock completion (called by JS between runSystem calls, never
@@ -4510,86 +4641,146 @@ pub extern "C" fn sys_pending_builds() -> u32 {
 /// before repointing the page's entries at the new function.
 #[no_mangle]
 #[allow(static_mut_refs)]
-pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
+pub extern "C" fn sys_jit_ready(ticket: u64, base: i32, slot_count: u32) {
     unsafe {
         match ACTIVE_FULL_SYSTEM {
             FullSystemKind::Legacy => {
                 if let Some(machine) = SYS.as_mut() {
-                    complete_superblock(machine, ticket, idx);
+                    complete_jit(machine, ticket, base, slot_count);
                     return;
                 }
             }
             FullSystemKind::Virt => {
                 if let Some(machine) = VIRT.as_mut() {
-                    complete_superblock(machine, ticket, idx);
+                    complete_jit(machine, ticket, base, slot_count);
                     return;
                 }
             }
             FullSystemKind::None => {}
         }
-        if idx >= 0 {
-            register_table_slot(idx);
-            retire_table_slot(idx, false);
+        for offset in 0..slot_count {
+            let idx = base.checked_add(offset as i32).unwrap_or(-1);
+            if idx >= 0 {
+                register_table_slot(idx);
+                retire_table_slot(idx, false);
+            }
         }
     }
 }
 
+/// Compatibility entry for pre-async-region test modules. New generated
+/// modules call sys_jit_ready with the complete contiguous slot run.
+#[no_mangle]
+pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
+    sys_jit_ready(ticket, idx, 1);
+}
+
 #[allow(static_mut_refs)]
-fn complete_superblock<M: FullSystemJitMachine>(m: &mut M, ticket: u64, idx: i32) {
+fn complete_jit<M: FullSystemJitMachine>(m: &mut M, ticket: u64, base: i32, slot_count: u32) {
     unsafe {
-        let Some(pos) = PENDING_SB.iter().position(|p| p.ticket == ticket) else {
+        let Some(pos) = PENDING_JIT.iter().position(|p| p.ticket == ticket) else {
             // JavaScript can finish a compile after a reboot cleared the
             // ticket. Adopt and retire the returned slot so it cannot leak.
-            if idx >= 0 {
-                register_table_slot(idx);
-                retire_table_slot(idx, false);
+            for offset in 0..slot_count {
+                let idx = base.checked_add(offset as i32).unwrap_or(-1);
+                if idx >= 0 {
+                    register_table_slot(idx);
+                    retire_table_slot(idx, false);
+                }
             }
             return;
         };
-        let p = PENDING_SB.swap_remove(pos);
+        let p = PENDING_JIT.swap_remove(pos);
+        if p.slot_count() != slot_count {
+            for offset in 0..slot_count {
+                let idx = base.checked_add(offset as i32).unwrap_or(-1);
+                if idx >= 0 {
+                    register_table_slot(idx);
+                    retire_table_slot(idx, false);
+                }
+            }
+            return;
+        }
         let Some(jit) = SYS_JIT.as_mut() else {
-            if idx >= 0 {
-                register_table_slot(idx);
-                retire_table_slot(idx, false);
+            for offset in 0..slot_count {
+                let idx = base.checked_add(offset as i32).unwrap_or(-1);
+                if idx >= 0 {
+                    register_table_slot(idx);
+                    retire_table_slot(idx, false);
+                }
             }
             return;
         };
-        let source_stale = p.boot_gen == BOOT_GEN
-            && p.pages
+        let block_stale = |block: &PendingBlock| {
+            block
+                .pages
                 .iter()
-                .zip(&p.page_generations)
+                .zip(&block.page_generations)
                 .any(|(&(_, pp), &generation)| {
                     let page = (pp - rv64_system::RAM_BASE) >> 12;
                     !m.code_page_marked(page)
                         || m.code_page_dirty(page)
                         || m.code_page_generation(page) != Some(generation)
-                });
+                })
+        };
+        let source_stale = p.boot_gen == BOOT_GEN
+            && match &p.kind {
+                PendingJitKind::Block(block) => block_stale(block),
+                PendingJitKind::Batch(batch) => batch.members.iter().any(block_stale),
+                PendingJitKind::Region(region) => {
+                    region.pages.iter().zip(&region.page_generations).any(
+                        |(&(_, pp), &generation)| {
+                            let page = (pp - rv64_system::RAM_BASE) >> 12;
+                            !m.code_page_marked(page)
+                                || m.code_page_dirty(page)
+                                || m.code_page_generation(page) != Some(generation)
+                        },
+                    )
+                }
+            };
         let current = p.boot_gen == BOOT_GEN
-            && jit.pending_superblock_is_current(p.ticket, p.aspace, &p.pages);
+            && match &p.kind {
+                PendingJitKind::Region(region) => {
+                    jit.pending_superblock_is_current(p.ticket, region.aspace, &region.pages)
+                }
+                PendingJitKind::Block(_) | PendingJitKind::Batch(_) => true,
+            };
         if !current {
             // A newer overlapping build owns at least one page. The older
             // module cannot install a coherent region, but it still releases
             // any non-overlapping claims that were not superseded.
-            jit.finish_pending_superblock(p.ticket, p.aspace, &p.pages, false);
-            if idx >= 0 && source_stale {
+            if let PendingJitKind::Region(region) = &p.kind {
+                jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, false);
+            }
+            if base >= 0 && source_stale {
                 SB_STALE += 1;
             }
-            if idx >= 0 {
-                register_table_slot(idx);
-                retire_table_slot(idx, false);
+            for offset in 0..slot_count {
+                let idx = base.checked_add(offset as i32).unwrap_or(-1);
+                if idx >= 0 {
+                    register_table_slot(idx);
+                    retire_table_slot(idx, false);
+                }
             }
             return;
         }
-        if idx == JIT_REGISTER_CAPACITY {
-            jit.finish_pending_superblock(p.ticket, p.aspace, &p.pages, false);
+        if base == JIT_REGISTER_CAPACITY {
+            if let PendingJitKind::Region(region) = &p.kind {
+                jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, false);
+            }
             handle_jit_capacity(jit);
             return;
         }
-        if idx < 0 {
-            jit.finish_pending_superblock(p.ticket, p.aspace, &p.pages, false);
+        if base < 0 {
+            if let PendingJitKind::Region(region) = &p.kind {
+                jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, false);
+            }
             return;
         }
-        let owner = jit.track_owner([idx]).expect("valid async JIT slot");
+        let slots = (0..slot_count).map(|offset| base + offset as i32);
+        let owner = jit
+            .track_owner(slots.clone())
+            .expect("valid async JIT slot");
         // A page written while compiling makes the result stale. The write
         // generation closes the dirty-drain/re-mark ABA window: a page cannot
         // become apparently clean and accept an older compile.
@@ -4607,13 +4798,34 @@ fn complete_superblock<M: FullSystemJitMachine>(m: &mut M, ticket: u64, idx: i32
         // every block gets after a mapping event, deferred to a point where the
         // current address space is the one asking for the block.
         if source_stale {
-            SB_STALE += 1;
-            jit.finish_pending_superblock(p.ticket, p.aspace, &p.pages, false);
+            if let PendingJitKind::Region(region) = &p.kind {
+                SB_STALE += 1;
+                jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, false);
+            }
             jit.retire_unreferenced_slots(owner);
             return;
         }
-        jit.finish_pending_superblock(p.ticket, p.aspace, &p.pages, true);
-        SB_LANDED += 1;
+        if let PendingJitKind::Region(region) = &p.kind {
+            jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, true);
+            SB_LANDED += 1;
+            complete_region_landing(m, jit, base, region);
+        } else if let PendingJitKind::Block(block) = &p.kind {
+            complete_block_landing(m, jit, base, block);
+        } else if let PendingJitKind::Batch(batch) = &p.kind {
+            complete_batch_landing(m, jit, base, batch);
+        }
+        jit.retire_unreferenced_slots(owner);
+    }
+}
+
+#[allow(static_mut_refs)]
+fn complete_region_landing<M: FullSystemJitMachine>(
+    _m: &mut M,
+    jit: &mut JitState,
+    idx: i32,
+    p: &PendingRegion,
+) {
+    unsafe {
         if p.pages.len() > 1 {
             jit.regions.insert(idx, p.pages.clone());
         }
@@ -4671,7 +4883,98 @@ fn complete_superblock<M: FullSystemJitMachine>(m: &mut M, ticket: u64, idx: i32
                 jit.dispatch[slot].pc = NO_PC;
             }
         }
-        jit.retire_unreferenced_slots(owner);
+    }
+}
+
+fn block_should_replace_region(
+    current: Option<&Option<JitBlock>>,
+    block: JitBlock,
+    keep: u32,
+) -> bool {
+    !matches!(current, Some(Some(current)) if current.n == 0) || (!block.fp && block.n >= keep)
+}
+
+#[allow(static_mut_refs)]
+fn complete_block_landing<M: FullSystemJitMachine>(
+    m: &mut M,
+    jit: &mut JitState,
+    idx: i32,
+    p: &PendingBlock,
+) {
+    if !block_should_replace_region(jit.cache.get(&p.pc), p.block, unsafe { TRACE_KEEP_MIN }) {
+        return;
+    }
+    let mut block = p.block;
+    block.idx = idx;
+    block.last_used = next_jit_use_stamp();
+    for &(_, pp) in &p.pages {
+        m.code_mark_page(pp);
+    }
+    if p.pages.len() > 1 {
+        jit.regions.insert(idx, p.pages.clone());
+    }
+    if unsafe { SYS_SUPERBLOCK } {
+        for &sd in &p.seeds {
+            let e = jit.page_entries.entry((p.aspace, sd & !0xfff)).or_default();
+            if let Err(i) = e.binary_search(&sd) {
+                e.insert(i, sd);
+            }
+        }
+    }
+    let previous = jit.cache_insert(p.pc, Some(block));
+    let slot = JitState::dslot(p.pc);
+    if jit.dispatch[slot].pc == p.pc {
+        jit.dispatch[slot].pc = NO_PC;
+    }
+    if p.missed_superblock && !matches!(previous, Some(Some(current)) if current.n == 0) {
+        *jit.sb_missed.entry((p.aspace, p.pc & !0xfff)).or_insert(0) += 1;
+        unsafe { SB_INDIV += 1 };
+    }
+    m.cpu_mut().clear_store_jtlb();
+}
+
+#[allow(static_mut_refs)]
+fn complete_batch_landing<M: FullSystemJitMachine>(
+    _m: &mut M,
+    jit: &mut JitState,
+    base: i32,
+    p: &PendingBatch,
+) {
+    unsafe {
+        if BATCH_CELL_SEQUENCE[p.cell] == p.sequence {
+            BATCH_BASE_POOL[p.cell] = base as u32;
+        }
+        BATCHES += 1;
+        BATCH_MEMBERS += p.members.len() as u64;
+    }
+    for (offset, member) in p.members.iter().enumerate() {
+        if !block_should_replace_region(jit.cache.get(&member.pc), member.block, unsafe {
+            TRACE_KEEP_MIN
+        }) {
+            continue;
+        }
+        let mut block = member.block;
+        block.idx = base + offset as i32;
+        block.last_used = next_jit_use_stamp();
+        if member.pages.len() > 1 {
+            jit.regions.insert(block.idx, member.pages.clone());
+        }
+        if unsafe { SYS_SUPERBLOCK } {
+            for &sd in &member.seeds {
+                let e = jit
+                    .page_entries
+                    .entry((member.aspace, sd & !0xfff))
+                    .or_default();
+                if let Err(i) = e.binary_search(&sd) {
+                    e.insert(i, sd);
+                }
+            }
+        }
+        jit.cache_insert(member.pc, Some(block));
+        let slot = JitState::dslot(member.pc);
+        if jit.dispatch[slot].pc == member.pc {
+            jit.dispatch[slot].pc = NO_PC;
+        }
     }
 }
 
@@ -4879,6 +5182,8 @@ pub extern "C" fn jit_set_rotated_nests(on: u32) {
 /// through a fixed pool so addresses are stable for the module's lifetime.
 const BATCH_CELLS: usize = 4096;
 static mut BATCH_BASE_POOL: [u32; BATCH_CELLS] = [0; BATCH_CELLS];
+static mut BATCH_CELL_SEQUENCE: [u64; BATCH_CELLS] = [0; BATCH_CELLS];
+static mut NEXT_BATCH_SEQUENCE: u64 = 1;
 static mut BATCH_CELL_NEXT: usize = 0;
 /// Batch compilation (see rv64_jit::translate_batch). Members transfer by
 /// DIRECT tail call inside one module — the only chaining shape that avoids

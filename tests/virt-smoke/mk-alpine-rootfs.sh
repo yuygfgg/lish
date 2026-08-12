@@ -46,52 +46,54 @@ base_tar="$work/alpine-minirootfs.tar"
 
 "$ROOT_DIR/tools/build-guest-benchmarks.sh" "$OUT/guest-benchmarks"
 mkdir -p \
-    "$overlay/etc/profile.d" \
-    "$overlay/run/rv64-proxy" \
     "$overlay/usr/local/bin"
 install -m 0755 "$BENCH" "$overlay/usr/local/bin/rv64-jit-bench"
-
-cat > "$overlay/etc/profile.d/rv64-proxy.sh" <<'EOF'
-if grep -qw 'rv64.network=fetch' /proc/cmdline 2>/dev/null; then
-    export http_proxy=http://10.0.2.2:8080
-    export https_proxy=http://10.0.2.2:8080
-    export HTTP_PROXY="$http_proxy"
-    export HTTPS_PROXY="$https_proxy"
-else
-    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-fi
-EOF
 
 cat > "$overlay/rv64-init" <<'EOF'
 #!/bin/sh
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-. /etc/profile.d/rv64-proxy.sh
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
-ip link set eth0 up
-ip addr add 10.0.2.15/24 dev eth0
-ip route add default via 10.0.2.2
-
-# The emulator exposes the exact ephemeral proxy CA through this private 9p
-# share. The minirootfs already contains apk and the public CA bundle.
-if grep -qw 'rv64.network=fetch' /proc/cmdline && \
-   mount -t 9p -o trans=virtio,version=9p2000.L,ro rv64-proxy /run/rv64-proxy; then
-    ca_bundle=/etc/ssl/certs/ca-certificates.crt
-    ca_base=/etc/ssl/certs/ca-certificates.rv64-base.crt
-    if [ ! -s "$ca_base" ]; then
-        cp "$ca_bundle" "$ca_base"
-    fi
-    if [ -s /run/rv64-proxy/ca.pem ] &&
-       cat "$ca_base" /run/rv64-proxy/ca.pem > /run/rv64-ca-bundle.crt &&
-       mv /run/rv64-ca-bundle.crt "$ca_bundle"; then
-        echo PROXY_CA_READY
+if grep -qw 'rv64.network=wsproxy' /proc/cmdline; then
+    ip link set eth0 up
+    if udhcpc -i eth0 -q -n -t 5; then
+        echo LISH_NETWORK_DHCP=OK
+        if env | grep -qiE '(^|_)https?_proxy='; then
+            echo LISH_NETWORK_PROXY=ON
+        else
+            echo LISH_NETWORK_PROXY=OFF
+        fi
+        if nslookup dl-cdn.alpinelinux.org 10.0.2.3 >/dev/null 2>&1; then
+            echo LISH_NETWORK_DNS=OK
+        else
+            echo LISH_NETWORK_DNS=FAIL
+        fi
+        # The first TLS workload can compile cold guest code. Fastly closes an
+        # idle TCP connection after about one second, so retry the same HTTPS
+        # path during boot before declaring the network unhealthy.
+        https_ok=0
+        for _ in 1 2 3 4 5; do
+            if wget -q -T 3 -t 1 -O /dev/null \
+                https://dl-cdn.alpinelinux.org/alpine/; then
+                https_ok=1
+                break
+            fi
+        done
+        if [ "$https_ok" -eq 1 ]; then
+            echo LISH_NETWORK_HTTPS=OK
+        else
+            echo LISH_NETWORK_HTTPS=FAIL
+        fi
+    else
+        echo LISH_NETWORK_DHCP=FAIL
     fi
 fi
 
 hostname rv64
 echo ALPINE_READY
-echo 'Networking is configured. Try: apk update && apk add nano'
+echo 'Try: apk update && apk add nano'
 echo 'JIT lifecycle benchmark: rv64-jit-bench [pages] [rounds] [calls]'
 exec /bin/sh -l
 EOF
@@ -116,5 +118,5 @@ genext2fs \
     -U -d "$overlay" \
     "$IMG"
 
-touch "$OUT/alpine-image-v5"
+touch "$OUT/alpine-image-v6"
 echo "assembled $IMG (${size_mb} MiB, Alpine $VERSION riscv64, ext2)"

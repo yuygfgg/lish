@@ -47,15 +47,6 @@ export type BootConfig =
 export type NetworkConfig =
   | { mode: "none" }
   | {
-      /** HTTP request egress through the host's fetch() implementation. */
-      mode: "fetch";
-      /** Rewrite plaintext upstream URLs to HTTPS; defaults to true in browsers. */
-      upgradeHttps?: boolean;
-      /** Optional request-level WebSocket fallback for requests blocked by CORS. */
-      relayURL?: string;
-      mac?: Uint8Array;
-    }
-  | {
       /** Raw Ethernet frames over a websockproxy-compatible WebSocket. */
       mode: "wsproxy";
       /** Layer-2 websockproxy-compatible relay URL. */
@@ -115,13 +106,32 @@ export interface RV64Options {
     maxSlots?: number;
     maxBytes?: number;
     growSlots?: number;
+    /** Maximum concurrent background WebAssembly.compile jobs. Defaults to 2. */
+    asyncCompilers?: number;
   };
   boot: BootConfig;
-  /** Linux defaults to the built-in fetch backend; bare metal defaults to none. */
+  /** Networking is disabled unless the caller selects a backend. */
   network?: NetworkConfig;
   /** Execution stays on the calling thread unless Worker mode is explicitly selected. */
   execution?: ExecutionConfig;
   events?: RV64EventListeners;
+}
+
+export interface JitMetrics {
+  liveModules: number;
+  liveSlots: number;
+  liveBytes: number;
+  pendingModules: number;
+  pendingSlots: number;
+  pendingBytes: number;
+  rustPendingBuilds: number;
+  pendingBlocks: number;
+  pendingBatches: number;
+  pendingRegions: number;
+  asyncCompileActive: number;
+  asyncCompileQueued: number;
+  peakAsyncCompileQueued: number;
+  [name: string]: number | boolean | object;
 }
 
 export class RV64 {
@@ -129,11 +139,12 @@ export class RV64 {
   readonly running: boolean;
   /** Exact in local mode; periodically sampled in Worker mode. */
   readonly instructions: bigint;
+  /** JIT ownership and asynchronous compiler queue state. */
+  jitMetrics(): JitMetrics | null;
   readonly console: { send(data: string | Uint8Array): void };
   readonly export: { send(data: string | Uint8Array): void };
   readonly network: {
     readonly mode: NetworkConfig["mode"];
-    readonly proxyURL?: string;
     /** Supply an Ethernet frame when network.mode is "external". */
     receive(frame: Uint8Array | ArrayBuffer): void;
   };
