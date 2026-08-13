@@ -161,6 +161,8 @@ for relative in \
     app/index.html \
     app/app.css \
     app/app.mjs \
+    app/cursor-focus.mjs \
+    app/telemetry.mjs \
     rv64.js \
     rv64.worker.js \
     native-disk.js \

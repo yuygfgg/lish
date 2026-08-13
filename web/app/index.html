@@ -12,35 +12,9 @@
   <link rel="stylesheet" href="./app.css">
 </head>
 <body>
-  <header class="toolbar" aria-label="Lish controls">
-    <div class="identity">
-      <span class="brand">Lish</span>
-      <span class="machine">Alpine Linux</span>
-      <span id="state" class="state" role="status" aria-live="polite">Waiting for host</span>
-    </div>
-    <nav class="actions" aria-label="Machine actions">
-      <button id="start" type="button" data-action="start">Start</button>
-      <button id="stop" type="button" data-action="stop">Stop</button>
-      <button id="reset" type="button" data-action="reset">Reset</button>
-      <button id="clear" type="button" data-action="clear">Clear</button>
-    </nav>
-  </header>
-
   <main class="workspace">
-    <section class="terminal-panel" aria-label="Linux terminal">
-      <div id="terminal" class="terminal" tabindex="-1"></div>
-      <div id="loading" class="overlay" aria-live="polite">
-        <div class="overlay-title" id="loading-title">Waiting for host</div>
-        <div class="overlay-detail" id="loading-detail">The native session will start this machine.</div>
-      </div>
-    </section>
+    <div id="terminal" class="terminal" tabindex="-1" aria-label="Linux terminal"></div>
   </main>
-
-  <footer class="statusbar" aria-label="Session status">
-    <span id="connection">Host disconnected</span>
-    <span id="queue" aria-label="Terminal output queue">Queue 0 B</span>
-    <span id="dimensions">-- x --</span>
-  </footer>
 
   <script type="module" src="./app.mjs"></script>
 </body>

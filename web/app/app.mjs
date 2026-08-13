@@ -1,6 +1,8 @@
 import { RV64 } from "../rv64.js";
 import { Terminal } from "../vendor/xterm/xterm.js";
 import { FitAddon } from "../vendor/xterm/addon-fit.js";
+import { applyNativeCursorFocus } from "./cursor-focus.mjs";
+import { sampleInstructionRate } from "./telemetry.mjs";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
@@ -11,19 +13,13 @@ globalThis.LISH_DIAGNOSTICS = false;
 
 const elements = {
   terminal: document.querySelector("#terminal"),
-  loading: document.querySelector("#loading"),
-  loadingTitle: document.querySelector("#loading-title"),
-  loadingDetail: document.querySelector("#loading-detail"),
-  state: document.querySelector("#state"),
-  connection: document.querySelector("#connection"),
-  queue: document.querySelector("#queue"),
-  dimensions: document.querySelector("#dimensions"),
 };
 
 const terminal = new Terminal({
   allowProposedApi: false,
   convertEol: false,
   cursorBlink: true,
+  cursorInactiveStyle: "outline",
   fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
   fontSize: 14,
   lineHeight: 1.2,
@@ -210,6 +206,8 @@ class Session {
   #output;
   #nativeInput = false;
   #backpressureStop = false;
+  #telemetryTimer = null;
+  #telemetrySample = null;
 
   constructor(bridge) {
     this.#bridge = bridge;
@@ -217,7 +215,6 @@ class Session {
       maxBytes: DEFAULT_MAX_OUTPUT_BYTES,
       credit: DEFAULT_WRITE_CREDIT,
       onChange: (metrics) => {
-        elements.queue.textContent = `Queue ${formatBytes(metrics.queuedBytes)}`;
         if (this.#backpressureStop && metrics.queuedBytes === 0 && metrics.credit > 0) {
           void this.#resumeAfterBackpressure();
         }
@@ -251,13 +248,11 @@ class Session {
     if (!config) throw new Error("VM bootstrap configuration is missing");
     this.#config = normalizeConfig(config);
     this.#setState("loading");
-    setOverlay("Loading", "Preparing the guest machine.");
     const generation = ++this.#generation;
     try {
       const vmOptions = buildVMOptions(this.#config, {
         console: (data) => this.#output.push(data),
         networkTransmit: () => {},
-        downloadProgress: (progress) => this.#reportProgress(progress),
         stop: (detail) => this.#handleStop(detail),
         error: (error) => this.#handleError(error),
         diskError: (detail) => this.#bridge.event("disk-error", detail),
@@ -269,7 +264,6 @@ class Session {
       }
       this.#vm = vm;
       this.#setState("stopped");
-      hideOverlay();
       this.#bridge.event("ready", {
         state: this.#state,
         protocol: PROTOCOL_VERSION,
@@ -338,11 +332,11 @@ class Session {
 
   async destroy() {
     ++this.#generation;
+    this.#stopTelemetry();
     if (this.#vm) await this.#vm.destroy();
     this.#vm = null;
     this.#output.clear();
     this.#setState("destroyed");
-    showOverlay("Session ended", "The native host can create a new session.");
     return this.#state;
   }
 
@@ -386,14 +380,39 @@ class Session {
 
   #setState(state, error = null) {
     this.#state = state;
-    elements.state.textContent = stateLabel(state);
-    elements.state.dataset.kind = state === "failed" ? "error" : ["cold", "destroyed"].includes(state) ? "muted" : "";
-    elements.connection.textContent = this.#bridge.connected ? "Host connected" : "Development host";
-    updateActionAvailability(state);
+    if (state === "running") this.#startTelemetry();
+    else this.#stopTelemetry();
     this.#bridge.event("state", {
       state,
       error: error ? serializedError(error) : undefined,
       terminal: { queuedBytes: this.#output.queuedBytes, credit: this.#output.credit },
+    });
+  }
+
+  #startTelemetry() {
+    if (this.#telemetryTimer !== null) return;
+    this.#telemetrySample = null;
+    this.#telemetryTimer = setInterval(() => this.#reportTelemetry(), 500);
+  }
+
+  #stopTelemetry() {
+    if (this.#telemetryTimer !== null) clearInterval(this.#telemetryTimer);
+    this.#telemetryTimer = null;
+    this.#telemetrySample = null;
+  }
+
+  #reportTelemetry() {
+    if (!this.#vm || this.#state !== "running") return;
+    const sample = sampleInstructionRate(
+      this.#telemetrySample,
+      this.#vm.instructions,
+      performance.now(),
+    );
+    this.#telemetrySample = sample.next;
+    const jit = this.#vm.jitMetrics?.();
+    this.#bridge.event("telemetry", {
+      instructionsPerSecond: sample.instructionsPerSecond,
+      jitPending: Number(jit?.rustPendingBuilds ?? 0),
     });
   }
 
@@ -405,7 +424,7 @@ class Session {
   #handleError(error) {
     this.#setState("failed", error);
     this.#bridge.event("error", serializedError(error));
-    showOverlay("Guest error", serializedError(error).message);
+    terminal.writeln(`\r\n[host] ${serializedError(error).message}`);
   }
 
   #handleOutputOverflow(size) {
@@ -425,48 +444,16 @@ class Session {
     }
   }
 
-  #reportProgress(progress) {
-    const image = progress?.image ?? "guest";
-    const loaded = Number(progress?.loaded ?? 0);
-    const total = Number(progress?.total ?? 0);
-    const detail = total ? `${image} ${Math.round(loaded / total * 100)}%` : `Loading ${image}`;
-    setOverlay("Loading", detail);
-  }
-
   #reportResize() {
     const payload = { cols: terminal.cols, rows: terminal.rows };
-    elements.dimensions.textContent = `${payload.cols} x ${payload.rows}`;
     this.#bridge.event("terminal-resize", payload);
   }
-}
-
-function stateLabel(state) {
-  return {
-    cold: "Waiting for host", loading: "Loading", starting: "Starting", running: "Running",
-    stopping: "Stopping", stopped: "Stopped", quiescing: "Pausing", suspended: "Paused",
-    failed: "Failed", destroyed: "Ended",
-  }[state] ?? state;
-}
-
-function formatBytes(value) {
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MiB`;
 }
 
 function clampInteger(value, min, max, fallback) {
   const number = Number(value);
   return Number.isInteger(number) ? Math.min(max, Math.max(min, number)) : fallback;
 }
-
-function setOverlay(title, detail) {
-  elements.loading.hidden = false;
-  elements.loadingTitle.textContent = title;
-  elements.loadingDetail.textContent = detail;
-}
-
-function hideOverlay() { elements.loading.hidden = true; }
-function showOverlay(title, detail) { setOverlay(title, detail); }
 
 function normalizeConfig(config) {
   if (!config || typeof config !== "object") throw new TypeError("bootstrap configuration must be an object");
@@ -578,27 +565,15 @@ function controlCode(value) {
 
 function reportToNative(event, payload) { bridge.event(event, payload); }
 
-function updateActionAvailability(state) {
-  const enabled = {
-    start: state === "stopped" || state === "suspended",
-    stop: state === "running" || state === "starting",
-    reset: ["running", "stopped", "suspended"].includes(state),
-  };
-  for (const button of document.querySelectorAll("button[data-action]")) {
-    const action = button.dataset.action;
-    if (action !== "clear") button.disabled = !enabled[action];
-  }
-}
-
 const bridge = new NativeBridge();
 const session = new Session(bridge);
-updateActionAvailability(session.state);
 
 // The AppKit shell uses the same low-rate bridge for input and control. Keep
 // these aliases public so the native side can call them with bound arguments.
 globalThis.lishNativeInput = (bytes) => session.input({ bytes });
 globalThis.lishNativePaste = pasteText;
 globalThis.lishNativeControlResult = (message) => bridge.receive(message);
+globalThis.lishNativeWindowFocus = (focused) => applyNativeCursorFocus(terminal, focused === true);
 globalThis.lishCopySelection = () => terminal.hasSelection() ? terminal.getSelection() : null;
 globalThis.lishSelectAll = () => terminal.selectAll();
 
@@ -629,6 +604,7 @@ async function dispatch(op, payload) {
     case "destroy": return session.destroy();
     case "focus-input": return session.focusInput();
     case "console-resize": return session.resize(payload?.cols, payload?.rows);
+    case "clear-terminal": terminal.clear(); return { cleared: true };
     default: throw new Error(`unknown Lish operation: ${op}`);
   }
 }
@@ -657,20 +633,11 @@ terminal.onSelectionChange(() => {
 });
 elements.terminal.addEventListener("focusin", () => reportToNative("focus-input", { focused: true }));
 terminal.onResize(({ cols, rows }) => {
-  elements.dimensions.textContent = `${cols} x ${rows}`;
   if (session.state !== "cold") reportToNative("terminal-resize", { cols, rows });
 });
 elements.terminal.addEventListener("pointerdown", () => {
   session.requestNativeInputFocus();
 });
-
-for (const button of document.querySelectorAll("button[data-action]")) {
-  button.addEventListener("click", () => {
-    const op = button.dataset.action;
-    if (op === "clear") { terminal.clear(); return; }
-    void dispatch(op).catch((error) => session.reportError(error));
-  });
-}
 
 const resizeObserver = new ResizeObserver(() => {
   fitAddon.fit();
@@ -683,14 +650,8 @@ const parameters = new URLSearchParams(globalThis.location?.search ?? "");
 const devConfig = globalThis.__LISH_DEV_BOOTSTRAP__;
 if (devConfig && parameters.get(DEV_QUERY) === "1") {
   void session.bootstrap({ ...devConfig, inputMode: "browser" }).catch((error) => {
-    setOverlay("Boot failed", serializedError(error).message);
+    terminal.writeln(`\r\n[host] ${serializedError(error).message}`);
   });
-} else if (bridge.connected) {
-  elements.connection.textContent = "Host connected";
-  setOverlay("Waiting for host", "The native session will start this machine.");
-} else {
-  elements.connection.textContent = "Development host";
-  elements.loadingDetail.textContent = "Use an explicit development bootstrap to run this page.";
 }
 
 export { PROTOCOL_VERSION, session, handleIncoming };

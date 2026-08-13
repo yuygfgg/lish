@@ -3,13 +3,19 @@ import WebKit
 
 @main
 @MainActor
-final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler,
+    NSMenuItemValidation {
     private static let bridgeName = "lish"
 
     private var window: NSWindow?
     private var webView: WKWebView?
     private var inputView: TerminalInputView?
     private var session: LishSessionController?
+    private var statusField: NSTextField?
+    private var terminalInputFocused = false
+    private var pageState = "cold"
+    private var instructionsPerSecond: Double?
+    private var jitPending: Int?
     private var terminationPending = false
     private var nextControlRequest = 1
 
@@ -18,7 +24,7 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
         let delegate = LishApplicationDelegate()
         application.delegate = delegate
         application.setActivationPolicy(.regular)
-        application.mainMenu = makeMainMenu()
+        application.mainMenu = delegate.makeMainMenu()
         withExtendedLifetime(delegate) {
             application.run()
         }
@@ -57,6 +63,10 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
             input.selectAllTerminal = { [weak self] in
                 self?.selectAllTerminal()
             }
+            input.focusChanged = { [weak self] focused in
+                self?.terminalInputFocused = focused
+                self?.updateTerminalFocus()
+            }
             self.inputView = input
 
             let root = NSView()
@@ -86,6 +96,7 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
             window.isReleasedWhenClosed = false
             window.delegate = self
             self.window = window
+            installStatusAccessory(in: window)
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
 
@@ -155,6 +166,8 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
     }
 
     private func loadSession() async {
+        pageState = "loading"
+        updateStatusField()
         do {
             guard let session else { return }
             let configuration = try await session.start()
@@ -176,6 +189,10 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
               let configuration = session?.webConfiguration else { return }
         inputView?.terminalAvailable = false
         inputView?.terminalHasSelection = false
+        pageState = "loading"
+        instructionsPerSecond = nil
+        jitPending = nil
+        updateStatusField()
         webView.load(URLRequest(url: configuration.pageURL))
     }
 
@@ -301,6 +318,131 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
         )
     }
 
+    private func updateTerminalFocus() {
+        guard let webView else { return }
+        webView.callAsyncJavaScript(
+            "window.lishNativeWindowFocus(focused)",
+            arguments: ["focused": terminalInputFocused && window?.isKeyWindow == true],
+            in: nil,
+            in: .page,
+            completionHandler: nil
+        )
+    }
+
+    private func installStatusAccessory(in window: NSWindow) {
+        let field = NSTextField(labelWithString: "Waiting")
+        field.alignment = .right
+        field.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        field.textColor = .secondaryLabelColor
+        field.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        container.addSubview(field)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: 300),
+            field.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            field.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            field.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .right
+        accessory.view = container
+        window.addTitlebarAccessoryViewController(accessory)
+        statusField = field
+        updateStatusField()
+    }
+
+    private func updateStatusField() {
+        let state = Self.pageStateLabel(pageState)
+        guard pageState == "running" else {
+            statusField?.stringValue = state
+            return
+        }
+        let pending = jitPending.map(String.init) ?? "--"
+        let rate = instructionsPerSecond.map(Self.formatInstructionRate) ?? "-- MIPS"
+        statusField?.stringValue = "\(state) · JIT \(pending) pending · \(rate)"
+    }
+
+    private static func pageStateLabel(_ state: String) -> String {
+        switch state {
+        case "cold": return "Waiting"
+        case "loading": return "Loading"
+        case "starting": return "Starting"
+        case "running": return "Running"
+        case "stopping": return "Stopping"
+        case "stopped": return "Stopped"
+        case "quiescing": return "Pausing"
+        case "suspended": return "Paused"
+        case "failed": return "Failed"
+        case "destroyed": return "Ended"
+        default: return state.capitalized
+        }
+    }
+
+    private static func formatInstructionRate(_ value: Double) -> String {
+        let rate = max(0, value)
+        if rate >= 1_000_000_000 { return String(format: "%.2f GIPS", rate / 1_000_000_000) }
+        if rate >= 1_000_000 { return String(format: "%.1f MIPS", rate / 1_000_000) }
+        if rate >= 1_000 { return String(format: "%.1f KIPS", rate / 1_000) }
+        return String(format: "%.0f IPS", rate)
+    }
+
+    private func performPageOperation(_ operation: String) {
+        guard let webView else { return }
+        let requestID = "native-\(nextControlRequest)"
+        nextControlRequest += 1
+        webView.callAsyncJavaScript(
+            "return await window.lishControl(request)",
+            arguments: [
+                "request": [
+                    "version": 1,
+                    "type": "request",
+                    "id": requestID,
+                    "op": operation,
+                    "payload": [:],
+                ],
+            ],
+            in: nil,
+            in: .page
+        ) { [weak self] result in
+            if case .failure(let error) = result {
+                self?.diagnostic("machine operation failed: \(operation): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    @objc private func startMachine(_ sender: Any?) {
+        performPageOperation("start")
+    }
+
+    @objc private func stopMachine(_ sender: Any?) {
+        performPageOperation("stop")
+    }
+
+    @objc private func resetMachine(_ sender: Any?) {
+        performPageOperation("reset")
+    }
+
+    @objc private func clearTerminal(_ sender: Any?) {
+        performPageOperation("clear-terminal")
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(startMachine(_:)):
+            return pageState == "stopped" || pageState == "suspended"
+        case #selector(stopMachine(_:)):
+            return pageState == "running" || pageState == "starting"
+        case #selector(resetMachine(_:)):
+            return ["running", "stopped", "suspended"].contains(pageState)
+        case #selector(clearTerminal(_:)):
+            return inputView?.terminalAvailable == true
+        default:
+            return true
+        }
+    }
+
     private func handlePageEvent(_ body: [String: Any]) {
         guard let event = body["event"] as? String else { return }
         switch event {
@@ -310,18 +452,32 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
                   webView.url == configuration.pageURL else { return }
             inputView?.terminalAvailable = true
             inputView?.terminalHasSelection = false
+            updateTerminalFocus()
             diagnostic("guest page runtime ready")
             bootstrapPage(configuration, in: webView)
         case "focus-input":
             window?.makeFirstResponder(inputView)
+            updateTerminalFocus()
         case "ready":
             diagnostic("guest machine ready")
             window?.makeFirstResponder(inputView)
+            updateTerminalFocus()
         case "state":
             if let payload = body["payload"] as? [String: Any],
                let state = payload["state"] as? String {
+                pageState = state
+                if state != "running" {
+                    instructionsPerSecond = nil
+                    jitPending = nil
+                }
+                updateStatusField()
                 diagnostic("guest state: \(state)")
             }
+        case "telemetry":
+            guard let payload = body["payload"] as? [String: Any] else { return }
+            instructionsPerSecond = (payload["instructionsPerSecond"] as? NSNumber)?.doubleValue
+            jitPending = (payload["jitPending"] as? NSNumber)?.intValue
+            updateStatusField()
         case "selection-change":
             guard let payload = body["payload"] as? [String: Any],
                   let hasSelection = payload["hasSelection"] as? Bool else { return }
@@ -422,6 +578,10 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
     }
 
     private func showStartupError(_ error: Error) {
+        pageState = "failed"
+        instructionsPerSecond = nil
+        jitPending = nil
+        updateStatusField()
         diagnostic("startup failed")
         let alert = NSAlert()
         alert.messageText = "Lish could not start"
@@ -442,7 +602,7 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
         return message.replacingOccurrences(of: capability, with: "<capability>")
     }
 
-    private static func makeMainMenu() -> NSMenu {
+    private func makeMainMenu() -> NSMenu {
         let mainMenu = NSMenu()
 
         let applicationItem = NSMenuItem(title: "Lish", action: nil, keyEquivalent: "")
@@ -453,6 +613,39 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
             keyEquivalent: ""
         )
         applicationMenu.addItem(.separator())
+
+        let machineItem = NSMenuItem(title: "Machine", action: nil, keyEquivalent: "")
+        let machineMenu = NSMenu(title: "Machine")
+        let start = machineMenu.addItem(
+            withTitle: "Start",
+            action: #selector(startMachine(_:)),
+            keyEquivalent: ""
+        )
+        start.target = self
+        let stop = machineMenu.addItem(
+            withTitle: "Stop",
+            action: #selector(stopMachine(_:)),
+            keyEquivalent: ""
+        )
+        stop.target = self
+        let reset = machineMenu.addItem(
+            withTitle: "Reset",
+            action: #selector(resetMachine(_:)),
+            keyEquivalent: "r"
+        )
+        reset.keyEquivalentModifierMask = [.command, .option]
+        reset.target = self
+        machineMenu.addItem(.separator())
+        let clear = machineMenu.addItem(
+            withTitle: "Clear Terminal",
+            action: #selector(clearTerminal(_:)),
+            keyEquivalent: "k"
+        )
+        clear.target = self
+        machineItem.submenu = machineMenu
+        applicationMenu.addItem(machineItem)
+        applicationMenu.addItem(.separator())
+
         applicationMenu.addItem(
             withTitle: "Hide Lish",
             action: #selector(NSApplication.hide(_:)),
@@ -534,5 +727,13 @@ private final class OneShotResult<Value: Sendable>: @unchecked Sendable {
 extension LishApplicationDelegate: NSWindowDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        updateTerminalFocus()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        updateTerminalFocus()
     }
 }

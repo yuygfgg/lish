@@ -12,6 +12,7 @@ public final class TerminalInputView: NSView, @preconcurrency NSTextInputClient,
     public var copySelection: (@MainActor () -> Void)?
     public var pasteText: (@MainActor (String) -> Void)?
     public var selectAllTerminal: (@MainActor () -> Void)?
+    public var focusChanged: (@MainActor (Bool) -> Void)?
     public var terminalAvailable = false
     public var terminalHasSelection = false
 
@@ -21,7 +22,13 @@ public final class TerminalInputView: NSView, @preconcurrency NSTextInputClient,
     public override var acceptsFirstResponder: Bool { true }
 
     public override func becomeFirstResponder() -> Bool {
-        true
+        focusChanged?(true)
+        return true
+    }
+
+    public override func resignFirstResponder() -> Bool {
+        focusChanged?(false)
+        return true
     }
 
     public override func keyDown(with event: NSEvent) {
