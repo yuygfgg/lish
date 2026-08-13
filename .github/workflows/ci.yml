@@ -13,82 +13,67 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  release-assets-worker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: deploy/release-assets-worker/package-lock.json
-
-      - name: Install release asset Worker dependencies
-        working-directory: deploy/release-assets-worker
-        run: npm ci
-
-      - name: Validate release asset Worker
-        working-directory: deploy/release-assets-worker
-        run: npm run check
-
-      - name: Validate release asset Worker bundle
-        working-directory: deploy/release-assets-worker
-        run: npx wrangler deploy --dry-run
-
   validate:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: macos-latest
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify pinned Rust toolchain
+      - name: Install image and native host tools
         run: |
-          rustc --version
-          cargo clippy --version
+          brew install coreutils genext2fs libarchive libslirp zig
+          echo "$(brew --prefix libarchive)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Select pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Verify toolchain
+        run: |
+          tools/cargo --version
+          tools/cargo clippy --version
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: tools/cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: tools/cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Build guest fixtures
+      - name: Test Rust workspace
         run: |
-          for guest in hello-nostd hello-std fpu-test bench; do
-            (cd "guests/$guest" && cargo build --release)
-          done
-          tools/build-guest-benchmarks.sh
-
-      - name: Test debug workspace
-        run: cargo test --workspace
-
-      - name: Test release workspace
-        run: cargo test --workspace --release
+          tools/cargo test --workspace --exclude rv64-wasm --release
+          tools/cargo test -p rv64-wasm --lib --release
 
       - name: Build browser module
-        run: cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
+        run: tools/cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
 
-      - name: Test self-contained JavaScript harnesses
+      - name: Stage browser dependencies
         run: |
-          node tests/public-api.mjs
-          node tests/worker-api.mjs
-          node tests/jit-code-store.mjs
-          node tests/jit-module-bench.mjs
-          node tests/site-asset-source.mjs
-          node tests/direct-boot.mjs
-          node tests/alpine-boot.mjs
-          node tests/vs-v86/harness-selftest.mjs
-          node tests/http-relay.mjs
+          npm ci
+          npm run stage-web-dependencies
+
+      - name: Test maintained JavaScript harnesses
+        run: |
           node tests/boot-profile-selftest.mjs
-          mkdir -p web/images/alpine
-          curl --fail --location --retry 3 \
-            https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v3/modern-Image \
-            --output web/images/alpine/Image
-          curl --fail --location --retry 3 \
-            https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v3/modern-alpine.ext4 \
-            --output web/images/alpine/alpine.ext4
-          RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs
+          node tests/jit-code-store.mjs
+          node tests/host-callback-boundary.mjs
+          node tests/public-api.mjs
+          node tests/virt-jit.mjs
+          node tests/worker-api.mjs
+
+      - name: Test Swift network host
+        run: swift test --package-path native -Xswiftc -warnings-as-errors
+
+      - name: Build Alpine assets
+        run: web/prepare-images.sh
+
+      - name: Boot Alpine direct machine
+        run: node tests/alpine-boot.mjs
+
+      - name: Boot native virt smoke test
+        run: tests/virt-smoke/run.sh

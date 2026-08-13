@@ -11,8 +11,8 @@ const wasmPath = join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.was
 const kernelPath = process.env.RV64_MODERN_KERNEL || join(root, "web/images/alpine/Image");
 const diskPath = join(root, "web/images/alpine/alpine.ext4");
 if (![wasmPath, kernelPath, diskPath].every(existsSync)) {
-  console.log("SKIP Alpine boot (run web/prepare-images.sh first)");
-  process.exit(0);
+  console.error("FAIL Alpine boot: missing Wasm, kernel, or disk; run web/prepare-images.sh first");
+  process.exit(2);
 }
 
 let output = "";

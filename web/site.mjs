@@ -1,17 +1,12 @@
-import { RV64 } from "./rv64.js?v=2";
-import { resolveAssetOverride } from "./asset-source.mjs";
-import { defaultAssetURL } from "./site-config.js?v=3";
-import { Terminal } from "https://esm.sh/@xterm/xterm@6.0.0";
-import { FitAddon } from "https://esm.sh/@xterm/addon-fit@0.11.0";
-
-export const PUBLISHED_ASSETS = defaultAssetURL;
+import { RV64 } from "./rv64.js?v=3";
+import { Terminal } from "./vendor/xterm/xterm.js";
+import { FitAddon } from "./vendor/xterm/addon-fit.js";
 
 export const PRESETS = Object.freeze({
   alpine: {
     label: "Alpine Linux",
     ramMB: 512,
     local: ["images/alpine/Image", "images/alpine/alpine.ext4"],
-    release: ["modern-Image", "modern-alpine.ext4"],
   },
 });
 
@@ -71,22 +66,8 @@ function write(data) {
   terminal.write(typeof data === "string" ? data : decoder.decode(data, { stream: true }));
 }
 
-function localAssetCandidates(local, release) {
-  const override = resolveAssetOverride(
-    new URLSearchParams(location.search).get("assets"),
-    location.href,
-  );
-  if (override) return [{ url: `${override}/${release}` }];
-  const candidates = [];
-  if (PUBLISHED_ASSETS) {
-    candidates.push({ url: `${PUBLISHED_ASSETS.replace(/\/$/, "")}/${release}` });
-  }
-  candidates.push(...(Array.isArray(local) ? local : [local]).map((url) => ({ url })));
-  return candidates;
-}
-
 async function downloadAsset(candidate, progress) {
-  const response = await fetch(candidate.url, { headers: candidate.headers });
+  const response = await fetch(candidate);
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   const total = response.headers.has("content-encoding")
     ? 0
@@ -108,24 +89,22 @@ async function downloadAsset(candidate, progress) {
   return result;
 }
 
-async function fetchAsset(local, release, progress) {
-  let last;
-  const candidates = localAssetCandidates(local, release);
+async function fetchAsset(local, progress) {
+  const candidates = Array.isArray(local) ? local : [local];
+  let lastError;
   for (const candidate of candidates) {
     try {
       return await downloadAsset(candidate, progress);
     } catch (error) {
-      last = new Error(`${candidate.url}: ${error.message}`);
+      lastError = new Error(`${candidate}: ${error.message}`);
     }
   }
-
-  throw last;
+  throw lastError ?? new Error("asset has no source");
 }
 
 async function loadWasm() {
   return fetchAsset(
     ["./rv64_wasm.wasm", "../target/wasm32-unknown-unknown/release/rv64_wasm.wasm"],
-    "rv64_wasm.wasm",
     () => {},
   );
 }
@@ -135,7 +114,7 @@ async function start(presetName) {
   const preset = PRESETS[presetName];
   boot.disabled = true;
   terminal.clear();
-  networkStatus.textContent = "Network idle";
+  networkStatus.textContent = "Ethernet idle";
   networkStatus.title = "";
   write(`[host] loading ${preset.label}…\n`);
   try {
@@ -144,8 +123,8 @@ async function start(presetName) {
     const wasm = await loadWasm();
     const images = [];
     for (let i = 0; i < preset.local.length; i++) {
-      const name = preset.release[i];
-      images.push(await fetchAsset(preset.local[i], name, (loaded, total) => {
+      const name = preset.local[i].split("/").at(-1);
+      images.push(await fetchAsset(preset.local[i], (loaded, total) => {
         const amount = total ? `${(loaded / total * 100).toFixed(0)}%` : `${(loaded / 1048576).toFixed(1)} MiB`;
         cpuStatus(`Downloading ${name}: ${amount}`);
       }));
@@ -165,39 +144,9 @@ async function start(presetName) {
       network: networkConfiguration(),
       events: {
         console: (data) => write(data),
-        networkTraffic: (() => {
-          let requests = 0;
-          let uploaded = 0;
-          let downloaded = 0;
-          let last = "";
-          const render = () => {
-            const received = downloaded < 1048576
-              ? `${(downloaded / 1024).toFixed(0)} KiB`
-              : `${(downloaded / 1048576).toFixed(1)} MiB`;
-            const sent = uploaded < 1024
-              ? `${uploaded} B`
-              : `${(uploaded / 1024).toFixed(1)} KiB`;
-            networkStatus.textContent = `${requests} requests · ${sent} sent · ${received} received${last ? ` · ${last}` : ""}`;
-          };
-          return (detail) => {
-            if (detail.type === "request") {
-              requests++;
-              uploaded += detail.bytes;
-              last = `${detail.method} ${new URL(detail.url).hostname}`;
-            } else if (detail.type === "download") {
-              downloaded += detail.bytes;
-            } else if (detail.type === "response") {
-              last = `HTTP ${detail.status}`;
-            } else if (detail.type === "end") {
-              last = "complete";
-            } else if (detail.type === "error") {
-              last = "network error";
-              networkStatus.title = detail.message;
-              write(`\n[network] ${detail.message}\n`);
-            }
-            render();
-          };
-        })(),
+        networkTransmit: (frame) => {
+          networkStatus.textContent = `Ethernet · ${frame.byteLength} bytes sent`;
+        },
         stop: ({ reason }) => {
           if (reason === "powered-off") write("\n[host] guest powered off\n");
           cpuStatus(reason === "powered-off" ? "Powered off" : "Stopped");
@@ -233,7 +182,7 @@ async function start(presetName) {
     frame();
   } catch (error) {
     write(`\n[host] unable to boot: ${error.message}\n\n`);
-    write("For local setup, follow the commands below the terminal.\n");
+    write("Build the local assets before starting the page.\n");
     cpuStatus("Boot failed");
     console.error(error);
   } finally {

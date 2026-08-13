@@ -1,81 +1,121 @@
-# rv64.js
+# Lish
 
-> [!NOTE]
-> This codebase was written 100% with AI using Claude Code and Codex, directed
-> by [@ibuildthecloud](https://github.com/ibuildthecloud), who is not a
-> virtualization or JIT expert.
+Lish runs a full RV64 Linux system in WebAssembly. The product target is a
+macOS and iOS shell application that uses WebKit for WebAssembly compilation.
+The first implementation target is macOS.
 
-A RISC-V RV64 full-system emulator written in Rust, with a WebAssembly target
-and a JavaScript browser frontend. Its machine model is based on
-[TinyEMU](https://bellard.org/tinyemu/), and its browser architecture is
-inspired by [copy/v86](https://github.com/copy/v86).
+This repository contains the emulator, browser runtime, Linux image tools,
+native host services, tests, and product design. The emulator started from
+[`rv64.js`](https://github.com/ibuildthecloud/rv64.js). It is now an internal
+Lish subsystem. See [UPSTREAM.md](UPSTREAM.md) for the import record.
 
-**Project status: pre-release, with working Linux boots.** The native Rust
-interpreter and the browser's WebAssembly interpreter/JIT boot Linux to an
-interactive shell. The browser demo boots Alpine 3.24 on Linux 6.12 with
-working `apk` networking.
+Status: pre-release. The WebAssembly full-system machine boots Alpine Linux to
+an interactive shell. The current native host connects virtio-net to libslirp
+with a raw Ethernet WebSocket. The guest can use DHCP, DNS, TCP, UDP, and TLS.
+Native disk streaming and the macOS application shell are not implemented yet.
 
-The separate Linux user-mode runner is **experimental**. It can load static
-riscv64 ELF executables and supports enough of the Linux syscall ABI for the
-repository's small, static musl test programs. It is not a general-purpose
-`qemu-riscv64` replacement: there is currently no guest filesystem, process
-creation, networking, threading, or complete signal handling, and several
-implemented syscalls are compatibility stubs.
+## Scope
 
-Implemented and tested paths include:
+The active runtime has one full-system machine:
 
-- RV64 I/M/A/F/D/C, Zicsr, and the privileged architecture
-- Sv39 and Sv48 virtual memory
-- WebAssembly JIT in both user-mode and full-system browser run loops
-- virtio console and block devices
-- virtio-9p host-directory and in-memory file sharing
-- virtio networking through raw Ethernet WebSocket, WISP, or a browser-local LAN
+- RV64 I, M, A, F, D, C, Zicsr, and privileged execution;
+- Sv39 and Sv48 virtual memory;
+- direct Linux boot through an emulator-provided SBI;
+- virtio block, network, and console devices;
+- bounded asynchronous WebAssembly JIT compilation;
+- local and dedicated Worker execution;
+- raw Ethernet transport over an ordered WebSocket;
+- a Swift libslirp host for unprivileged guest networking.
 
-Architecture details live in [DESIGN.md](DESIGN.md). See
-[ROADMAP.md](ROADMAP.md) for future work and
-[PERFORMANCE_PROGRESS.md](PERFORMANCE_PROGRESS.md) for measured JIT results.
-The planned stable JavaScript API and direct-Linux boot contract are recorded
-in [API_DESIGN.md](API_DESIGN.md).
-Claims here describe the current test coverage, not complete RISC-V or Linux
-compatibility.
+Lish does not include the old Linux user-mode emulator, TinyEMU source tree,
+HTTP translation proxy, WISP transport, 9P filesystem, WANIX integration, or
+independent Web library release pipeline.
 
-## Quick start
+## Local Browser Run
 
-### Browser
-
-The hosted demo is available at
-<https://ibuildthecloud.github.io/rv64.js/>. To run it locally:
+Install the host tools, build the Alpine assets, and build Wasm:
 
 ```sh
-nix develop -c web/prepare-images.sh
-cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
-python3 -m http.server -d . 8000
+brew install coreutils genext2fs zig
+npm ci
+npm run stage-web-dependencies
+web/prepare-images.sh
+tools/cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
 ```
 
-Open <http://localhost:8000/web/>.
+Rust commands use the rustup-managed toolchain in `rust-toolchain.toml`.
+Repository scripts call `tools/cargo`, which selects that toolchain even when
+Homebrew puts another Cargo first in `PATH`.
 
-The same machine is available as a runnable Node example. It forwards the host
-terminal to the guest:
+Start a local file server from the repository root:
+
+```sh
+python3 -m http.server 4173
+```
+
+Open <http://127.0.0.1:4173/web/>. The page runs the VM in a dedicated Worker
+by default. It loads the kernel and disk from `web/images/alpine` and loads the
+Wasm module from the repository build output.
+
+The Node harness runs the same machine and forwards the guest serial console:
 
 ```sh
 node examples/boot-linux.mjs
 ```
 
-For a non-interactive smoke test, stop after a known boot marker:
+Stop the harness after the Alpine readiness marker:
 
 ```sh
 RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs
 ```
 
-The generated Alpine image includes `rv64-jit-bench`. The program creates,
-warms, rewrites, and reruns executable guest pages. Optional arguments select
-the page count, rewrite rounds, and calls per page:
+The Alpine image includes the JIT lifecycle benchmark:
 
 ```sh
 rv64-jit-bench 1024 8 2304
 ```
 
-The browser and Node examples use the typed public API from `web/rv64.js`:
+## Native Network Host
+
+The Swift package requires libslirp. On macOS, install it with Homebrew:
+
+```sh
+brew install libslirp
+cd native
+swift test
+swift run lish-network-host --origin http://127.0.0.1:4173
+```
+
+The host prints a WebSocket URL and a capability token. Add both values to the
+page URL:
+
+```text
+http://127.0.0.1:4173/web/?network=ws://127.0.0.1:PORT/&capability=TOKEN
+```
+
+The product service must listen on loopback only. The host has an
+`--allow-remote` option for physical-device development. Do not enable that
+option in the product application.
+
+The network data path is:
+
+```text
+Linux virtio-net
+  -> Web Worker
+  -> raw Ethernet WebSocket
+  -> Swift host
+  -> libslirp
+  -> host network
+```
+
+The guest owns DNS, TCP, UDP, and TLS. Lish does not translate HTTP requests
+or install a proxy certificate in the guest.
+
+## JavaScript Runtime
+
+`web/rv64.js` is the product browser runtime. `web/rv64.d.ts` describes its
+typed API. New product code must use direct Linux boot, Worker execution, and
+raw Ethernet networking:
 
 ```js
 import { RV64 } from "./rv64.js";
@@ -83,228 +123,100 @@ import { RV64 } from "./rv64.js";
 const vm = await RV64.create({
   wasm: { url: "./rv64_wasm.wasm" },
   memoryMB: 512,
+  execution: { mode: "worker" },
   boot: {
     mode: "linux-direct",
     kernel: { url: "./Image" },
     disk: { url: "./alpine.ext4" },
     cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
   },
-  events: { console: (bytes) => terminal.write(bytes) },
-});
-await vm.start();
-vm.console.send("uname -a\n");
-vm.console.send("apk update\n");
-```
-
-The library owns the execution loop. Its lifecycle is `start()`, `stop()`,
-`reset()`, and `destroy()`; `on()` provides typed events and returns an
-unsubscribe function. See [web/rv64.d.ts](web/rv64.d.ts) and
-[API_DESIGN.md](API_DESIGN.md). `linux-direct` is part of the declared boot
-model and boots Linux in supervisor mode through the emulator-provided SBI,
-without loading or executing a firmware image. Use `mode: "linux-direct"` and
-omit `firmware`; the kernel, disk/initrd, command line, and lifecycle are
-otherwise unchanged.
-
-### JavaScript and TypeScript API
-
-`web/rv64.js` is a standard ES module. Its adjacent `web/rv64.d.ts` declaration
-provides the same API to TypeScript without a separate `@types` package:
-
-```ts
-import { RV64, type RV64Options } from "./web/rv64.js";
-
-const capability = "replace-with-a-random-256-bit-token";
-const options: RV64Options = {
-  wasm: { url: "./rv64_wasm.wasm" },
-  memoryMB: 512,
-  boot: {
-    mode: "linux-direct",
-    kernel: { url: "./Image" },
-    disk: { url: "./alpine.ext4" },
-    cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
+  network: {
+    mode: "wsproxy",
+    url: "ws://127.0.0.1:4199/",
+    protocols: ["lish.raw-ethernet.v1", capability],
   },
-  network: { mode: "wsproxy", url: "ws://127.0.0.1:4199/", protocols: [
-    "lish.raw-ethernet.v1", capability,
-  ] },
   events: {
-    downloadProgress: ({ image, loaded, total }) => {
-      console.log(image, loaded, total);
-    },
     console: bytes => terminal.write(bytes),
     error: error => console.error(error),
   },
-};
+});
 
-const vm = await RV64.create(options); // created and assembled, but stopped
-const unsubscribe = vm.on("stop", ({ reason }) => console.log(reason));
 await vm.start();
 vm.console.send("uname -a\n");
 await vm.stop();
-await vm.reset();
-unsubscribe();
 await vm.destroy();
 ```
 
-Embedders that already own a 9P2000.L server can expose it as a live
-virtio-9P mount instead of loading a tar-backed filesystem:
+Call `destroy()` when a session ends. Destruction closes transports, cancels
+runtime work, and releases JIT ownership. The raw Wasm exports are internal.
 
-```js
-boot: {
-  mode: "linux-direct",
-  kernel,
-  cmdline: "console=ttyS0 root=host9p rootfstype=9p rootflags=trans=virtio,version=9p2000.L",
-  p9: { tag: "host9p", handle: request => namespace9p(request) },
-}
-```
+The supported Lish path is `linux-direct` with `none`, raw Ethernet `wsproxy`,
+or an application-provided external Ethernet transport. The `firmware` mode
+remains available when the caller supplies an OpenSBI image. The image builder
+does not create or download firmware. The runtime does not expose
+user-mode, bare-metal, HTTP proxy, WISP, browser-local LAN, 9P, or secondary
+console compatibility APIs.
 
-The handler may return a `Uint8Array` or a promise. External handlers require
-local execution mode; they are intended for hosts such as WANIX that already
-run rv64.js inside their own Worker.
+## Native Full-System Runner
 
-The self-contained [WANIX integration](integrations/wanix/README.md) builds an
-rv64 VM-driver archive and matching RISC-V Linux namespace without patching a
-WANIX checkout.
-
-Execution is local (on the calling thread) by default. Browser applications
-that need to keep their UI responsive can opt into a dedicated module Worker
-without changing the VM lifecycle or event API:
-
-```js
-const vm = await RV64.create({
-  ...options,
-  execution: { mode: "worker" },
-});
-```
-
-Worker mode runs Wasm, devices, image downloads, and networking off the main
-thread. `running` and `instructions` are cached snapshots in this mode (updated
-every 500 ms by default); set `statisticsIntervalMs` to change that interval.
-URL and byte image sources work in both modes. A `Response` source is local-mode
-only because response bodies cannot be transferred reliably between browsers.
-Browser execution slices yield through `MessageChannel`, avoiding the nested
-timer clamping that applies to repeated `setTimeout(..., 0)` calls.
-
-Images may be `{ url }`, `Response`, `Uint8Array`, `ArrayBuffer`, or another
-array-buffer view. `RV64.create()` resolves all images and emits download
-progress before the `ready` event. `start()` runs cooperative execution slices;
-calling it repeatedly is harmless. Always call `destroy()` when the VM is no
-longer needed so sockets, channels, and listeners are closed.
-
-The supported boot configurations are:
-
-- `linux-direct`: boot a Linux kernel in supervisor mode using rv64.js's SBI.
-- `firmware`: boot through an explicitly supplied firmware image.
-- `bare-metal`: load an image at an explicit address without Linux devices.
-
-The stable facade intentionally does not expose raw Wasm exports or JIT control
-methods. Architecture and emulator tests use the separately named
-`RV64Debug` API; applications should not depend on it.
-
-Networking defaults to `none`. The stable API does not expose the legacy HTTP
-translation backend. Select a layer-2 or payload relay explicitly:
-
-```js
-network: { mode: "wisp", url: "wisps://…" }          // TCP/UDP relay
-network: { mode: "wsproxy", url: "wss://…" }         // layer-2 relay
-network: { mode: "inbrowser", channel: "my-lan" }    // browser-local LAN
-network: { mode: "external" }                         // advanced frame API
-network: { mode: "none" }
-```
-
-`wisp` provides outbound TCP and UDP through a WISP v1 relay. `wsproxy` carries
-raw Ethernet frames to a websockproxy-compatible relay. `inbrowser` joins VMs
-in the same browser to a local Ethernet segment using `BroadcastChannel` and
-has no Internet access. In `external` mode, outbound frames arrive through
-`networkTransmit` and inbound frames are passed to `vm.network.receive(frame)`.
-
-### Native full-system emulator
+The native runner supports emulator and Linux boot diagnostics:
 
 ```sh
-cargo build --release --bin rv64-vboot
+tools/cargo build --release --bin rv64-vboot
 target/release/rv64-vboot --direct web/images/alpine/Image \
   --disk web/images/alpine/alpine.ext4 --ram 0.5 \
   -- 'console=ttyS0 root=/dev/vda rw init=/rv64-init'
 ```
 
-Share a host directory over virtio-9p:
+The native runner loads its disk into host memory. It is a diagnostic tool, not
+the product persistence design.
+
+## Validation
+
+Run the native Rust tests, Wasm build, focused JavaScript tests, and Swift
+tests:
 
 ```sh
-target/release/rv64-vboot --direct web/images/alpine/Image \
-  --disk web/images/alpine/alpine.ext4 --9p ~/src --ram 0.5 \
-  -- 'console=ttyS0 root=/dev/vda rw init=/rv64-init'
-```
-
-Then mount it in the guest:
-
-```sh
-mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
-```
-
-The old in-process HTTP proxy and browser HTTP relay remain only as low-level
-debug fixtures. They are not part of the stable API and are not used by the
-product network path.
-
-### Alpine/Linux machine
-
-The Alpine image builder runs as an unprivileged user on macOS and Linux. It
-requires `curl`, `gzip`, `genext2fs`, a SHA-256 tool, and one supported RISC-V
-cross compiler. It does not require host `apk`, `fakeroot`, `debugfs`, or a
-guest runner.
-
-```sh
-tests/virt-smoke/mk-alpine-rootfs.sh target/bench
+tools/cargo fmt --all -- --check
+tools/cargo test --workspace --exclude rv64-wasm --release
+tools/cargo test -p rv64-wasm --lib --release
+tools/cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
+node tests/boot-profile-selftest.mjs
+node tests/jit-code-store.mjs
+node tests/host-callback-boundary.mjs
+node tests/virt-jit.mjs
+node tests/public-api.mjs
+node tests/worker-api.mjs
 node tests/alpine-boot.mjs
+(cd native && swift test)
 ```
 
-### User-mode emulator
+Use `tests/run-isa-tests.sh`, `tests/run-arch-tests.sh`, and
+`tests/lockstep.py` for architecture validation. These stages need external
+RISC-V test sources and reference tools. See
+[tests/VALIDATION.md](tests/VALIDATION.md) for the last recorded conformance
+results.
 
-This runner is experimental and intended for the included static test guests,
-instruction testing, and JIT development. It does not currently provide a
-general Linux userspace environment.
+Use WebKit as the default engine for browser integration tests. Use Chromium
+as a comparison engine. A missing kernel, disk, compiler, or browser is a test
+setup failure for a required product gate.
 
-```sh
-cargo run --release -p rv64-run -- <static-elf> [args...]
-```
+## Repository Layout
 
-## Build & test
+- `crates/rv64-core`: CPU, MMU, CSR, and software floating point.
+- `crates/rv64-jit`: WebAssembly code emitter.
+- `crates/rv64-system`: full-system `virt` machine and devices.
+- `crates/rv64-wasm`: plain Wasm host ABI for one full-system VM.
+- `web`: Worker runtime and local development page.
+- `native`: Swift libslirp bridge and raw Ethernet WebSocket host.
+- `kernel`: Linux configuration for the Lish machine.
+- `tests`: architecture, runtime, Worker, boot, and native integration tests.
+- `tools`: image and benchmark build tools.
 
-```sh
-# reproducible dev environment (rust + cross targets, node, qemu, spike,
-# riscv cross-gcc, wabt/binaryen, dtc — everything validation needs)
-nix develop
-
-# the full automated suite: cargo tests, guest builds, qemu differential,
-# official riscv-tests, architecture-signature comparison against Spike,
-# wasm build + Node smoke (limited user mode, JIT, Linux boot). Unavailable
-# external stages are reported as skips.
-tests/run-all.sh
-
-# release gate: treat any unavailable tool-dependent stage as a failure
-REQUIRE_ALL=1 tests/run-all.sh
-
-# individual pieces
-cargo test --workspace --exclude rv64-wasm  # native unit + integration tests
-cargo test -p rv64-wasm --lib           # wasm ABI unit tests through a native harness
-tests/run-isa-tests.sh                  # official ISA suite only
-cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
-python3 -m http.server -d . 8000        # then open /web/
-
-# native TinyEMU oracle (differential testing)
-make -C reference/tinyemu CONFIG_FS_NET= CONFIG_SDL= CONFIG_X86EMU= CONFIG_SLIRP=
-```
-
-Validation status lives in [tests/VALIDATION.md](tests/VALIDATION.md).
-The source-release checklist and known gate limitations live in
-[RELEASING.md](RELEASING.md).
-
-## Layout
-
-- `crates/rv64-core` — portable CPU core (`no_std`, generic over a `Bus` trait)
-- `crates/rv64-wasm` — `extern "C"` wasm export surface (no wasm-bindgen)
-- `web/` — JS loader + demo page
-- `reference/tinyemu/` — vendored TinyEMU (MIT, Fabrice Bellard): spec map & test oracle
+The product plan is in [PLAN.md](PLAN.md). The native integration contract is
+in [APP_INTEGRATION.md](APP_INTEGRATION.md).
 
 ## License
 
-MIT; see [LICENSE](LICENSE). `reference/tinyemu/` retains its own MIT license and copyright
-(Fabrice Bellard); see `reference/README.md`.
+Lish is MIT licensed. See [LICENSE](LICENSE). Retained third-party code and
+attribution are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

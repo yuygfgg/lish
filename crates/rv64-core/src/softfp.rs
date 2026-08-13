@@ -1,7 +1,7 @@
 //! Software floating point with exact IEEE 754 exception flags.
 //!
 //! A Rust port of TinyEMU's softfp (Copyright (c) 2016 Fabrice Bellard,
-//! MIT license — see reference/tinyemu/softfp_template.h). Same internal
+//! MIT license — see THIRD_PARTY_NOTICES.md). Same internal
 //! representation: mantissa normalized to bit F_SIZE-2 with RND_SIZE
 //! guard/sticky bits, single round_pack step setting NX/UF/OF.
 

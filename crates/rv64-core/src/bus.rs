@@ -2,9 +2,8 @@ use crate::exception::Exception;
 
 /// Memory/MMIO access interface the CPU executes against.
 ///
-/// This is the seam between user-mode and full-system emulation:
-/// - user-mode: [`FlatMemory`] — bounds-checked flat buffer, no translation
-/// - full-system (later): sv39/sv48 page-table walk + TLB, then RAM or MMIO
+/// The full-system implementation dispatches RAM and MMIO after address
+/// translation. [`FlatMemory`] supplies bounded memory for architecture tests.
 ///
 /// Addresses are guest virtual addresses; the implementation decides what
 /// translation means.
@@ -51,7 +50,7 @@ pub trait Bus {
     }
 }
 
-/// Flat guest memory starting at `base` — the user-mode Bus.
+/// Flat guest memory starting at `base` for architecture tests.
 pub struct FlatMemory<'a> {
     pub base: u64,
     pub mem: &'a mut [u8],

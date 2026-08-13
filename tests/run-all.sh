@@ -1,122 +1,101 @@
-#!/bin/sh
-# rv64.js full test suite. Run from anywhere; skips stages whose external
-# tools are missing (each skip is reported). Set REQUIRE_ALL=1 for a release
-# gate where a skipped tool-dependent stage is a failure. Exit 0 means every
-# stage that ran passed, and in strict mode that every stage was available.
-#
-# Stages:
-#   1. cargo tests        unit + guest-integration tests
-#   2. guest builds       Rust->riscv64gc-musl test binaries
-#   3. qemu differential  guests bit-identical on qemu-riscv64
-#   4. riscv-tests        official ISA suite, 134 tests (cross-gcc needed)
-#   5. spike lockstep     per-instruction register-writeback diff vs Spike
-#   6. riscv-arch-test    official architecture tests, signatures vs Spike
-#   7. wasm build + smoke + JIT differential fuzzer through Node
-#   8. virt-smoke        modern-system (Debian-class) boot regression test
-#
-# Under the nix dev shell (flake.nix) all tools are present.
-set -u
-# Stages 5 and 6 pipe their runner into `tail`, so without pipefail the
-# EXIT STATUS IS TAIL'S — a failing lockstep or signature comparison
-# printed its failure and the suite still reported ALL STAGES PASSED.
-# (POSIX sh has no pipefail; re-exec under bash when it is available, which
-# it is in the dev shell and on every platform this suite supports.)
-if [ -z "${RUNALL_PIPEFAIL:-}" ] && command -v bash >/dev/null 2>&1; then
-    RUNALL_PIPEFAIL=1 exec bash "$0" "$@"
-fi
-(set -o pipefail) 2>/dev/null && set -o pipefail
-cd "$(dirname "$0")/.." || exit 1
+#!/usr/bin/env bash
+# Lish validation suite. Run from anywhere; stages with external tools or
+# images report a skip. Set REQUIRE_ALL=1 to make every skip a failure.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
 FAILED=0
+CARGO="$PWD/tools/cargo"
+
 note() { printf '\n=== %s\n' "$*"; }
 skip() {
     echo "SKIP ($*)"
     if [ "${REQUIRE_ALL:-0}" = 1 ]; then FAILED=1; fi
 }
+run_stage() {
+    if "$@"; then
+        return 0
+    fi
+    FAILED=1
+}
 
-note "1/8 cargo tests"
-# Testing the whole workspace in one Cargo invocation also asks macOS to link
-# rv64-wasm as a native cdylib. Its host symbols are WebAssembly imports, so
-# only the Rust test harness has a native link target.
-cargo test --workspace --exclude rv64-wasm --release -q || FAILED=1
-cargo test -p rv64-wasm --lib --release -q || FAILED=1
+note "1/6 Rust workspace"
+run_stage "$CARGO" test --workspace --exclude rv64-wasm --release -q
+run_stage "$CARGO" test -p rv64-wasm --lib --release -q
+run_stage "$CARGO" clippy --workspace --all-targets -- -D warnings
 
-note "2/8 guest builds"
-for g in hello-nostd hello-std fpu-test bench; do
-    (cd "guests/$g" && cargo build --release -q) || FAILED=1
-done
-cargo build --release -q -p rv64-run -p rv64-system || FAILED=1
-# re-run guest integration tests now that guests surely exist
-cargo test --release -q -p rv64-linux || FAILED=1
-
-note "3/8 qemu differential"
-if command -v qemu-riscv64 >/dev/null 2>&1; then
-    for g in hello-std fpu-test bench; do
-        B="guests/$g/target/riscv64gc-unknown-linux-musl/release/$g"
-        qemu-riscv64 "$B" a b >/tmp/rv64-q.out 2>&1; QE=$?
-        ./target/release/rv64-run "$B" a b >/tmp/rv64-r.out 2>&1; RE=$?
-        if [ "$QE" -eq "$RE" ] && cmp -s /tmp/rv64-q.out /tmp/rv64-r.out; then
-            echo "DIFF-OK $g"
-        else
-            echo "DIFF-FAIL $g (qemu=$QE rv64=$RE)"; FAILED=1
-        fi
-    done
-else
-    skip "qemu-riscv64 not found"
-fi
-
-note "4/8 riscv-tests ISA suite"
-PREFIX="${RISCV_PREFIX:-riscv64-unknown-elf-}"
+note "2/6 architecture validation"
+PREFIX="${RISCV_PREFIX:-riscv64-none-elf-}"
 if command -v "${PREFIX}gcc" >/dev/null 2>&1; then
-    RISCV_PREFIX="$PREFIX" tests/run-isa-tests.sh || FAILED=1
+    run_stage env RISCV_PREFIX="$PREFIX" tests/run-isa-tests.sh
 else
-    skip "${PREFIX}gcc not found; set RISCV_PREFIX or enter nix develop"
+    skip "${PREFIX}gcc not found; set RISCV_PREFIX"
 fi
 
-note "5/8 spike lockstep differential"
 if command -v spike >/dev/null 2>&1 && [ -d tests/riscv-tests/isa ]; then
-    python3 tests/lockstep.py $(ls tests/riscv-tests/isa/rv64u[imac]-p-* \
-        tests/riscv-tests/isa/rv64ud-p-* tests/riscv-tests/isa/rv64uf-p-* \
-        2>/dev/null | grep -v dump) | tail -3 || FAILED=1
+    isa_binaries=()
+    while IFS= read -r binary; do
+        isa_binaries+=("$binary")
+    done < <(find tests/riscv-tests/isa -type f \( \
+        -name 'rv64u[imac]-p-*' -o -name 'rv64ud-p-*' -o -name 'rv64uf-p-*' \
+    \) ! -name '*dump' | sort)
+    if [ "${#isa_binaries[@]}" -gt 0 ]; then
+        run_stage python3 tests/lockstep.py "${isa_binaries[@]}"
+    else
+        skip "riscv-tests binaries are missing; run tests/run-isa-tests.sh first"
+    fi
 else
-    skip "spike or built riscv-tests missing; run stage 4 first"
+    skip "spike or riscv-tests binaries are missing"
 fi
 
-note "6/8 riscv-arch-test signatures vs Spike"
 if command -v spike >/dev/null 2>&1 && command -v "${PREFIX}gcc" >/dev/null 2>&1; then
-    tests/run-arch-tests.sh | tail -1 || FAILED=1
+    run_stage tests/run-arch-tests.sh
 else
     skip "spike or ${PREFIX}gcc not found"
 fi
 
-note "7/8 wasm build + smoke"
+note "3/6 Wasm runtime and JIT"
 if command -v node >/dev/null 2>&1; then
-    node tests/vs-v86/harness-selftest.mjs || FAILED=1
-    node tests/jit-code-store.mjs || FAILED=1
-    node tests/host-callback-boundary.mjs || FAILED=1
-    if command -v zig >/dev/null 2>&1 || command -v "${PREFIX}gcc" >/dev/null 2>&1; then
-        tools/build-guest-benchmarks.sh || FAILED=1
+    run_stage "$CARGO" build --release -q -p rv64-wasm --target wasm32-unknown-unknown
+    run_stage node tests/boot-profile-selftest.mjs
+    run_stage node tests/jit-code-store.mjs
+    if [ -f target/wasm32-unknown-unknown/release/rv64_wasm.wasm ]; then
+        run_stage node tests/host-callback-boundary.mjs
+        run_stage node tests/public-api.mjs
+        run_stage node tests/virt-jit.mjs
+        run_stage node tests/worker-api.mjs
     else
-        skip "zig or ${PREFIX}gcc not found; JIT module benchmark unavailable"
+        skip "Wasm build did not produce rv64_wasm.wasm"
     fi
-    cargo build --release -q -p rv64-wasm --target wasm32-unknown-unknown || FAILED=1
-    node tests/jit-module-bench.mjs || FAILED=1
-    node tests/virt-jit.mjs || FAILED=1
-    node tests/http-relay.mjs || FAILED=1
-    node tests/wasm-smoke.mjs || FAILED=1
-    node tests/jit-differential.mjs || FAILED=1
-    ARTIFACTS="${ARTIFACTS:-target/bench}" node tests/fp-context-switch.mjs || FAILED=1
-    ARTIFACTS="${ARTIFACTS:-target/bench}" node tests/amo-diff.mjs || FAILED=1
 else
     skip "node not found"
 fi
 
-note "8/8 virt-smoke (modern-system boot)"
-# Only run when the kernel is already realized in the store; building it is a
-# ~15 min one-off. `nix path-info` checks presence without triggering a build.
-if command -v nix >/dev/null 2>&1 && nix path-info .#virt-kernel >/dev/null 2>&1; then
-    tests/virt-smoke/run.sh || FAILED=1
+note "4/6 Alpine direct boot"
+if command -v node >/dev/null 2>&1; then
+    if [ -f target/wasm32-unknown-unknown/release/rv64_wasm.wasm \
+        ] && [ -f web/images/alpine/Image ] && [ -f web/images/alpine/alpine.ext4 ]; then
+        run_stage node tests/alpine-boot.mjs
+    else
+        skip "Wasm, Alpine kernel, or Alpine disk is missing; run web/prepare-images.sh"
+    fi
 else
-    skip "virt-kernel not built; run tests/virt-smoke/run.sh once to build+cache it"
+    skip "node not found"
+fi
+
+note "5/6 Native network host"
+if command -v swift >/dev/null 2>&1; then
+    run_stage swift test --package-path native -Xswiftc -warnings-as-errors
+else
+    skip "swift not found"
+fi
+
+note "6/6 VirtMachine native smoke"
+if [ -s web/images/alpine/Image ] && \
+    { command -v zig >/dev/null 2>&1 || command -v "${PREFIX}gcc" >/dev/null 2>&1; }; then
+    run_stage tests/virt-smoke/run.sh
+else
+    skip "kernel or Zig/RISC-V compiler is missing; run web/prepare-images.sh"
 fi
 
 printf '\n'

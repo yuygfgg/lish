@@ -1,15 +1,6 @@
-import { RV64 } from "./rv64.js";
+import { RV64 } from "./rv64.js?v=3";
 
-const EVENTS = [
-  "ready",
-  "start",
-  "stop",
-  "error",
-  "console",
-  "networkTransmit",
-  "networkTraffic",
-  "downloadProgress",
-];
+const INTERNAL_EVENTS = ["stop", "error"];
 
 let vm = null;
 
@@ -38,8 +29,9 @@ function postEvent(event, detail) {
 }
 
 async function create(message) {
+  const eventNames = new Set([...INTERNAL_EVENTS, ...(message.eventNames ?? [])]);
   const events = Object.fromEntries(
-    EVENTS.map((event) => [event, (detail) => postEvent(event, detail)]),
+    [...eventNames].map((event) => [event, (detail) => postEvent(event, detail)]),
   );
   vm = await RV64.create({
     ...message.options,

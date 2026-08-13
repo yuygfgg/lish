@@ -1,10 +1,8 @@
 //! rv64-core: portable RV64 CPU core.
 //!
-//! Design (see /DESIGN.md): the CPU is generic over a [`Bus`], so the same
-//! execute code serves both user-mode emulation (flat memory + syscall shim)
-//! and full-system emulation (MMU walk + MMIO dispatch). No I/O, no alloc
-//! beyond the caller-provided memory — the wasm crate and native harnesses
-//! own the outside world.
+//! The CPU is generic over a [`Bus`]. The production full-system machine uses
+//! this boundary for RAM, MMIO, and interrupt delivery. A flat implementation
+//! supports architecture tests without creating a second emulator.
 
 #![cfg_attr(not(test), no_std)]
 

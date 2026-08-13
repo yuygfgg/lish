@@ -1,13 +1,15 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # riscv-arch-test signature comparison: compile the official architecture
-# tests once (shared env in tests/arch-env), run each on rv64.js AND on
+# tests once (shared env in tests/arch-env), run each on Lish and on
 # Spike (the RISC-V golden model), and require bit-identical signatures.
 # This is the substance of RISCOF compliance with Spike as reference.
 #
-# Requires (all in `nix develop`): riscv cross gcc (RISCV_PREFIX), spike.
+# Requires a RISC-V cross gcc (RISCV_PREFIX) and Spike.
 # Suites: I M A C F D Zifencei privilege (rv64i_m).
 set -u
 cd "$(dirname "$0")"
+ROOT="$(cd .. && pwd)"
+CARGO="$ROOT/tools/cargo"
 PREFIX="${RISCV_PREFIX:-riscv64-unknown-elf-}"
 SPIKE="${SPIKE:-spike}"
 ARCH="${ARCH_TEST_DIR:-riscv-arch-test}"
@@ -19,7 +21,7 @@ if [ ! -d "$ARCH/riscv-test-suite" ]; then
     git clone -q --depth 1 --branch 3.9.1 \
         https://github.com/riscv-non-isa/riscv-arch-test.git "$ARCH"
 fi
-cargo build --release -q -p rv64-system --manifest-path ../Cargo.toml
+"$CARGO" build --release -q -p rv64-system --manifest-path ../Cargo.toml
 
 PASS=0; FAIL=0; CFAIL=0
 for suite in $SUITES; do

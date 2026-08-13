@@ -1,12 +1,12 @@
 //! Minimal WebSocket client (RFC 6455) for the virtio-net relay.
 //!
 //! The net device only moves Ethernet frames; something has to carry them off
-//! the host. A relay is the transport we picked (see ROADMAP item 8): the proxy
-//! at the far end holds the privileges and does the NAT, so the emulator needs
-//! no `CAP_NET_ADMIN` and no userspace TCP/IP stack of its own. It is also the
+//! the host. A relay carries the frames to the native network host. The
+//! emulator needs no `CAP_NET_ADMIN` and no userspace TCP/IP stack of its own.
+//! It is also the
 //! only option in a browser, which means one protocol serves both targets.
 //!
-//! Wire format is v86's, and websockproxy's: **one binary WebSocket message per
+//! Wire format matches websockproxy: **one binary WebSocket message per
 //! Ethernet frame**, no envelope.
 //!
 //! Deliberately small — no external crates, matching the rest of this crate:

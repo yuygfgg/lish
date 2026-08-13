@@ -1,5 +1,4 @@
-//! Phase-6 JIT, v1: translate straight-line RV64 basic blocks into wasm
-//! modules (v86's endgame architecture).
+//! RV64 WebAssembly JIT for basic blocks, traces, loops, and code regions.
 //!
 //! State contract with the host: the guest register file lives in the
 //! module's imported linear memory —
@@ -12,10 +11,8 @@
 //! A compiled block updates registers in place, stores the next pc, and
 //! returns. The dispatcher (interpreter loop) looks up the next block by pc.
 //!
-//! v1 scope: OP-IMM/OP/OP-IMM-32/OP-32 (I+M subset), LUI/AUIPC, JAL/JALR,
-//! conditional branches. Loads/stores/system/FP end the block and fall back
-//! to the interpreter — the tiering seam v86 uses. Compressed instructions
-//! are expanded through the same rv64-core expander before translation.
+//! Unsupported operations return to the interpreter. Compressed instructions
+//! use the same expansion path as the interpreter.
 
 // Translation routines receive explicit architectural state and emitter
 // operands. Bundling them would obscure the generated-code contract.
@@ -291,8 +288,8 @@ pub struct JitLayout {
     pub x_base: u32,
     /// Linear-memory offset of the pc slot.
     pub pc_addr: u32,
-    /// Flat guest RAM (user-mode): (linear offset of guest address 0,
-    /// guest size). Loads/stores access it directly, bounds-checked.
+    /// Flat test RAM: (linear offset of guest address 0, guest size).
+    /// Loads and stores use bounds-checked direct access.
     pub mem: Option<(u32, u64)>,
     /// Full-system memory layout (mutually exclusive with `mem`). When
     /// both are None, loads/stores end the block.
@@ -327,8 +324,8 @@ pub struct JitLayout {
     pub fuel_addr: u32,
     /// Direct block chaining (tail calls): base address of the host's
     /// dispatch-line array ({pc: u64, idx: i32, gen: u32} x (mask+1)), the
-    /// entry-index mask, and the address of cpu.map_gen. Zero = no chaining
-    /// (user mode, diagnostics).
+    /// entry-index mask, and the address of cpu.map_gen. Zero disables
+    /// chaining for tests and diagnostics.
     pub dispatch_base: u32,
     pub dispatch_mask: u32,
     pub map_gen_addr: u32,
@@ -447,8 +444,8 @@ fn fetch(code: &[u8], base: u64, pc: u64) -> Option<(u32, u64)> {
 struct Ctx {
     lay: JitLayout,
     /// Per-guest-register wasm local index, or 0 (= not cached, use memory).
-    /// Registers a block touches live in i64 locals for the block's lifetime
-    /// (v86's register_locals), eliminating the per-instruction load/store to
+    /// Registers a block touches live in i64 locals for the block's lifetime,
+    /// eliminating the per-instruction load/store to
     /// the CPU state struct. Locals are loaded at the prologue and flushed to
     /// state at every exit / mid-block bail.
     reg_local: [u32; 32],
@@ -965,7 +962,7 @@ impl Ctx {
     /// System-mode FP-state guard: bail unless mstatus.FS == Dirty (0b11).
     /// FS=Off must trap (illegal instruction) and Initial/Clean must become
     /// Dirty — one interpreter step does both exactly, and once Dirty the
-    /// fast path needs no writeback at all. No-op in user mode.
+    /// fast path needs no writeback at all. No-op without privileged state.
     #[allow(dead_code)] // retained for the switchable system FP fast path
     fn fp_fs_guard(&self, m: &mut WasmModule, pc: u64, n: u32) {
         if self.lay.mstatus_addr == 0 {
@@ -1545,7 +1542,7 @@ impl Ctx {
 
     /// Guest address (i64) is on the stack. Bounds-check it against guest
     /// RAM and leave the wrapped i32 index on the stack. Traps (wasm
-    /// `unreachable`) on out-of-range — a fatal guest fault in user mode.
+    /// `unreachable`) on out-of-range. Flat test memory has no trap handler.
     fn guest_addr(&self, m: &mut WasmModule, size: u64, len: u64) {
         m.local_set(VA);
         m.local_get(VA).i64_const((size - len) as i64).op(I64_GT_U);
@@ -1834,8 +1831,8 @@ fn scan_regs(
                 mem_ops += 1;
             }
             // FLD/FSD (funct3 3, raw 8-byte copy) and FLW/FSW (funct3 2, the
-            // low half with NaN-boxing) between memory and f[], user-mode
-            // direct or system inline-TLB (needs f_base for the FP file).
+            // low half with NaN-boxing) between memory and f[]. Flat layouts
+            // use direct access. System layouts use the inline TLB.
             0x07 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
                 if !matches!(funct3(insn), 2 | 3) {
                     break;
@@ -2168,10 +2165,9 @@ struct LoopRegion {
 }
 
 /// Detect and fully validate a structured loop region at `start_pc` (which must
-/// be a natural-loop header — the target of a backward branch). User-mode only:
-/// inline memory ops here only TRAP on fault (never bail mid-loop), and the FP
-/// register file is present. Returns None for anything not provably structured
-/// (the caller then compiles a plain basic block).
+/// be a natural-loop header, which is the target of a backward branch. Returns
+/// None for code that is not provably structured. The caller then compiles a
+/// plain basic block.
 fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option<LoopRegion> {
     if lay.multi_latch {
         if let Some(region) = loop_region_mode(code, base, start_pc, lay, true) {
@@ -2189,7 +2185,7 @@ fn loop_region_mode(
     lay: &JitLayout,
     extend: bool,
 ) -> Option<LoopRegion> {
-    // Compile loops for user-mode (flat memory) or system-mode (inline TLB).
+    // Compile loops for flat test memory or system memory with an inline TLB.
     // System memory ops can bail mid-iteration; the compiled loop handles that
     // (flush locals, set pc, report ITER-retired, return) — see translate_loop.
     if lay.mem.is_none() && lay.sys.is_none() {
@@ -2989,7 +2985,7 @@ fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64, n: u32, round:
             m.op(I32_OR);
         }
     } else if !round {
-        return; // nothing to check (user mode, non-rounding FP only)
+        return; // no privileged FP state and no dynamic rounding check
     }
     m.op(IF).op(VOID);
     c.bail(m, start_pc, n);
@@ -3369,7 +3365,7 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 c.store_post(m, d);
             }
         }
-        // LOAD (user-mode direct, or system inline-TLB)
+        // LOAD (flat direct access or system inline TLB)
         0x03 if lay.mem.is_some() || lay.sys.is_some() => {
             let f3 = funct3(insn);
             let len = match f3 {
@@ -3407,7 +3403,7 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 c.store_post(m, d);
             }
         }
-        // STORE (user-mode direct, or system inline-TLB)
+        // STORE (flat direct access or system inline TLB)
         0x23 if lay.mem.is_some() || lay.sys.is_some() => {
             let f3 = funct3(insn);
             if f3 > 3 {
@@ -3875,8 +3871,7 @@ fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
 /// guaranteed) to the in-block normal body — which sets the temp registers
 /// exactly as real execution would. Retirement is exact: each chunk adds
 /// iterations x body_n to ITER; the normal body adds body_n; mid-body bails
-/// report ITER + position (Ctx::bail). This is the riscv64 counter to v86's
-/// rep-movs bulk-copy fast path.
+/// report ITER + position (Ctx::bail).
 fn translate_copy_loop(
     cl: &CopyLoop,
     code: &[u8],
@@ -4296,8 +4291,8 @@ pub fn translate_block_ic(
         }
     }
     // Structured loop region (nested loops + forward if-then/break) → compile
-    // the whole thing as one wasm function so register locals persist across
-    // every iteration of every level (3e-2 / v86 control-flow structuring).
+    // the whole thing as one Wasm function so register locals persist across
+    // every iteration of every level.
     if (lay.mem.is_some() || lay.sys.is_some()) && !skip_detectors {
         if let Some(region) = loop_region(code, base, start_pc, &lay) {
             let (rm, wm, fr, fw) = scan_regs_region(code, base, start_pc, region.end_pc, &lay);
@@ -5412,7 +5407,7 @@ pub fn is_loop_at(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> bool
 }
 
 /// Statically discover every basic-block leader in a code page reachable from
-/// `seeds` (v86's page-analysis pass). Walks each pending leader forward,
+/// `seeds`. Walk each pending leader forward,
 /// adding in-page branch targets, fallthroughs, and post-call return sites as
 /// new leaders until fixpoint. A superblock compiled over the FULL leader set
 /// keeps intra-page control flow inside one wasm function — compiling only the
@@ -5529,7 +5524,7 @@ pub fn discover_page_leaders_ext(
     (leaders.into_iter().collect(), back_targets)
 }
 
-/// Compile a whole page of basic blocks (v86's function-per-page) into one wasm
+/// Compile a whole page of basic blocks into one Wasm
 /// function with an internal `br_table` dispatch loop and all touched registers
 /// cached in locals for the function's lifetime — so execution flows between
 /// blocks with no per-block prologue/epilogue, `call_indirect` or pa-verify (the

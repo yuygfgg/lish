@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { RV64Debug } from "../web/rv64.js";
 
+// This module is deliberately small. It exercises the host ABI that the
+// full-system Wasm module uses today. It must not grow compatibility imports
+// for removed user-mode or proxy transports.
 const I32 = 0x7f;
 const I64 = 0x7e;
+const F64 = 0x7c;
 
 function uleb(value) {
   const bytes = [];
@@ -61,113 +65,95 @@ function functionBody(code) {
 
 const i32Const = (value) => [0x41, ...sleb(value)];
 const i64Const = (value) => [0x42, ...sleb(value)];
+const localGet = (index) => [0x20, ...uleb(index)];
+const globalGet = (index) => [0x23, ...uleb(index)];
+const globalSet = (index) => [0x24, ...uleb(index)];
 const call = (index) => [0x10, ...uleb(index)];
 
-function boundaryModule({ trapReady = false } = {}) {
+function compiledBlockModule() {
+  return new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    ...section(1, vector([functionType([I32], [])])),
+    ...section(3, vector([uleb(0)])),
+    ...section(7, vector([functionExport("run", 0)])),
+    ...section(10, vector([functionBody([])])),
+  ]);
+}
+
+function boundaryModule(compiled) {
   const types = [
-    functionType([I32, I32, I32], []),
-    functionType([I32, I32], []),
-    functionType([I64, I32, I32], []),
-    functionType([I64], []),
-    functionType([I64, I32, I32, I32, I32], []),
-    functionType([I64], [I32]),
+    functionType([I32, I32, I32], []), // host_write
+    functionType([I32, I32], []), // host_net_send
+    functionType([], [F64]), // clock imports
+    functionType([I32, I32], []), // host_jit_retire
+    functionType([I64, I32], []), // host_jit_register_async
+    functionType([I64, I32, I32], []), // sys_jit_ready
     functionType([], []),
-    functionType([I64, I32], []),
+    functionType([I64], []),
+    functionType([], [F64]),
+    functionType([I32, I64, I32], [I64]),
     functionType([], [I32]),
     functionType([I32], []),
-    functionType([I32, I32], []),
-    functionType([I32, I64, I32], [I64]),
   ];
   const imports = [
     functionImport("host_write", 0),
     functionImport("host_net_send", 1),
-    functionImport("host_http_request", 2),
-    functionImport("host_wisp_open", 2),
-    functionImport("host_wisp_data", 2),
-    functionImport("host_wisp_close", 3),
-    functionImport("host_wisp_datagram", 4),
-    functionImport("host_jit_register_async", 3),
+    functionImport("host_now_ms", 2),
+    functionImport("host_unix_ms", 2),
+    functionImport("host_jit_retire", 3),
+    functionImport("host_jit_register_async", 4),
   ];
-  const functionTypes = [
-    5, 5, 5, 5, 6, 3, 7, 8, 8, 8, 8, 9, 9, 10, 9, 9, 8, 9, 11, 6, 6,
-  ];
-  const firstFunction = imports.length;
   const functionNames = [
-    "user_run",
-    "run",
-    "sys_run",
-    "virt_run",
-    "emit",
+    "emit_write",
+    "emit_net",
+    "emit_both",
+    "now",
+    "unix",
     "trigger_async",
-    "sys_sb_ready",
-    "active",
     "ready_status",
+    "sys_jit_ready",
     "jit_out_ptr",
     "jit_out_len",
-    "virt_console_enable",
-    "virt_net_enable",
-    "sys_proxy_enable",
-    "virt_boot",
-    "virt_boot_direct",
-    "virt_p9_take_request",
+    "retire_slot",
     "chain_next",
     "jit_tlb_fill",
-    "trap_dispatch",
     "full_system_dispatch_abort",
   ];
+  const functionTypes = [
+    6, 6, 6, 8, 8, 7, 10, 5, 10, 10, 11, 6, 9, 6,
+  ];
+  const firstFunction = imports.length;
   const exports = functionNames.map((field, index) =>
     functionExport(field, firstFunction + index)
   );
   exports.push([...name("__indirect_function_table"), 0x01, 0x00]);
   exports.push([...name("memory"), 0x02, 0x00]);
 
-  const run = [
-    ...i32Const(1), 0x24, 0x00,
+  const write = [
     ...i32Const(1), ...i32Const(0), ...i32Const(4), ...call(0),
-    ...i32Const(0), ...i32Const(4), ...call(1),
-    ...i64Const(3), ...i32Const(0), ...i32Const(4), ...call(2),
-    ...i64Const(4), ...i32Const(0), ...i32Const(5), ...call(3),
-    ...i64Const(6), ...i32Const(0), ...i32Const(4), ...call(4),
-    ...i64Const(7), ...call(5),
-    ...i64Const(8), ...i32Const(0), ...i32Const(9),
-    ...i32Const(0), ...i32Const(4), ...call(6),
-    ...i32Const(0), 0x24, 0x00,
-    ...i32Const(0),
   ];
-  const emit = [...i32Const(1), ...i32Const(0), ...i32Const(4), ...call(0)];
+  const net = [...i32Const(0), ...i32Const(4), ...call(1)];
   const bodies = [
-    run,
-    run,
-    run,
-    run,
-    emit,
-    [0x20, 0x00, ...call(7)],
-    trapReady ? [0x00] : [0x20, 0x01, 0x24, 0x01],
-    [0x23, 0x00],
-    [0x23, 0x01],
-    i32Const(64),
-    i32Const(4),
+    write,
+    net,
+    [...write, ...net],
+    [...call(2)],
+    [...call(3)],
+    [...localGet(0), ...i32Const(1), ...call(5)],
+    [...globalGet(0)],
+    [...localGet(1), ...globalSet(0)],
+    [...i32Const(64)],
+    [...i32Const(compiled.length)],
+    [...localGet(0), ...i32Const(1), ...call(4)],
     [],
+    [...i64Const(-1)],
     [],
-    [],
-    [],
-    [],
-    i32Const(0),
-    [],
-    i64Const(-1),
-    [...i32Const(1), 0x24, 0x00, 0x00],
-    [...i32Const(0), 0x24, 0x00],
   ].map(functionBody);
-
-  const globals = [
-    [I32, 0x01, ...i32Const(0), 0x0b],
-    [I32, 0x01, ...i32Const(7), 0x0b],
-  ];
+  const globals = [[I32, 0x01, ...i32Const(7), 0x0b]];
   const data = [
     [0x00, ...i32Const(0), 0x0b, ...uleb(4), 1, 2, 3, 4],
-    [0x00, ...i32Const(64), 0x0b, ...uleb(4), 0, 0, 0, 0],
+    [0x00, ...i32Const(64), 0x0b, ...uleb(compiled.length), ...compiled],
   ];
-
   return new Uint8Array([
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
     ...section(1, vector(types)),
@@ -182,347 +168,155 @@ function boundaryModule({ trapReady = false } = {}) {
   ]);
 }
 
-function compiledBlockModule() {
-  return new Uint8Array([
-    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-    ...section(1, vector([functionType([I32], [])])),
-    ...section(3, vector([uleb(0)])),
-    ...section(7, vector([functionExport("run", 0)])),
-    ...section(10, vector([functionBody([])])),
-  ]);
-}
-
 async function waitFor(predicate, message) {
-  for (let turn = 0; turn < 50; turn++) {
+  for (let turn = 0; turn < 80; turn++) {
     if (predicate()) return;
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.fail(message);
 }
 
-const vm = await RV64Debug.create(boundaryModule(), { maxBytes: 1 });
+const compiled = compiledBlockModule();
+const vm = await RV64Debug.create(boundaryModule(compiled));
 assert.equal(Object.hasOwn(vm.ex, "chain_next"), false);
 assert.equal(Object.hasOwn(vm.ex, "jit_tlb_fill"), false);
 assert.equal(Object.hasOwn(vm.ex, "full_system_dispatch_abort"), false);
-assert.throws(() => vm.ex.trap_dispatch(), WebAssembly.RuntimeError);
-assert.equal(vm.ex.active(), 0, "a trapped dispatch retained active context");
+assert.equal(Number.isFinite(vm.ex.now()), true);
+assert.equal(Number.isFinite(vm.ex.unix()), true);
+
 const events = [];
 let callbackDepth = 0;
 let maximumCallbackDepth = 0;
-let emitNestedWrite = false;
-
-function observe(event) {
-  return function (...args) {
-    callbackDepth++;
-    maximumCallbackDepth = Math.max(maximumCallbackDepth, callbackDepth);
-    try {
-      assert.equal(this, vm);
-      assert.equal(vm.ex.active(), 0, `${event} ran before Wasm returned`);
-      events.push(event);
-      if (event === "write" && emitNestedWrite) {
-        emitNestedWrite = false;
-        vm.ex.emit();
-      }
-      if (args.at(-1) instanceof Uint8Array) {
-        assert.deepEqual([...args.at(-1)], [1, 2, 3, 4]);
-      }
-    } finally {
-      callbackDepth--;
+let nested = false;
+vm.onWrite = function (fd, bytes) {
+  callbackDepth++;
+  maximumCallbackDepth = Math.max(maximumCallbackDepth, callbackDepth);
+  try {
+    assert.equal(fd, 1);
+    assert.deepEqual([...bytes], [1, 2, 3, 4]);
+    events.push("write");
+    if (nested) {
+      nested = false;
+      vm.ex.emit_write();
     }
-  };
-}
+  } finally {
+    callbackDepth--;
+  }
+};
+vm.onNetSend = (bytes) => {
+  assert.deepEqual([...bytes], [1, 2, 3, 4]);
+  events.push("net");
+};
 
-vm.onWrite = observe("write");
-vm.onNetSend = observe("net");
-vm.onHttpRequest = observe("http");
-vm.onWispOpen = observe("wisp-open");
-vm.onWispData = observe("wisp-data");
-vm.onWispClose = observe("wisp-close");
-vm.onWispDatagram = observe("wisp-datagram");
-
-const runEntries = [
-  ["runUser", () => vm.runUser(1n)],
-  ["run", () => vm.run(1n)],
-  ["runSystem", () => vm.runSystem(1n)],
-  ["runVirtSystem", () => vm.runVirtSystem(1n)],
-];
-const expectedEvents = [
-  "write",
-  "net",
-  "http",
-  "wisp-open",
-  "wisp-data",
-  "wisp-close",
-  "wisp-datagram",
-];
-for (const [entry, run] of runEntries) {
-  events.length = 0;
-  const expectNestedWrite = entry === "runUser";
-  emitNestedWrite = expectNestedWrite;
-  run();
-  assert.deepEqual(
-    events,
-    expectNestedWrite ? [...expectedEvents, "write"] : expectedEvents,
-    `${entry} did not synchronously drain host events`,
-  );
-}
-assert.equal(maximumCallbackDepth, 1, "host-event draining recursed");
+vm.ex.emit_both();
+assert.deepEqual(events, [], "host callbacks ran inside the Wasm call");
+// Mutating linear memory before delivery must not change copied host data.
+new Uint8Array(vm.ex.memory.buffer, 0, 4).fill(9);
+await waitFor(() => events.length === 2, "host callbacks were not delivered");
+assert.deepEqual(events, ["write", "net"]);
+assert.equal(maximumCallbackDepth, 1, "host callback delivery recursed");
+new Uint8Array(vm.ex.memory.buffer, 0, 4).set([1, 2, 3, 4]);
 
 events.length = 0;
-vm.ex.emit();
-assert.deepEqual(events, [], "a non-run export drained synchronously");
-await Promise.resolve();
-assert.deepEqual(events, ["write"], "the microtask fallback did not drain host events");
+nested = true;
+vm.ex.emit_write();
+await waitFor(() => events.length === 2, "nested host event was lost");
+assert.deepEqual(events, ["write", "write"]);
 
 const callbackFailure = new Error("deferred listener failed");
-vm.onWrite = () => {
-  throw callbackFailure;
-};
-vm.ex.emit();
+vm.onWrite = () => { throw callbackFailure; };
+vm.ex.emit_write();
 await Promise.resolve();
-assert.throws(
-  () => vm.ex.active(),
-  (error) => error === callbackFailure,
-  "an asynchronous listener failure did not reach the next public boundary",
-);
-assert.equal(vm.ex.active(), 0, "a delivered listener failure was not cleared");
-
+assert.throws(() => vm.ex.ready_status(), (error) => error === callbackFailure);
 assert.equal(vm.ex.ready_status(), 7);
-vm.ex.trigger_async(33n);
-assert.equal(vm.ex.ready_status(), 7, "capacity rejection reentered Wasm");
+
+// The slot remains live until the deferred retirement boundary.
+vm.onWrite = () => {};
+const syncModule = new WebAssembly.Module(compiled);
+const syncInstance = new WebAssembly.Instance(syncModule, {});
+const syncSlot = vm.jitCodeStore.register(syncInstance, ["run"], compiled.length);
+assert.equal(syncSlot, 0);
+assert.equal(vm.jitCodeStore.snapshot().liveSlots, 1);
+vm.ex.retire_slot(syncSlot);
+assert.equal(vm.jitCodeStore.snapshot().liveSlots, 1);
 await Promise.resolve();
-assert.equal(vm.ex.ready_status(), -2, "capacity rejection did not complete asynchronously");
+assert.equal(vm.jitCodeStore.snapshot().liveSlots, 0);
 
-const generation = vm.jitCodeStore.generation;
-vm.bootVirtLinux({});
-assert.equal(vm.jitCodeStore.generation, generation + 1);
-vm.bootVirtLinuxDirect({});
-assert.equal(vm.jitCodeStore.generation, generation + 2);
-
-{
-  const rejectionVm = await RV64Debug.create(boundaryModule());
+async function compileFailureCase(compile) {
+  const testVm = await RV64Debug.create(boundaryModule(compiled));
+  const originalCompile = WebAssembly.compile;
   const originalWarn = console.warn;
   const warnings = [];
+  WebAssembly.compile = compile;
   console.warn = (...args) => warnings.push(args);
   try {
-    rejectionVm.ex.trigger_async(34n);
-    assert.deepEqual(
-      {
-        modules: rejectionVm.jitCodeStore.snapshot().pendingModules,
-        slots: rejectionVm.jitCodeStore.snapshot().pendingSlots,
-        bytes: rejectionVm.jitCodeStore.snapshot().pendingBytes,
-      },
-      { modules: 1, slots: 1, bytes: 4 },
-      "native WebAssembly.compile did not reserve its in-flight resources",
-    );
-    await waitFor(
-      () => rejectionVm.ex.ready_status() === -1,
-      "native WebAssembly.compile rejection did not complete the Rust ticket",
-    );
-    const after = rejectionVm.jitCodeStore.snapshot();
-    assert.equal(after.pendingModules, 0);
-    assert.equal(after.pendingSlots, 0);
-    assert.equal(after.pendingBytes, 0);
-    assert.equal(after.liveSlots, 0);
+    testVm.ex.trigger_async(11n);
+    await waitFor(() => testVm.ex.ready_status() !== 7, "async JIT did not complete");
+    assert.equal(testVm.ex.ready_status(), -1);
+    assert.equal(testVm.jitCodeStore.snapshot().pendingModules, 0);
     assert.ok(
       warnings.some(([message]) => message === "async jit register failed:"),
-      "native WebAssembly.compile rejection was not reported",
-    );
-  } finally {
-    console.warn = originalWarn;
-    rejectionVm.destroyJit();
-  }
-}
-
-{
-  const throwingVm = await RV64Debug.create(boundaryModule());
-  const originalCompile = WebAssembly.compile;
-  const originalWarn = console.warn;
-  const syncFailure = new Error("synchronous compile failure");
-  const warnings = [];
-  WebAssembly.compile = () => {
-    throw syncFailure;
-  };
-  console.warn = (...args) => warnings.push(args);
-  try {
-    assert.doesNotThrow(
-      () => throwingVm.ex.trigger_async(35n),
-      "a synchronous compile error escaped through the Wasm host import",
-    );
-    assert.equal(throwingVm.ex.ready_status(), 7, "sync failure reentered Wasm");
-    assert.equal(
-      throwingVm.jitCodeStore.snapshot().pendingModules,
-      1,
-      "serialized compilation did not retain its reservation",
-    );
-    await waitFor(
-      () => throwingVm.ex.ready_status() === -1,
-      "synchronous compile failure did not complete the Rust ticket",
-    );
-    assert.equal(throwingVm.jitCodeStore.snapshot().pendingModules, 0);
-    assert.ok(
-      warnings.some(([, error]) => error === syncFailure),
-      "synchronous compile failure was not reported",
+      "compile failure was not reported",
     );
   } finally {
     WebAssembly.compile = originalCompile;
     console.warn = originalWarn;
-    throwingVm.destroyJit();
+    testVm.destroyJit();
+  }
+}
+
+await compileFailureCase(() => Promise.reject(new Error("compile rejected")));
+const synchronousFailure = new Error("compile threw");
+await compileFailureCase(() => { throw synchronousFailure; });
+
+{
+  const capacityVm = await RV64Debug.create(boundaryModule(compiled), { maxBytes: 1 });
+  capacityVm.ex.trigger_async(12n);
+  await waitFor(() => capacityVm.ex.ready_status() === -2, "capacity rejection did not complete");
+  assert.equal(capacityVm.jitCodeStore.snapshot().pendingModules, 0);
+  capacityVm.destroyJit();
+}
+
+{
+  const staleVm = await RV64Debug.create(boundaryModule(compiled));
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const originalCompile = WebAssembly.compile;
+  WebAssembly.compile = () => gate;
+  try {
+    staleVm.ex.trigger_async(13n);
+    assert.equal(staleVm.jitCodeStore.snapshot().pendingModules, 1);
+    staleVm.jitCodeStore.generation++;
+    release(new WebAssembly.Module(compiled));
+    await waitFor(() => staleVm.ex.ready_status() === -1, "stale JIT result was installed");
+    assert.equal(staleVm.jitCodeStore.snapshot().liveSlots, 0);
+  } finally {
+    release(new WebAssembly.Module(compiled));
+    WebAssembly.compile = originalCompile;
+    staleVm.destroyJit();
   }
 }
 
 {
-  const pendingVm = await RV64Debug.create(boundaryModule(), {
-    maxModules: 1,
-    maxSlots: 1,
-    maxBytes: 4,
-    growSlots: 1,
-  });
+  const destroyedVm = await RV64Debug.create(boundaryModule(compiled));
   const originalCompile = WebAssembly.compile;
-  const compiled = new WebAssembly.Module(compiledBlockModule());
-  let releaseCompile;
-  const compileGate = new Promise((resolve) => {
-    releaseCompile = resolve;
-  });
-  let compileCalls = 0;
-  WebAssembly.compile = () => {
-    compileCalls++;
-    return compileGate;
-  };
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  WebAssembly.compile = () => gate;
   try {
-    pendingVm.ex.trigger_async(36n);
-    assert.equal(pendingVm.jitCodeStore.snapshot().pendingModules, 1);
-    const bootGeneration = pendingVm.jitCodeStore.generation;
-    pendingVm.bootVirtLinux({});
-    assert.equal(pendingVm.jitCodeStore.generation, bootGeneration + 1);
-    assert.equal(
-      pendingVm.jitCodeStore.snapshot().pendingModules,
-      1,
-      "boot released resources still retained by an in-flight compile",
-    );
-
-    pendingVm.ex.trigger_async(37n);
-    await waitFor(
-      () => pendingVm.ex.ready_status() === -2,
-      "an old in-flight compile did not enforce the next boot's capacity",
-    );
-    assert.equal(compileCalls, 1, "capacity rejection launched another compile");
-    assert.equal(pendingVm.jitCodeStore.snapshot().pendingModules, 1);
-
-    releaseCompile(compiled);
-    await waitFor(
-      () => pendingVm.jitCodeStore.snapshot().pendingModules === 0,
-      "stale compile did not release its reservation",
-    );
-    assert.equal(pendingVm.ex.ready_status(), -1);
-    assert.equal(pendingVm.jitCodeStore.snapshot().registeredModules, 0);
-    assert.equal(pendingVm.jitCodeStore.snapshot().liveSlots, 0);
-  } finally {
-    releaseCompile(compiled);
-    WebAssembly.compile = originalCompile;
-    pendingVm.destroyJit();
-  }
-}
-
-{
-  const failingVm = await RV64Debug.create(boundaryModule({ trapReady: true }));
-  const originalCompile = WebAssembly.compile;
-  const originalWarn = console.warn;
-  const compiled = new WebAssembly.Module(compiledBlockModule());
-  const warnings = [];
-  WebAssembly.compile = async () => compiled;
-  console.warn = (...args) => warnings.push(args);
-  try {
-    const before = failingVm.jitCodeStore.snapshot();
-    failingVm.ex.trigger_async(44n);
-    for (let turn = 0; turn < 20; turn++) {
-      await new Promise((resolve) => setImmediate(resolve));
-      if (failingVm.jitCodeStore.snapshot().retiredSlots > before.retiredSlots) break;
-    }
-    const after = failingVm.jitCodeStore.snapshot();
-    assert.equal(after.registeredModules, before.registeredModules + 1);
-    assert.equal(after.retiredSlots, before.retiredSlots + 1);
-    assert.equal(after.liveSlots, before.liveSlots, "failed async handoff leaked a slot");
-    assert.ok(
-      warnings.some(([message]) => message === "async jit completion failed:"),
-      "failed async handoff was not reported",
-    );
-  } finally {
-    WebAssembly.compile = originalCompile;
-    console.warn = originalWarn;
-    failingVm.destroyJit();
-  }
-}
-
-async function checkTerminalDestroy(disableWeakRef) {
-  const destroyedVm = await RV64Debug.create(boundaryModule());
-  const originalCompile = WebAssembly.compile;
-  const OriginalInstance = WebAssembly.Instance;
-  const OriginalWeakRef = globalThis.WeakRef;
-  const compiled = new WebAssembly.Module(compiledBlockModule());
-  let releaseCompile;
-  const compileGate = new Promise((resolve) => {
-    releaseCompile = resolve;
-  });
-  let compileCalls = 0;
-  let compileSettled = false;
-  let instanceCalls = 0;
-  WebAssembly.compile = () => {
-    compileCalls++;
-    return compileGate.then((module) => {
-      compileSettled = true;
-      return module;
-    });
-  };
-  WebAssembly.Instance = new Proxy(OriginalInstance, {
-    construct(target, args) {
-      instanceCalls++;
-      return Reflect.construct(target, args);
-    },
-  });
-  if (disableWeakRef) globalThis.WeakRef = undefined;
-  try {
-    destroyedVm.ex.trigger_async(45n);
-    assert.equal(destroyedVm.jitCodeStore.snapshot().pendingModules, 1);
+    destroyedVm.ex.trigger_async(14n);
     destroyedVm.destroyJit();
-    const afterDestroy = destroyedVm.jitCodeStore.snapshot();
-    assert.equal(afterDestroy.destroyed, true);
-    assert.deepEqual(
-      {
-        modules: afterDestroy.pendingModules,
-        slots: afterDestroy.pendingSlots,
-        bytes: afterDestroy.pendingBytes,
-      },
-      { modules: 0, slots: 0, bytes: 0 },
-      "terminal destroy retained a never-settling compile reservation",
-    );
-    releaseCompile(compiled);
+    release(new WebAssembly.Module(compiled));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(compileCalls, 0, "destroyed VM started a queued compilation");
-    assert.equal(compileSettled, false, "cancelled compilation unexpectedly settled");
-    assert.equal(instanceCalls, 0, "late compile completion instantiated a module");
-    assert.equal(destroyedVm.ex.ready_status(), 7, "late compile completion reached Rust");
-    const afterSettle = destroyedVm.jitCodeStore.snapshot();
-    assert.deepEqual(
-      {
-        modules: afterSettle.pendingModules,
-        slots: afterSettle.pendingSlots,
-        bytes: afterSettle.pendingBytes,
-        liveSlots: afterSettle.liveSlots,
-      },
-      { modules: 0, slots: 0, bytes: 0, liveSlots: 0 },
-      "late compile completion restored destroyed JIT state",
-    );
+    assert.equal(destroyedVm.jitCodeStore.snapshot().pendingModules, 0);
+    assert.equal(destroyedVm.jitCodeStore.snapshot().liveSlots, 0);
+    assert.equal(destroyedVm.ex.ready_status(), 7, "destroyed VM accepted a late JIT result");
   } finally {
-    releaseCompile(compiled);
+    release(new WebAssembly.Module(compiled));
     WebAssembly.compile = originalCompile;
-    WebAssembly.Instance = OriginalInstance;
-    globalThis.WeakRef = OriginalWeakRef;
     destroyedVm.destroyJit();
   }
 }
 
-await checkTerminalDestroy(false);
-await checkTerminalDestroy(true);
-
-console.log("PASS deferred host callback and transactional async JIT boundaries");
+vm.destroyJit();
+console.log("PASS current host callback and asynchronous JIT boundaries");

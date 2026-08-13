@@ -1,8 +1,4 @@
-//! Modern "virt"-class riscv64 machine: OpenSBI + a current Linux kernel.
-//!
-//! Unlike the TinyEMU-compatible [`crate::Machine`] (BBL + Linux 4.15,
-//! minimal PLIC, HTIF), this models a QEMU-`virt`-like platform good enough
-//! for a modern kernel and a full Debian userland:
+//! RISC-V `virt` machine for OpenSBI and current Linux kernels.
 //!
 //! ```text
 //! 0x0010_0000  sifive,test   (poweroff/reboot)
@@ -50,6 +46,8 @@ pub const VIRTIO_COUNT: u64 = 8;
 pub const RTC_FREQ: u64 = 10_000_000;
 
 const KERNEL_OFFSET: u64 = 0x20_0000; // kernel Image at RAM_BASE + 2 MiB
+const TOP_LAYOUT_MARGIN: u64 = 0x20_0000;
+const FW_DYNAMIC_INFO_SIZE: u64 = 0x1000;
 
 // Interrupt source numbers (PLIC). Source 0 = "no interrupt".
 const UART_IRQ: u32 = 10;
@@ -397,8 +395,6 @@ impl VirtBus {
             _ if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_COUNT * VIRTIO_SIZE).contains(&addr) => {
                 let i = ((addr - VIRTIO_BASE) / VIRTIO_SIZE) as usize;
                 let off = (addr - VIRTIO_BASE) % VIRTIO_SIZE;
-                // Width matters in config space: Linux reads a 9p mount tag one
-                // byte at a time (`virtio_cread_bytes`).
                 self.virtio
                     .get_mut(i)
                     .map(|d| d.read_sized(off, size) as u64)
@@ -535,14 +531,7 @@ pub struct VirtImages<'a> {
     pub cmdline: &'a str,
     pub initrd: Option<&'a [u8]>,
     pub disk: Option<Vec<u8>>,
-    /// Host filesystems exported over virtio-9p; see [`crate::BootImages::fs`].
-    pub fs: Vec<crate::p9::Server>,
-    /// Optional 9P transport whose request/reply handling is delegated to the
-    /// embedder (for example WANIX's namespace server).
-    pub external_fs: Option<&'a str>,
-    /// Add a virtio console for an independent host/guest byte channel.
-    pub virtio_console: bool,
-    /// MAC for a virtio-net device; see [`crate::BootImages::net`].
+    /// MAC address for a layer-2 virtio-net device.
     pub net: Option<[u8; 6]>,
 }
 
@@ -575,6 +564,14 @@ impl VirtMachine {
     }
 
     fn new_inner(ram_bytes: u64, images: VirtImages, direct_sbi: bool) -> VirtMachine {
+        let minimum_ram = KERNEL_OFFSET
+            .checked_add(images.kernel.len() as u64)
+            .and_then(|end| end.checked_add(TOP_LAYOUT_MARGIN + FW_DYNAMIC_INFO_SIZE))
+            .expect("kernel image is too large");
+        assert!(
+            ram_bytes >= minimum_ram,
+            "guest RAM must fit the kernel and top-of-RAM boot data"
+        );
         let ram_size = ram_bytes;
         let mut ram = vec![0u8; ram_size as usize];
 
@@ -586,12 +583,7 @@ impl VirtMachine {
         let kend = kbase + images.kernel.len();
 
         let _ = kend;
-        // One mmio slot per device we will instantiate below, in the same order.
-        let n_virtio = images.disk.is_some() as usize
-            + images.fs.len()
-            + images.external_fs.is_some() as usize
-            + images.virtio_console as usize
-            + images.net.is_some() as usize;
+        let n_virtio = images.disk.is_some() as usize + images.net.is_some() as usize;
         // Place initrd + DTB near the TOP of RAM (as QEMU/U-Boot do) so the
         // kernel's early allocations near the Image don't clobber them.
         // Layout from the top down: [DTB][initrd][fw_dynamic_info], each
@@ -599,7 +591,7 @@ impl VirtMachine {
         let ram_top = ram_size as usize;
         let dtb = build_virt_fdt(ram_size, images.cmdline, 0, 0, n_virtio);
         // Reserve DTB just below the top (2 MiB margin, page aligned).
-        let dtb_off = ((ram_top - 0x20_0000).saturating_sub(dtb.len())) & !0xfff;
+        let dtb_off = ((ram_top - TOP_LAYOUT_MARGIN as usize).saturating_sub(dtb.len())) & !0xfff;
 
         // initrd below the DTB (1 MiB aligned).
         let mut initrd_start = 0u64;
@@ -614,35 +606,17 @@ impl VirtMachine {
         }
 
         // fw_dynamic_info struct below the initrd (page aligned).
-        let dyn_off = (below.saturating_sub(0x1000)) & !0xfff;
+        let dyn_off = (below.saturating_sub(FW_DYNAMIC_INFO_SIZE as usize)) & !0xfff;
 
         // Rebuild the DTB now that initrd addresses are known, then place it.
         let dtb = build_virt_fdt(ram_size, images.cmdline, initrd_start, initrd_end, n_virtio);
         ram[dtb_off..dtb_off + dtb.len()].copy_from_slice(&dtb);
         let dtb_addr = RAM_BASE + dtb_off as u64;
 
-        // Virtio: blk if a disk is given, then 9p if a filesystem is exported.
         // Slot i takes PLIC source VIRTIO_IRQ_BASE + i, matching the DTB above.
         let mut virtio = Vec::new();
-        if images.virtio_console {
-            virtio.push(VirtioDev::new(Backend::Console {
-                rx_buf: Vec::new(),
-                tx_out: Vec::new(),
-            }));
-        }
         if let Some(disk) = images.disk {
             virtio.push(VirtioDev::new(Backend::Block { disk }));
-        }
-        for srv in images.fs {
-            virtio.push(VirtioDev::new(Backend::Fs { srv }));
-        }
-        if let Some(tag) = images.external_fs {
-            virtio.push(VirtioDev::new(Backend::FsExternal {
-                tag: tag.into(),
-                request: None,
-                reply: None,
-                awaiting_reply: false,
-            }));
         }
         if let Some(mac) = images.net {
             virtio.push(VirtioDev::new(Backend::Net {
@@ -741,45 +715,6 @@ impl VirtMachine {
             .iter_mut()
             .find(|d| d.device_id() == 1)
             .map(|d| d.net_take_output())
-            .unwrap_or_default()
-    }
-
-    pub fn fs_external_take_request(&mut self) -> Option<Vec<u8>> {
-        self.bus
-            .virtio
-            .iter_mut()
-            .find_map(VirtioDev::fs_external_take_request)
-    }
-
-    pub fn fs_external_reply(&mut self, bytes: Vec<u8>) -> bool {
-        self.bus
-            .virtio
-            .iter_mut()
-            .find(|dev| matches!(dev.backend, Backend::FsExternal { .. }))
-            .is_some_and(|dev| dev.fs_external_reply(bytes))
-    }
-
-    pub fn virtio_console_input(&mut self, bytes: &[u8]) {
-        if let Some((index, dev)) = self
-            .bus
-            .virtio
-            .iter_mut()
-            .enumerate()
-            .find(|(_, dev)| matches!(dev.backend, Backend::Console { .. }))
-        {
-            dev.console_input(bytes);
-            let mut dev = self.bus.virtio.remove(index);
-            dev.process(0, &mut self.bus.ram, RAM_BASE, &mut self.bus.jit);
-            self.bus.virtio.insert(index, dev);
-        }
-    }
-
-    pub fn virtio_console_take_output(&mut self) -> Vec<u8> {
-        self.bus
-            .virtio
-            .iter_mut()
-            .find(|dev| matches!(dev.backend, Backend::Console { .. }))
-            .map(VirtioDev::console_take_output)
             .unwrap_or_default()
     }
 
@@ -1266,9 +1201,6 @@ mod tests {
                 cmdline: "console=ttyS0",
                 initrd: None,
                 disk: None,
-                fs: Vec::new(),
-                external_fs: None,
-                virtio_console: false,
                 net: None,
             },
         )

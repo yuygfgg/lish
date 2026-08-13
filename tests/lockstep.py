@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lockstep differential: compare rv64.js x-register commit streams against
+"""Lockstep differential: compare Lish x-register commit streams against
 Spike's commit log for riscv-tests binaries.
 
 Usage: tests/lockstep.py [--spike PATH] <test-elf>...
@@ -86,7 +86,7 @@ def cut_tohost_spin(stream):
 # Spec-legal implementation differences (not bugs): both behaviors are
 # architecturally allowed, so the streams legitimately diverge.
 KNOWN_DIVERGENT = {
-    # rv64.js executes misaligned loads/stores in hardware (same choice as
+    # Lish executes misaligned loads/stores in hardware (same choice as
     # TinyEMU/qemu); default-config Spike traps to the handler instead.
     "rv64ui-p-ma_data",
 }

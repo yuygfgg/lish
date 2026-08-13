@@ -5,19 +5,11 @@
 //! Usage:
 //!   rv64-vboot <opensbi.bin> <kernel-Image> [--initrd FILE] [--disk FILE]
 //!   rv64-vboot --direct <kernel-Image> [--initrd FILE] [--disk FILE]
-//!              [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT] [--net-mac MAC]
+//!              [--net ws://HOST:PORT] [--net-mac MAC]
 //!              [--ram GB] [-- <cmdline...>]
 //!
-//! `--9p DIR` exports a host directory over virtio-9p. Note that the stock
-//! Debian/nixpkgs riscv64 kernels ship 9p as modules (`9pnet_virtio`, `9p`),
-//! so the guest must load them (or use a kernel with them built in) before:
-//!   mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
-
-use rv64_system::egress::NativeEgress;
-use rv64_system::httpproxy::Proxy;
-use rv64_system::netstack::{NetConfig, NetStack};
 use rv64_system::virt::{VirtImages, VirtMachine};
-use rv64_system::{p9, p9fs, ws};
+use rv64_system::ws;
 use std::io::{Read, Write};
 
 fn main() {
@@ -29,10 +21,7 @@ fn main() {
     }
     let mut initrd_path = None;
     let mut disk_path = None;
-    let mut share = None;
-    let mut tag = "host".to_string();
     let mut relay_url = None;
-    let mut proxy_mode = false;
     let mut mac = rv64_system::virtio::DEFAULT_MAC;
     let mut ram_gb = 2.0f64;
     let mut direct = false;
@@ -42,10 +31,7 @@ fn main() {
         match a.as_str() {
             "--initrd" => initrd_path = it.next(),
             "--disk" => disk_path = it.next(),
-            "--9p" => share = it.next(),
-            "--9p-tag" => tag = it.next().unwrap_or(tag),
             "--net" => relay_url = it.next(),
-            "--proxy" => proxy_mode = true,
             "--net-mac" => {
                 mac = it.next().as_deref().and_then(parse_mac).unwrap_or_else(|| {
                     eprintln!("bad --net-mac");
@@ -58,18 +44,7 @@ fn main() {
         }
     }
     if positional.len() < if direct { 1 } else { 2 } {
-        eprintln!("usage: rv64-vboot [--direct] [<opensbi.bin>] <kernel> [--initrd F] [--disk F] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT | --proxy] [--net-mac MAC] [--ram GB] [-- cmdline]");
-        std::process::exit(2);
-    }
-    if relay_url.is_some() && proxy_mode {
-        eprintln!("--net and --proxy are mutually exclusive");
-        std::process::exit(2);
-    }
-    if proxy_mode && share.is_some() && tag == rv64_system::httpproxy::CA_9P_TAG {
-        eprintln!(
-            "--9p-tag '{}' is reserved for the proxy CA",
-            rv64_system::httpproxy::CA_9P_TAG
-        );
+        eprintln!("usage: rv64-vboot [--direct] [<opensbi.bin>] <kernel> [--initrd F] [--disk F] [--net ws://HOST:PORT] [--net-mac MAC] [--ram GB] [-- cmdline]");
         std::process::exit(2);
     }
     let (opensbi, kernel_path) = if direct {
@@ -83,12 +58,6 @@ fn main() {
     let kernel = std::fs::read(kernel_path).expect("read kernel");
     let initrd = initrd_path.map(|p| std::fs::read(p).expect("read initrd"));
     let disk = disk_path.map(|p| std::fs::read(p).expect("read disk"));
-    let mut fs = Vec::new();
-    if let Some(dir) = share {
-        eprintln!("[vboot] 9p: exporting {dir} as tag '{tag}'");
-        fs.push(p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir))));
-    }
-
     // Connect the relay before booting: a NIC the guest can see but that has
     // nowhere to send is worse than no NIC at all.
     let mut relay = match &relay_url {
@@ -104,28 +73,7 @@ fn main() {
         },
         None => None,
     };
-    let mut proxy_stack = if proxy_mode {
-        let stack = NetStack::new(NetConfig::default());
-        // Preserve ordinary http:// requests. Requests decrypted from CONNECT
-        // are independently marked https:// by the proxy.
-        let mut proxy = Proxy::new().keep_scheme();
-        let ca_fs = proxy.ca_9p_server().unwrap_or_else(|error| {
-            eprintln!("[vboot] proxy CA: {error}");
-            std::process::exit(1);
-        });
-        fs.push(ca_fs);
-        eprintln!(
-            "[vboot] proxy: {} — guest address {} netmask {}; CA on 9p tag '{}'",
-            stack.proxy_url(),
-            fmt_ip(&stack.config().guest_ip),
-            fmt_ip(&stack.config().netmask),
-            rv64_system::httpproxy::CA_9P_TAG,
-        );
-        Some((stack, proxy, NativeEgress::new()))
-    } else {
-        None
-    };
-    let net = (relay.is_some() || proxy_mode).then_some(mac);
+    let net = relay.is_some().then_some(mac);
 
     let ram_bytes = (ram_gb * (1u64 << 30) as f64) as u64;
     eprintln!(
@@ -144,9 +92,6 @@ fn main() {
         cmdline: &cmdline,
         initrd: initrd.as_deref(),
         disk,
-        fs,
-        external_fs: None,
-        virtio_console: false,
         net,
     };
     let mut m = if direct {
@@ -167,7 +112,6 @@ fn main() {
     let hb_secs: Option<u64> = std::env::var("VBOOT_HEARTBEAT")
         .ok()
         .and_then(|v| v.parse().ok());
-    let net_trace = std::env::var_os("RV64_NET_TRACE").is_some();
     let mut hb_last = std::time::Instant::now();
     let mut hb_insns = 0u64;
 
@@ -213,22 +157,6 @@ fn main() {
             }
             eprintln!("\r\n[vboot] powered off");
             break;
-        }
-        // Pump the in-process proxy both ways once per slice.
-        if let Some((stack, proxy, egress)) = proxy_stack.as_mut() {
-            for frame in m.net_take_output() {
-                if net_trace {
-                    eprintln!("[vboot] net guest->proxy {}", describe_frame(&frame));
-                }
-                stack.input(&frame);
-            }
-            proxy.pump(stack, egress);
-            for frame in stack.take_output() {
-                if net_trace {
-                    eprintln!("[vboot] net proxy->guest {}", describe_frame(&frame));
-                }
-                m.net_input(&frame);
-            }
         }
         // Pump the relay both ways once per slice.
         if let Some(r) = relay.as_mut() {
@@ -297,18 +225,6 @@ fn fmt_mac(mac: &[u8; 6]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":")
-}
-
-fn fmt_ip(o: &[u8; 4]) -> String {
-    format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
-}
-
-fn describe_frame(frame: &[u8]) -> String {
-    let ethertype = frame
-        .get(12..14)
-        .map(|b| u16::from_be_bytes([b[0], b[1]]))
-        .unwrap_or(0);
-    format!("{} bytes ethertype=0x{ethertype:04x}", frame.len())
 }
 
 /// Format the last ~20 user syscalls from the CPU ring buffer, decoding

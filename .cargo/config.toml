@@ -6,5 +6,5 @@ RUST_MIN_STACK = { value = "4194304", force = false }
 
 [target.wasm32-unknown-unknown]
 # Export + allow growing the function table so the JS host can register
-# JIT-compiled block functions for call_indirect dispatch (v86-style).
+# JIT-compiled block functions for call_indirect dispatch.
 rustflags = ["-C", "link-arg=--export-table", "-C", "link-arg=--growable-table"]

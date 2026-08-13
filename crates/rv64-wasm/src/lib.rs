@@ -1,20 +1,8 @@
-//! wasm export surface for rv64.js.
+//! Wasm host ABI for the Lish full-system RISC-V VM.
 //!
-//! v86-style: a plain `extern "C"` ABI over wasm linear memory — no
-//! wasm-bindgen. `web/rv64.js` instantiates the module and talks to these
-//! exports directly.
-//!
-//! Two APIs:
-//! - **raw CPU** (`init`/`run`/`get_reg`/...): bare hart + flat RAM, used by
-//!   the phase-0 demo and tests.
-//! - **user-mode Linux** (`user_*`): load a static riscv64 ELF and run it,
-//!   syscalls serviced by rv64-linux. Console output and clock/entropy go
-//!   through imported host functions (see `extern "C"` imports below).
-//!
-//! Single-instance (v86's model): one emulator per wasm instantiation.
+//! The module uses a plain `extern "C"` ABI. One Wasm instance owns one VM.
 
-use rv64_core::{Bus, Cpu, FlatMemory, StopReason};
-use rv64_linux::{Host, Machine};
+use rv64_core::{Bus, Cpu};
 
 // ---- host imports (provided by web/rv64.js) -----------------------------
 
@@ -26,30 +14,14 @@ extern "C" {
     fn host_now_ms() -> f64;
     /// Milliseconds since the Unix epoch (Date.now()), for the guest RTC.
     fn host_unix_ms() -> f64;
-    /// Fill with entropy (crypto.getRandomValues).
-    fn host_random(ptr: *mut u8, len: usize);
-    /// JIT: instantiate the wasm module currently in JIT_OUT (see
-    /// jit_out_ptr/jit_out_len), append its `run` function to this module's
-    /// exported function table, and return the table index (-1 on failure).
-    fn host_jit_register() -> i32;
     /// Queue a dead table slot for cleanup after the current Wasm entry
     /// returns to JavaScript. reason=1 identifies policy eviction.
     fn host_jit_retire(idx: i32, reason: u32);
     /// One Ethernet frame the guest transmitted, for the page to forward over
     /// its WebSocket relay. Called at quantum granularity, like host_write.
     fn host_net_send(ptr: *const u8, len: usize);
-    /// One HTTP request the in-process proxy wants performed, encoded by
-    /// `httpproxy::Request::encode`. The page performs it with `fetch()` and
-    /// calls `sys_http_response` when it completes — asynchronously, so this
-    /// returns immediately and the guest's TCP connection stays open meanwhile.
-    fn host_http_request(id: u64, ptr: *const u8, len: usize);
-    /// Transparent guest TCP stream events for a WISP transport.
-    fn host_wisp_open(id: u64, address: *const u8, port: u32);
-    fn host_wisp_data(id: u64, ptr: *const u8, len: usize);
-    fn host_wisp_close(id: u64);
-    fn host_wisp_datagram(id: u64, address: *const u8, port: u32, ptr: *const u8, len: usize);
     /// Compile the module in JIT_OUT asynchronously and reserve `slot_count`
-    /// contiguous table entries. JS calls sys_jit_ready between runSystem
+    /// contiguous table entries. JS calls sys_jit_ready between VM slices
     /// calls after every export is installed (base -1/-2 = failure/capacity).
     fn host_jit_register_async(ticket: u64, slot_count: u32);
 }
@@ -90,67 +62,6 @@ fn emit_host_net(frame: &[u8]) {
     }
 }
 
-#[inline]
-fn emit_host_http(id: u64, bytes: &[u8]) {
-    unsafe {
-        HOST_EVENT_QUEUED = true;
-        host_http_request(id, bytes.as_ptr(), bytes.len());
-    }
-}
-
-#[inline]
-fn emit_host_wisp_open(id: u64, address: &[u8], port: u32) {
-    unsafe {
-        HOST_EVENT_QUEUED = true;
-        host_wisp_open(id, address.as_ptr(), port);
-    }
-}
-
-#[inline]
-fn emit_host_wisp_data(id: u64, bytes: &[u8]) {
-    unsafe {
-        HOST_EVENT_QUEUED = true;
-        host_wisp_data(id, bytes.as_ptr(), bytes.len());
-    }
-}
-
-#[inline]
-fn emit_host_wisp_close(id: u64) {
-    unsafe {
-        HOST_EVENT_QUEUED = true;
-        host_wisp_close(id);
-    }
-}
-
-#[inline]
-fn emit_host_wisp_datagram(id: u64, address: &[u8], port: u32, bytes: &[u8]) {
-    unsafe {
-        HOST_EVENT_QUEUED = true;
-        host_wisp_datagram(id, address.as_ptr(), port, bytes.as_ptr(), bytes.len());
-    }
-}
-
-fn tls_random(buf: &mut [u8]) -> Result<(), getrandom::Error> {
-    unsafe { host_random(buf.as_mut_ptr(), buf.len()) }
-    Ok(())
-}
-
-getrandom::register_custom_getrandom!(tls_random);
-
-struct JsHost;
-
-impl Host for JsHost {
-    fn write_out(&mut self, fd: i32, bytes: &[u8]) {
-        emit_host_write(fd, bytes);
-    }
-    fn clock_ns(&mut self) -> u64 {
-        (unsafe { host_now_ms() } * 1e6) as u64
-    }
-    fn random(&mut self, buf: &mut [u8]) {
-        unsafe { host_random(buf.as_mut_ptr(), buf.len()) }
-    }
-}
-
 // ---- shared staging buffer (JS -> wasm data transfer) --------------------
 
 static mut STAGING: Vec<u8> = Vec::new();
@@ -163,159 +74,6 @@ pub extern "C" fn staging_alloc(len: usize) -> *mut u8 {
         STAGING.clear();
         STAGING.resize(len, 0);
         STAGING.as_mut_ptr()
-    }
-}
-
-/// Pointer to the staging buffer WITHOUT resizing or clearing it, for reading
-/// data the core placed there. `staging_alloc` is the write path and empties the
-/// buffer, so it cannot be used to read a result back out.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn staging_ptr() -> *const u8 {
-    unsafe { STAGING.as_ptr() }
-}
-
-// ---- raw CPU API ---------------------------------------------------------
-
-struct RawEmu {
-    cpu: Cpu,
-    ram: Vec<u8>,
-    ram_base: u64,
-}
-
-static mut RAW: Option<RawEmu> = None;
-
-const STOP_YIELD: i32 = 0;
-const STOP_ECALL: i32 = 1;
-const STOP_BREAK: i32 = 2;
-const STOP_TRAP: i32 = 3;
-const STOP_EXITED: i32 = 4;
-
-static mut LAST_TRAP: i32 = -1;
-
-#[allow(static_mut_refs)]
-fn raw() -> &'static mut RawEmu {
-    unsafe { RAW.as_mut().expect("call init() first") }
-}
-
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn init(base: u64, size: u32) {
-    let mut cpu = Cpu::new();
-    cpu.pc = base;
-    unsafe {
-        RAW = Some(RawEmu {
-            cpu,
-            ram: vec![0; size as usize],
-            ram_base: base,
-        })
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn mem_ptr() -> *mut u8 {
-    raw().ram.as_mut_ptr()
-}
-
-#[no_mangle]
-pub extern "C" fn mem_size() -> u32 {
-    raw().ram.len() as u32
-}
-
-#[no_mangle]
-pub extern "C" fn get_pc() -> u64 {
-    raw().cpu.pc
-}
-
-#[no_mangle]
-pub extern "C" fn set_pc(pc: u64) {
-    raw().cpu.pc = pc;
-}
-
-#[no_mangle]
-pub extern "C" fn get_reg(i: u32) -> u64 {
-    raw().cpu.x[(i & 31) as usize]
-}
-
-#[no_mangle]
-pub extern "C" fn set_reg(i: u32, val: u64) {
-    if i != 0 {
-        raw().cpu.x[(i & 31) as usize] = val;
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn insn_count() -> u64 {
-    raw().cpu.insn_count
-}
-
-#[no_mangle]
-pub extern "C" fn run(budget: u64) -> i32 {
-    let e = raw();
-    let mut bus = FlatMemory::new(e.ram_base, &mut e.ram);
-    match e.cpu.run(&mut bus, budget) {
-        StopReason::Budget => STOP_YIELD,
-        StopReason::Ecall => STOP_ECALL,
-        StopReason::Break => STOP_BREAK,
-        StopReason::Wfi => STOP_YIELD, // raw API has no system mode yet
-        StopReason::Trap(exc) => {
-            unsafe { LAST_TRAP = exc.cause() as i32 };
-            STOP_TRAP
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn trap_cause() -> i32 {
-    unsafe { LAST_TRAP }
-}
-
-// ---- user-mode Linux API --------------------------------------------------
-
-struct UserEmu {
-    machine: Machine,
-    exit_code: i32,
-}
-
-static mut USER: Option<UserEmu> = None;
-static mut USER_ARGS: Vec<String> = Vec::new();
-
-/// Append one argv string (staged via staging_alloc + copy).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_arg_push() {
-    unsafe {
-        let s = String::from_utf8_lossy(&STAGING).into_owned();
-        USER_ARGS.push(s);
-    }
-}
-
-/// Load the ELF currently in the staging buffer with the pushed argv.
-/// Returns 0 on success, negative on load error.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_load(mem_size: u32) -> i32 {
-    let mut host = JsHost;
-    unsafe {
-        let argv: Vec<&str> = USER_ARGS.iter().map(String::as_str).collect();
-        let argv: &[&str] = if argv.is_empty() { &["guest"] } else { &argv };
-        let envp = ["PATH=/bin", "HOME=/", "TERM=dumb"];
-        match Machine::load(&STAGING, argv, &envp, mem_size as usize, &mut host) {
-            Ok(machine) => {
-                USER = Some(UserEmu {
-                    machine,
-                    exit_code: 0,
-                });
-                // New address space: any compiled blocks are stale.
-                if let Some(j) = USER_JIT.as_mut() {
-                    j.clear();
-                }
-                STAGING.clear();
-                USER_ARGS.clear();
-                0
-            }
-            Err(_) => -1,
-        }
     }
 }
 
@@ -391,7 +149,7 @@ struct JitState {
     /// Last observed cpu.jit_flush_gen; a change means the va→pa code
     /// mapping was invalidated (satp/SFENCE) — drop everything.
     flush_gen: u64,
-    /// Superblock compilation (v86's function-per-page): the hot block-entry
+    /// Superblock compilation: the hot block-entry
     /// pcs discovered in each guest code page (keyed by virtual page base). When
     /// a new entry appears the page's superblock is recompiled to cover it, and
     /// every entry's `cache`/`dispatch` slot points at the one superblock.
@@ -947,7 +705,6 @@ mod jit_state_tests {
     }
 }
 
-static mut USER_JIT: Option<JitState> = None;
 static mut SYS_JIT: Option<JitState> = None;
 
 // Cell every compiled block writes with the number of guest instructions
@@ -1163,7 +920,7 @@ pub extern "C" fn jit_set_demote(on: u32) {
 /// long-stay FP region bails exactly like that while FS is off. 64 (~2K
 /// real exits): the 16-sample verdict condemned regions on WARM-UP stays —
 /// NUMERIC SORT's straddling-loop region measured 320-467 iter/s across
-/// identical boots (a coin flip against v86's ~400) because whether it
+/// identical boots because whether it
 /// survived demotion depended on how cold its first sampled exits were.
 const DEMOTE_MIN_SAMPLES: u32 = 64;
 static mut SB_DEMOTED: u64 = 0;
@@ -1344,7 +1101,7 @@ static mut TRACE_SB_INSTALL: u64 = 0;
 static mut TRACE_INDIV: u64 = 0;
 static mut TRACE_SEED: u64 = 0;
 static mut TRACE_ENTRY: u64 = 0;
-/// Bumped by sys_boot: async results from a previous machine must be dropped.
+/// Bumped by every VM boot: async results from a previous machine must be dropped.
 static mut BOOT_GEN: u64 = 0;
 
 // Perf instrumentation: guest instructions retired inside JIT blocks vs
@@ -1587,8 +1344,7 @@ fn eprof_hit(src: u64, dst: u64, retired: u64) {
     }
 }
 
-/// jit_stat(0) = insns retired in JIT blocks, (1) = block dispatches,
-/// (2) = compiled blocks (user), (3) = compiled blocks (sys).
+/// Return one JIT diagnostic counter.
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn jit_stat(which: u32) -> u64 {
@@ -1596,7 +1352,7 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
         match which {
             0 => JIT_RETIRED,
             1 => JIT_DISPATCHES,
-            2 => USER_JIT.as_ref().map_or(0, |j| j.cache.len() as u64),
+            2 => 0,
             3 => SYS_JIT.as_ref().map_or(0, |j| j.cache.len() as u64),
             4 => SLICE_CALLS,
             5 => SLICE_INSNS,
@@ -1702,23 +1458,8 @@ pub extern "C" fn jit_set_enabled(on: u32) {
             if let Some(j) = (*(&raw mut SYS_JIT)).as_mut() {
                 j.clear();
             }
-            #[allow(clippy::deref_addrof)]
-            if let Some(j) = (*(&raw mut USER_JIT)).as_mut() {
-                j.clear();
-            }
         }
     }
-}
-/// Opt-in: drive the guest CLINT from real host wall-clock instead of the
-/// default deterministic instruction-counted time. For benchmarks that self-
-/// time via the guest clock (nbench) and realistic `date`/timeouts. Off by
-/// default so lockstep/differential testing stays reproducible.
-static mut SYS_WALLCLOCK: bool = false;
-static mut WALL_LAST_ICOUNT: u64 = 0;
-static mut WALL_IDLE_ITERS: u32 = 0;
-#[no_mangle]
-pub extern "C" fn sys_set_wallclock(on: u32) {
-    unsafe { SYS_WALLCLOCK = on != 0 }
 }
 /// Opt-in: fold branchy code pages into one superblock (function-per-page with
 /// an internal br_table dispatch). Correct and validated, but per-page
@@ -1878,321 +1619,7 @@ fn call_block(idx: i32, state: i32) {
     }
 }
 
-// Standalone superblock-emitter validation: compile the sum-1..10 loop as a
-// 2-entry superblock and run it; must return 55 (x1). Exercises the internal
-// br_table dispatch, register-in-locals across blocks, loop back-edge and exit.
-static mut SBSTATE: [u64; 40] = [0; 40];
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sbtest() -> u64 {
-    const PROG: [u32; 7] = [
-        0x00000093, 0x00100113, 0x00b00193, 0x002080b3, 0x00110113, 0xfe311ce3, 0x00000073,
-    ];
-    let code: Vec<u8> = PROG.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let base = 0x1000u64;
-    unsafe {
-        SBSTATE = [0; 40];
-        let sp = SBSTATE.as_ptr() as u32;
-        SBSTATE[32] = base; // pc
-        let lay = rv64_jit::JitLayout {
-            x_base: sp,
-            pc_addr: sp + 256,
-            mem: None,
-            sys: None,
-            mem_profile: None,
-            reg_stress: false,
-            reg_profile_base: 0,
-            multi_latch: false,
-            retired_addr: sp + 264,
-            f_base: 0,
-            fcsr_addr: 0,
-            fuel_addr: 0,
-            mstatus_addr: 0,
-            copystat_addr: 0,
-            chain_off_addr: 0,
-            batch_base_addr: 0,
-            dispatch_base: 0,
-            dispatch_mask: 0,
-            map_gen_addr: 0,
-        };
-        let entries = [0x1000u64, 0x100c];
-        let blk = match rv64_jit::translate_superblock(&code, base, 0x1000, 0x40, &entries, lay) {
-            Some(b) => b,
-            None => return 0xDEAD_0001,
-        };
-        JIT_OUT = blk.wasm;
-        let idx = host_jit_register();
-        if idx < 0 {
-            return 0xDEAD_0002;
-        }
-        call_block(idx, sp as i32);
-        SBSTATE[1] // x1 == 55 if correct
-    }
-}
-
-/// Run the loaded program with JIT tier-up. STOP_EXITED on exit,
-/// STOP_YIELD when the caller must resume (fuel exhausted or copied host
-/// events are ready for delivery), and STOP_TRAP on an unhandled trap.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_run(budget: u64) -> i32 {
-    begin_host_event_batch();
-    unsafe { JIT_CAPACITY_BLOCKED = false };
-    let e = unsafe { USER.as_mut().expect("call user_load() first") };
-    let jit = unsafe { USER_JIT.get_or_insert_with(JitState::new) };
-    let mut host = JsHost;
-    let m = &mut e.machine;
-    let mut remaining = budget;
-    if remaining == 0 {
-        return STOP_YIELD;
-    }
-
-    loop {
-        // --- JIT fast path: direct-mapped dispatch, chain blocks ---
-        let mut chained = 0u32;
-        while chained < JIT_CHAIN_CAP && remaining > 0 {
-            unsafe { FUEL_CELL = remaining };
-            let pc = m.cpu.pc;
-            let line = jit.dispatch[JitState::dslot(pc)];
-            let idx = if line.pc == pc {
-                line.idx
-            } else {
-                match jit.cache.get(&pc) {
-                    Some(Some(b)) => {
-                        let idx = b.idx;
-                        jit.dispatch[JitState::dslot(pc)] = DispatchLine { pc, idx, gen: 0 };
-                        idx
-                    }
-                    _ => break,
-                }
-            };
-            if idx < 0 {
-                break; // blacklisted (user mode never blacklists with pa, but keep the invariant)
-            }
-            if chained & 0xff == 0 {
-                jit.touch(pc);
-            }
-            call_block(idx, m as *mut _ as i32);
-            // Read the dynamic retired count the block wrote: self-loop blocks
-            // (Phase 3) run a runtime-variable number of iterations, so their
-            // length is not the static b.n.
-            let retired = unsafe { RETIRED_CELL };
-            m.cpu.insn_count += retired;
-            unsafe {
-                JIT_RETIRED += retired;
-                JIT_DISPATCHES += 1;
-            }
-            remaining = remaining.saturating_sub(retired);
-            chained += 1;
-            if remaining == 0 {
-                return STOP_YIELD;
-            }
-        }
-
-        // --- hot counting + compile ---
-        let pc = m.cpu.pc;
-        if jit_compilation_allowed() && !jit.cache.contains_key(&pc) {
-            let c = jit.hot.entry(pc).or_insert(0);
-            *c += 1;
-            if *c >= unsafe { JIT_THRESHOLD } {
-                let lay = rv64_jit::JitLayout {
-                    x_base: m.cpu.x.as_ptr() as u32,
-                    pc_addr: &m.cpu.pc as *const u64 as u32,
-                    mem: Some((m.mem.as_ptr() as u32, m.mem.len() as u64)),
-                    sys: None,
-                    mem_profile: None,
-                    reg_stress: false,
-                    reg_profile_base: 0,
-                    multi_latch: false,
-                    retired_addr: retired_addr(),
-                    f_base: m.cpu.f.as_ptr() as u32,
-                    fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
-                    fuel_addr: fuel_addr(),
-                    mstatus_addr: 0, // user mode: no privileged FP state
-                    copystat_addr: 0,
-                    chain_off_addr: 0,
-                    batch_base_addr: 0,
-                    dispatch_base: 0,
-                    dispatch_mask: 0,
-                    map_gen_addr: 0,
-                };
-                let end = (pc as usize + 1024).min(m.mem.len());
-                let mut capacity = false;
-                let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
-                    .and_then(|blk| {
-                        unsafe { JIT_OUT = blk.wasm };
-                        let idx = unsafe { host_jit_register() };
-                        if idx == JIT_REGISTER_CAPACITY {
-                            capacity = true;
-                            return None;
-                        }
-                        if idx < 0 {
-                            return None;
-                        }
-                        jit.track_owner([idx]);
-                        Some(JitBlock {
-                            fp: false,
-                            idx,
-                            n: blk.n_insns,
-                            mix: blk.trace_mix,
-                            mem: blk.trace_mem,
-                            control: blk.trace_control,
-                            alu: blk.trace_alu,
-                            pa: pc,
-                            last_used: next_jit_use_stamp(),
-                        })
-                    });
-                if capacity {
-                    handle_jit_capacity(jit);
-                } else {
-                    jit.cache_insert(pc, entry);
-                }
-                if entry.is_some() {
-                    continue; // dispatch it immediately
-                }
-            }
-        }
-
-        // --- interpreter slice ---
-        let slice = remaining.min(512);
-        let (stop, retired) = m.run_cpu_slice(slice);
-        remaining = remaining.saturating_sub(retired);
-        match stop {
-            StopReason::Budget => {
-                if remaining == 0 {
-                    return STOP_YIELD;
-                }
-            }
-            StopReason::Ecall => {
-                if let Some(code) = rv64_linux::syscall::handle(m, &mut host) {
-                    m.exit_code = Some(code);
-                    e.exit_code = code;
-                    return STOP_EXITED;
-                }
-                if m.icache_flush_pending {
-                    m.icache_flush_pending = false;
-                    jit.clear(); // architectural code-change signal
-                }
-                // JavaScript drains the copied host events when this export
-                // returns. Yield at the completed syscall boundary so an
-                // output-heavy process cannot fill an unbounded JS queue.
-                if take_host_event() {
-                    return STOP_YIELD;
-                }
-                if remaining == 0 {
-                    return STOP_YIELD;
-                }
-            }
-            StopReason::Break => {
-                e.exit_code = 133;
-                return STOP_EXITED;
-            }
-            StopReason::Trap(exc) => {
-                unsafe { LAST_TRAP = exc.cause() as i32 };
-                return STOP_TRAP;
-            }
-            StopReason::Wfi => unreachable!(),
-        }
-    }
-}
-
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_exit_code() -> i32 {
-    unsafe { USER.as_ref().map(|e| e.exit_code).unwrap_or(-1) }
-}
-
-/// Read a user-machine GPR (differential testing: full architectural-state
-/// comparison between JIT and interpreter runs).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_reg(i: u32) -> u64 {
-    unsafe {
-        USER.as_ref()
-            .map(|e| e.machine.cpu.x[(i & 31) as usize])
-            .unwrap_or(0)
-    }
-}
-
-/// Read a user-machine FP register (raw bits).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_freg(i: u32) -> u64 {
-    unsafe {
-        USER.as_ref()
-            .map(|e| e.machine.cpu.f[(i & 31) as usize])
-            .unwrap_or(0)
-    }
-}
-
-/// User-machine fcsr (flags + rounding mode).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_fcsr() -> u32 {
-    unsafe { USER.as_ref().map(|e| e.machine.cpu.fcsr).unwrap_or(0) }
-}
-
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_pc() -> u64 {
-    unsafe { USER.as_ref().map(|e| e.machine.cpu.pc).unwrap_or(0) }
-}
-
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn user_insn_count() -> u64 {
-    unsafe { USER.as_ref().map(|e| e.machine.cpu.insn_count).unwrap_or(0) }
-}
-
-// ---- full-system API (boot Linux in the browser) --------------------------
-
-static mut SYS_BIOS: Vec<u8> = Vec::new();
-static mut SYS_KERNEL: Vec<u8> = Vec::new();
-static mut SYS_DISK: Vec<u8> = Vec::new();
-static mut SYS_CMDLINE: Vec<u8> = Vec::new();
-/// In-process HTTP proxy: the guest's NIC talks to this instead of a relay, and
-/// egress happens through the page's `fetch()`. This is the only configuration
-/// that reaches the network with no external infrastructure at all.
-static mut SYS_NETSTACK: Option<rv64_system::netstack::NetStack> = None;
-static mut SYS_PROXY: Option<rv64_system::httpproxy::Proxy> = None;
-static mut SYS_WISP: bool = false;
-static mut SYS_EGRESS: FetchEgress = FetchEgress { done: Vec::new() };
-
-/// Hands requests to the page and collects what the `sys_http_*` exports
-/// deliver. Responses arrive as a head then body chunks, so a streaming
-/// response (SSE, a long download) reaches the guest as it arrives.
-struct FetchEgress {
-    done: Vec<rv64_system::httpproxy::Completion>,
-}
-
-impl rv64_system::httpproxy::Egress for FetchEgress {
-    fn submit(&mut self, id: rv64_system::httpproxy::ReqId, req: rv64_system::httpproxy::Request) {
-        let bytes = req.encode();
-        emit_host_http(id, &bytes);
-    }
-    fn poll(&mut self) -> Vec<rv64_system::httpproxy::Completion> {
-        core::mem::take(&mut self.done)
-    }
-}
-
-/// Optional 6-byte MAC for the NIC; empty means use the crate default.
-static mut SYS_NET_MAC: Vec<u8> = Vec::new();
-/// Whether sys_boot should give the machine a virtio-net device.
-static mut SYS_NET_ON: bool = false;
-/// tar archive staged for the virtio-9p export (see `sys_stage_fs_tar`).
-static mut SYS_FS_TAR: Vec<u8> = Vec::new();
-/// Mount tag the 9p export answers to; the guest mounts this name.
-static mut SYS_FS_TAG: Vec<u8> = Vec::new();
-static mut SYS: Option<rv64_system::Machine> = None;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FullSystemKind {
-    None,
-    Legacy,
-    Virt,
-}
-
-static mut ACTIVE_FULL_SYSTEM: FullSystemKind = FullSystemKind::None;
+// ---- full-system API -------------------------------------------------------
 
 fn begin_full_system_dispatch() -> bool {
     unsafe {
@@ -2213,17 +1640,16 @@ fn end_full_system_dispatch() {
 
 /// Clear dispatcher-owned context after a Wasm trap escaped a run export.
 /// The JavaScript ABI wrapper calls this raw export from its exception edge;
-/// normal returns clear the same state inside `sys_run` or `virt_run`.
+/// normal returns clear the same state inside `virt_run`.
 #[no_mangle]
 pub extern "C" fn full_system_dispatch_abort() {
     end_full_system_dispatch();
 }
 
 #[allow(static_mut_refs)]
-unsafe fn reset_full_system_jit(kind: FullSystemKind) {
+unsafe fn reset_full_system_jit() {
     unsafe {
         end_full_system_dispatch();
-        ACTIVE_FULL_SYSTEM = kind;
         BOOT_GEN = BOOT_GEN.wrapping_add(1);
         PENDING_JIT.clear();
         if let Some(jit) = SYS_JIT.as_mut() {
@@ -2249,19 +1675,6 @@ macro_rules! stage_into {
     };
 }
 
-stage_into!(sys_stage_bios, SYS_BIOS);
-stage_into!(sys_stage_kernel, SYS_KERNEL);
-stage_into!(sys_stage_disk, SYS_DISK);
-stage_into!(sys_stage_cmdline, SYS_CMDLINE);
-// Stage a tar archive to export over virtio-9p. There is no host filesystem in
-// the browser, so the export is an in-memory tree built from a tarball the page
-// fetched — mount it in the guest with
-// `mount -t 9p -o trans=virtio,version=9p2000.L <tag> /mnt`.
-stage_into!(sys_stage_fs_tar, SYS_FS_TAR);
-stage_into!(sys_stage_fs_tag, SYS_FS_TAG);
-// Optional 6-byte MAC override for the NIC.
-stage_into!(sys_stage_net_mac, SYS_NET_MAC);
-
 // ---- modern virt-machine API (OpenSBI + current Linux) -------------------
 
 static mut VIRT_OPENSBI: Vec<u8> = Vec::new();
@@ -2271,8 +1684,6 @@ static mut VIRT_DISK: Vec<u8> = Vec::new();
 static mut VIRT_CMDLINE: Vec<u8> = Vec::new();
 static mut VIRT_NET_ON: bool = false;
 static mut VIRT_NET_MAC: Vec<u8> = Vec::new();
-static mut VIRT_FS_EXTERNAL_TAG: Vec<u8> = Vec::new();
-static mut VIRT_CONSOLE_ON: bool = false;
 static mut VIRT_LAST_MONOTONIC_MS: f64 = 0.0;
 static mut VIRT: Option<rv64_system::virt::VirtMachine> = None;
 
@@ -2282,17 +1693,11 @@ stage_into!(virt_stage_initrd, VIRT_INITRD);
 stage_into!(virt_stage_disk, VIRT_DISK);
 stage_into!(virt_stage_cmdline, VIRT_CMDLINE);
 stage_into!(virt_stage_net_mac, VIRT_NET_MAC);
-stage_into!(virt_stage_fs_external_tag, VIRT_FS_EXTERNAL_TAG);
 
 /// Give the next modern virt machine a virtio-net NIC.
 #[no_mangle]
 pub extern "C" fn virt_net_enable(on: u32) {
     unsafe { VIRT_NET_ON = on != 0 }
-}
-
-#[no_mangle]
-pub extern "C" fn virt_console_enable(on: u32) {
-    unsafe { VIRT_CONSOLE_ON = on != 0 }
 }
 
 /// Assemble and boot the modern virt machine from staged images.
@@ -2318,12 +1723,6 @@ fn boot_virt(ram_mb: u32, direct: bool) {
         } else {
             &cmdline
         };
-        let mut fs = Vec::new();
-        if let Some(proxy) = SYS_PROXY.as_mut() {
-            if let Ok(ca_fs) = proxy.ca_9p_server() {
-                fs.push(ca_fs);
-            }
-        }
         let net = VIRT_NET_ON.then(|| {
             <[u8; 6]>::try_from(VIRT_NET_MAC.as_slice()).unwrap_or(rv64_system::virtio::DEFAULT_MAC)
         });
@@ -2333,10 +1732,6 @@ fn boot_virt(ram_mb: u32, direct: bool) {
             cmdline,
             initrd: (!VIRT_INITRD.is_empty()).then_some(VIRT_INITRD.as_slice()),
             disk: (!VIRT_DISK.is_empty()).then(|| core::mem::take(&mut VIRT_DISK)),
-            fs,
-            external_fs: (!VIRT_FS_EXTERNAL_TAG.is_empty())
-                .then(|| core::str::from_utf8(&VIRT_FS_EXTERNAL_TAG).unwrap_or("host")),
-            virtio_console: VIRT_CONSOLE_ON,
             net,
         };
         let mut machine = if direct {
@@ -2349,11 +1744,9 @@ fn boot_virt(ram_mb: u32, direct: bool) {
         VIRT_KERNEL.clear();
         VIRT_INITRD.clear();
         VIRT_CMDLINE.clear();
-        VIRT_FS_EXTERNAL_TAG.clear();
-        SYS = None;
         VIRT = Some(machine);
         VIRT_LAST_MONOTONIC_MS = host_now_ms();
-        reset_full_system_jit(FullSystemKind::Virt);
+        reset_full_system_jit();
     }
 }
 
@@ -2384,42 +1777,6 @@ pub extern "C" fn virt_console_input() {
     machine.console_input(&bytes);
 }
 
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn virt_export_input() {
-    let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
-    let bytes = unsafe { core::mem::take(&mut STAGING) };
-    machine.virtio_console_input(&bytes);
-}
-
-/// Move the next external 9P request into STAGING, returning its byte length.
-/// Zero means that no request is waiting for the host.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn virt_p9_take_request() -> u32 {
-    unsafe {
-        let Some(machine) = VIRT.as_mut() else {
-            return 0;
-        };
-        let Some(request) = machine.fs_external_take_request() else {
-            return 0;
-        };
-        STAGING = request;
-        STAGING.len() as u32
-    }
-}
-
-/// Deliver the staged reply to the external virtio-9P device.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn virt_p9_reply() -> u32 {
-    unsafe {
-        let reply = core::mem::take(&mut STAGING);
-        VIRT.as_mut()
-            .is_some_and(|machine| machine.fs_external_reply(reply)) as u32
-    }
-}
-
 /// Deliver one inbound Ethernet frame to the modern machine's NIC.
 #[no_mangle]
 #[allow(static_mut_refs)]
@@ -2431,48 +1788,8 @@ pub extern "C" fn virt_net_input() {
 
 #[allow(static_mut_refs)]
 fn pump_virt_net(machine: &mut rv64_system::virt::VirtMachine) {
-    unsafe {
-        match SYS_NETSTACK.as_mut() {
-            Some(stack) => {
-                for frame in machine.net_take_output() {
-                    stack.input(&frame);
-                }
-                if let Some(proxy) = SYS_PROXY.as_mut() {
-                    proxy.pump(stack, &mut SYS_EGRESS);
-                } else if SYS_WISP {
-                    pump_wisp(stack);
-                }
-                for frame in stack.take_output() {
-                    machine.net_input(&frame);
-                }
-            }
-            None => {
-                for frame in machine.net_take_output() {
-                    emit_host_net(&frame);
-                }
-            }
-        }
-    }
-}
-
-#[allow(static_mut_refs)]
-fn pump_wisp(stack: &mut rv64_system::netstack::NetStack) {
-    for event in stack.take_events() {
-        match event {
-            rv64_system::netstack::Event::Opened { id, address, port } => {
-                emit_host_wisp_open(id, &address, u32::from(port));
-            }
-            rv64_system::netstack::Event::Data(id, bytes) => {
-                emit_host_wisp_data(id, &bytes);
-            }
-            rv64_system::netstack::Event::Closed(id) => emit_host_wisp_close(id),
-            rv64_system::netstack::Event::Datagram {
-                id,
-                address,
-                port,
-                bytes,
-            } => emit_host_wisp_datagram(id, &address, u32::from(port), &bytes),
-        }
+    for frame in machine.net_take_output() {
+        emit_host_net(&frame);
     }
 }
 
@@ -2520,240 +1837,6 @@ pub extern "C" fn virt_unsupported_sbi_function() -> u64 {
         VIRT.as_ref()
             .and_then(|m| m.unsupported_sbi)
             .map_or(0, |v| v.1)
-    }
-}
-
-/// Give the next-booted machine a virtio-net NIC. Frames the guest sends arrive
-/// via the `host_net_send` import; feed inbound frames back with
-/// `sys_net_input`. The page supplies the transport (a WebSocket to a relay) —
-/// the emulator only moves layer-2 frames.
-#[no_mangle]
-pub extern "C" fn sys_net_enable(on: u32) {
-    unsafe { SYS_NET_ON = on != 0 }
-}
-
-/// Run the in-process HTTP proxy behind the NIC (implies `sys_net_enable`).
-/// Frames then go to the built-in netstack rather than out `host_net_send`.
-///
-/// `upgrade_https` rewrites the guest's `http://` targets to `https://` on
-/// egress, which a page served over https requires — it cannot fetch http:// at
-/// all. Pass 0 only when egress genuinely wants plaintext (a localhost server,
-/// or a page served over http).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_proxy_enable(on: u32, upgrade_https: u32) {
-    unsafe {
-        if on != 0 {
-            SYS_WISP = false;
-            SYS_NET_ON = true;
-            VIRT_NET_ON = true;
-            SYS_NETSTACK = Some(rv64_system::netstack::NetStack::new(
-                rv64_system::netstack::NetConfig::default(),
-            ));
-            let proxy = rv64_system::httpproxy::Proxy::new();
-            SYS_PROXY = Some(if upgrade_https != 0 {
-                proxy
-            } else {
-                proxy.keep_scheme()
-            });
-        } else {
-            SYS_NETSTACK = None;
-            SYS_PROXY = None;
-        }
-    }
-}
-
-/// Run a transparent TCP stack behind the NIC for the JavaScript WISP client.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_wisp_enable(on: u32) {
-    unsafe {
-        SYS_WISP = on != 0;
-        if SYS_WISP {
-            SYS_NET_ON = true;
-            VIRT_NET_ON = true;
-            let cfg = rv64_system::netstack::NetConfig {
-                transparent: true,
-                ..rv64_system::netstack::NetConfig::default()
-            };
-            SYS_NETSTACK = Some(rv64_system::netstack::NetStack::new(cfg));
-            SYS_PROXY = None;
-        } else if SYS_PROXY.is_none() {
-            SYS_NETSTACK = None;
-        }
-    }
-}
-
-/// Deliver bytes received from a WISP stream (bytes staged first).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_wisp_data(id: u64) {
-    unsafe {
-        if let Some(stack) = SYS_NETSTACK.as_mut() {
-            let bytes = core::mem::take(&mut STAGING);
-            stack.send(id, &bytes);
-        }
-    }
-}
-
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_wisp_close(id: u64) {
-    unsafe {
-        if let Some(stack) = SYS_NETSTACK.as_mut() {
-            stack.close(id);
-        }
-    }
-}
-
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_wisp_datagram(id: u64) {
-    unsafe {
-        if let Some(stack) = SYS_NETSTACK.as_mut() {
-            let bytes = core::mem::take(&mut STAGING);
-            stack.send_udp(id, &bytes);
-        }
-    }
-}
-
-/// Deliver a response head (staged via staging_alloc) for request `id`.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_http_head(id: u64) {
-    unsafe {
-        let bytes = core::mem::take(&mut STAGING);
-        match rv64_system::httpproxy::decode_head(&bytes) {
-            Some((status, headers)) => {
-                SYS_EGRESS
-                    .done
-                    .push(rv64_system::httpproxy::Completion::Head {
-                        id,
-                        status,
-                        headers,
-                    })
-            }
-            None => SYS_EGRESS
-                .done
-                .push(rv64_system::httpproxy::Completion::Failed {
-                    id,
-                    error: "malformed response head from host".into(),
-                }),
-        }
-    }
-}
-
-/// Deliver a chunk of response body (staged via staging_alloc) for `id`.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_http_body(id: u64) {
-    unsafe {
-        let bytes = core::mem::take(&mut STAGING);
-        SYS_EGRESS
-            .done
-            .push(rv64_system::httpproxy::Completion::Body { id, bytes });
-    }
-}
-
-/// The response for `id` is complete.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_http_end(id: u64) {
-    unsafe {
-        SYS_EGRESS
-            .done
-            .push(rv64_system::httpproxy::Completion::End { id });
-    }
-}
-
-/// The request `id` could not be performed; STAGING holds why.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_http_fail(id: u64) {
-    unsafe {
-        let bytes = core::mem::take(&mut STAGING);
-        SYS_EGRESS
-            .done
-            .push(rv64_system::httpproxy::Completion::Failed {
-                id,
-                error: String::from_utf8_lossy(&bytes).into_owned(),
-            });
-    }
-}
-
-/// The `http_proxy` URL the guest should use, written into STAGING; returns its
-/// length so the page can show it without hardcoding the address.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_proxy_url() -> u32 {
-    unsafe {
-        let url = SYS_NETSTACK
-            .as_ref()
-            .map(|s| s.proxy_url())
-            .unwrap_or_default();
-        STAGING = url.into_bytes();
-        STAGING.len() as u32
-    }
-}
-
-/// Assemble and boot the machine from the staged images.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_boot(ram_mb: u32) {
-    unsafe {
-        let cmdline = String::from_utf8_lossy(&SYS_CMDLINE).into_owned();
-        let cmdline = if cmdline.is_empty() {
-            "console=hvc0 root=/dev/vda rw"
-        } else {
-            &cmdline
-        };
-        let mut fs = Vec::new();
-        if !SYS_FS_TAR.is_empty() {
-            let tag = String::from_utf8_lossy(&SYS_FS_TAG).into_owned();
-            let tag = if tag.is_empty() { "host".into() } else { tag };
-            let mut mem = rv64_system::p9fs::MemFs::new();
-            mem.load_tar(&core::mem::take(&mut SYS_FS_TAR));
-            fs.push(rv64_system::p9::Server::new(tag, Box::new(mem)));
-        }
-        // The guest can trust the exact ephemeral authority owned by this
-        // proxy without fetching it over the network. Only its public
-        // certificate is exposed; private signing material stays in Rust.
-        if let Some(proxy) = SYS_PROXY.as_mut() {
-            if let Ok(ca_fs) = proxy.ca_9p_server() {
-                fs.push(ca_fs);
-            }
-        }
-        let net = SYS_NET_ON.then(|| {
-            <[u8; 6]>::try_from(SYS_NET_MAC.as_slice()).unwrap_or(rv64_system::virtio::DEFAULT_MAC)
-        });
-        let mut m = rv64_system::Machine::new(
-            ram_mb as usize,
-            rv64_system::BootImages {
-                bios: &SYS_BIOS,
-                kernel: if SYS_KERNEL.is_empty() {
-                    None
-                } else {
-                    Some(&SYS_KERNEL)
-                },
-                cmdline,
-                disk: if SYS_DISK.is_empty() {
-                    None
-                } else {
-                    Some(core::mem::take(&mut SYS_DISK))
-                },
-                fs,
-                net,
-            },
-        );
-        m.set_rtc_unix_ns(host_unix_ms() as u64 * 1_000_000);
-        SYS_BIOS = Vec::new();
-        SYS_KERNEL = Vec::new();
-        VIRT = None;
-        SYS = Some(m);
-        // A new machine means every compiled block and stat is stale. A
-        // second boot in the same Wasm instance must never execute code from
-        // the previous guest.
-        reset_full_system_jit(FullSystemKind::Legacy);
     }
 }
 
@@ -2841,94 +1924,6 @@ trait FullSystemJitMachine {
     }
 }
 
-impl FullSystemJitMachine for rv64_system::Machine {
-    type Bus = rv64_system::SystemBus;
-
-    #[inline]
-    fn cpu(&self) -> &Cpu {
-        &self.cpu
-    }
-
-    #[inline]
-    fn cpu_mut(&mut self) -> &mut Cpu {
-        &mut self.cpu
-    }
-
-    #[inline]
-    fn cpu_bus_mut(&mut self) -> (&mut Cpu, &mut Self::Bus) {
-        (&mut self.cpu, &mut self.bus)
-    }
-
-    #[inline]
-    fn ram(&self) -> &[u8] {
-        &self.bus.ram
-    }
-
-    #[inline]
-    fn jit_pages(&self) -> &rv64_system::JitPageState {
-        &self.bus.jit
-    }
-
-    #[inline]
-    fn jit_pages_mut(&mut self) -> &mut rv64_system::JitPageState {
-        &mut self.bus.jit
-    }
-
-    #[inline]
-    fn run_interpreter(&mut self, max_insns: u64) -> rv64_system::RunSliceOutcome {
-        self.run_slice_outcome(max_insns)
-    }
-
-    #[inline]
-    fn run_interpreter_until<F>(
-        &mut self,
-        max_insns: u64,
-        compiled: F,
-    ) -> rv64_system::RunSliceOutcome
-    where
-        F: FnMut(u64) -> bool,
-    {
-        self.run_slice_until_outcome(max_insns, compiled)
-    }
-
-    #[inline]
-    fn sync_jit_devices(&mut self) {
-        rv64_system::Machine::sync_jit_devices(self);
-    }
-
-    #[inline]
-    fn powered_off(&self) -> bool {
-        self.power_off
-    }
-
-    fn refresh_jit_time(&mut self, force: bool) {
-        unsafe {
-            if !SYS_WALLCLOCK {
-                return;
-            }
-            let icount = self.cpu.insn_count;
-            let due =
-                force || icount.wrapping_sub(WALL_LAST_ICOUNT) >= 16_384 || WALL_IDLE_ITERS >= 64;
-            if due {
-                WALL_LAST_ICOUNT = icount;
-                WALL_IDLE_ITERS = 0;
-                self.wall_ns = Some(host_now_ms() as u64 * 1_000_000);
-                self.wall_anchor_icount = icount;
-            } else {
-                WALL_IDLE_ITERS += 1;
-            }
-        }
-    }
-
-    fn flush_host_io(&mut self) {
-        let out = self.console_output();
-        if !out.is_empty() {
-            emit_host_write(1, &out);
-        }
-        pump_net(self);
-    }
-}
-
 impl FullSystemJitMachine for rv64_system::virt::VirtMachine {
     type Bus = rv64_system::virt::VirtBus;
 
@@ -2997,10 +1992,6 @@ impl FullSystemJitMachine for rv64_system::virt::VirtMachine {
         if !out.is_empty() {
             emit_host_write(1, &out);
         }
-        let export = self.virtio_console_take_output();
-        if !export.is_empty() {
-            emit_host_write(3, &export);
-        }
         pump_virt_net(self);
     }
 }
@@ -3057,7 +2048,7 @@ fn build_superblock<M: FullSystemJitMachine>(
         .map_or(0, |e| e.len());
     // Enough individually-hot pcs: compile the page as
     // ONE function — but over the FULL statically
-    // discovered leader set (v86's page analysis), not
+    // discovered leader set, not
     // just the hot seeds. That keeps intra-page control
     // flow inside the function (any discovered target
     // hits its br_table slot) without recompiling per
@@ -3568,20 +2559,6 @@ fn try_extend_region<M: FullSystemJitMachine>(m: &mut M, jit: &mut JitState, idx
     }
 }
 
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_run(max_insns: u64) -> i32 {
-    if !begin_full_system_dispatch() {
-        return 0;
-    }
-    let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
-    m.set_rtc_unix_ns(unsafe { host_unix_ms() } as u64 * 1_000_000);
-    let jit = unsafe { SYS_JIT.get_or_insert_with(JitState::new) };
-    let result = run_full_system_jit(m, jit, max_insns);
-    end_full_system_dispatch();
-    result
-}
-
 #[allow(clippy::needless_range_loop)] // avoids references to mutable profiling statics
 #[allow(static_mut_refs)]
 fn run_full_system_jit<M: FullSystemJitMachine>(
@@ -3692,7 +2669,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
         // it on every dispatch is a store per ~13-insn block. Refresh every
         // 8 dispatches or 4K retired — staleness overshoots the round by at
         // most that, within the documented block-granularity tolerance
-        // (user_run keeps its exact per-dispatch store).
+        // The full-system dispatcher owns one store for the active VM.
         unsafe { FUEL_CELL = round_budget };
         let mut fuel_stored_at = 0u64;
         while chained < JIT_CHAIN_CAP && retired_sum < round_budget {
@@ -4507,10 +3484,8 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
         }
 
         // Stream console output at quantum granularity, DURING execution —
-        // buffering until sys_run returns skews benchmark timing: a marker
-        // printed early in a slice would be timestamped after the whole slice
-        // (v86 timestamps serial bytes as they arrive; symmetry demands we
-        // surface output comparably; see PERFORMANCE_PROGRESS.md).
+        // buffering until virt_run returns skews benchmark timing: a marker
+        // printed early in a slice would be timestamped after the whole slice.
         m.flush_host_io();
         if unsafe { JIT_ISSUES_THIS_RUN != 0 } || take_host_event() {
             break;
@@ -4519,56 +3494,6 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
 
     m.flush_host_io();
     m.powered_off() as i32
-}
-
-/// Deliver one inbound Ethernet frame (staged via staging_alloc) to the NIC.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_net_input() {
-    let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
-    unsafe {
-        let frame = core::mem::take(&mut STAGING);
-        m.net_input(&frame);
-    }
-}
-
-/// Move the guest's frames one step: into the in-process proxy when one is
-/// running, otherwise out to the page's relay.
-#[allow(static_mut_refs)]
-fn pump_net(m: &mut rv64_system::Machine) {
-    unsafe {
-        match SYS_NETSTACK.as_mut() {
-            Some(stack) => {
-                for frame in m.net_take_output() {
-                    stack.input(&frame);
-                }
-                if let Some(proxy) = SYS_PROXY.as_mut() {
-                    proxy.pump(stack, &mut SYS_EGRESS);
-                } else if SYS_WISP {
-                    pump_wisp(stack);
-                }
-                for frame in stack.take_output() {
-                    m.net_input(&frame);
-                }
-            }
-            None => {
-                for frame in m.net_take_output() {
-                    emit_host_net(&frame);
-                }
-            }
-        }
-    }
-}
-
-/// Send keyboard bytes (staged via staging_alloc) to the guest console.
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_console_input() {
-    let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
-    unsafe {
-        let bytes = core::mem::take(&mut STAGING);
-        m.console_input(&bytes);
-    }
 }
 
 /// Nested chain-transfer depth (see chain_next) and its bound: each hop
@@ -4625,17 +3550,16 @@ pub extern "C" fn chain_next(context: i32) {
 
 /// Region-function modules issued but not yet landed. The host's run loop
 /// should yield to its event loop when this is nonzero: module compilation
-/// resolves on the microtask queue, and a loop that never yields leaves
-/// finished code waiting tens of millions of instructions (v86's runner is
-/// event-driven per slice, so its codegen lands immediately — symmetric
-/// scheduling requires giving our compiles the same chance).
+/// resolves on the microtask queue. A loop that never yields leaves finished
+/// code waiting tens of millions of instructions, so the host must return at
+/// each execution slice.
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn sys_pending_builds() -> u32 {
     unsafe { PENDING_JIT.len() as u32 }
 }
 
-/// Async superblock completion (called by JS between runSystem calls, never
+/// Async JIT completion (called by JS between `virt_run` calls, never
 /// during wasm execution). Validates that the machine, the code page, and
 /// the va→pa mapping are still the ones the compile was issued against
 /// before repointing the page's entries at the new function.
@@ -4643,20 +3567,9 @@ pub extern "C" fn sys_pending_builds() -> u32 {
 #[allow(static_mut_refs)]
 pub extern "C" fn sys_jit_ready(ticket: u64, base: i32, slot_count: u32) {
     unsafe {
-        match ACTIVE_FULL_SYSTEM {
-            FullSystemKind::Legacy => {
-                if let Some(machine) = SYS.as_mut() {
-                    complete_jit(machine, ticket, base, slot_count);
-                    return;
-                }
-            }
-            FullSystemKind::Virt => {
-                if let Some(machine) = VIRT.as_mut() {
-                    complete_jit(machine, ticket, base, slot_count);
-                    return;
-                }
-            }
-            FullSystemKind::None => {}
+        if let Some(machine) = VIRT.as_mut() {
+            complete_jit(machine, ticket, base, slot_count);
+            return;
         }
         for offset in 0..slot_count {
             let idx = base.checked_add(offset as i32).unwrap_or(-1);
@@ -4989,15 +3902,9 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
         let Some(jit) = SYS_JIT.as_ref() else {
             return u64::MAX;
         };
-        match ACTIVE_FULL_SYSTEM {
-            FullSystemKind::Legacy => SYS.as_mut().map_or(u64::MAX, |machine| {
-                analyze_superblock(machine, jit, vpage, which)
-            }),
-            FullSystemKind::Virt => VIRT.as_mut().map_or(u64::MAX, |machine| {
-                analyze_superblock(machine, jit, vpage, which)
-            }),
-            FullSystemKind::None => u64::MAX,
-        }
+        VIRT.as_mut().map_or(u64::MAX, |machine| {
+            analyze_superblock(machine, jit, vpage, which)
+        })
     }
 }
 
@@ -5051,15 +3958,9 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
         let Some(jit) = SYS_JIT.as_ref() else {
             return u64::MAX;
         };
-        match ACTIVE_FULL_SYSTEM {
-            FullSystemKind::Legacy => SYS.as_mut().map_or(u64::MAX, |machine| {
-                analyze_superblock_pc(machine, jit, pc, which)
-            }),
-            FullSystemKind::Virt => VIRT.as_mut().map_or(u64::MAX, |machine| {
-                analyze_superblock_pc(machine, jit, pc, which)
-            }),
-            FullSystemKind::None => u64::MAX,
-        }
+        VIRT.as_mut().map_or(u64::MAX, |machine| {
+            analyze_superblock_pc(machine, jit, pc, which)
+        })
     }
 }
 
@@ -5108,15 +4009,9 @@ pub extern "C" fn sb_debug(vpage: u64) -> u64 {
         let Some(jit) = SYS_JIT.as_ref() else {
             return 0;
         };
-        let aspace = match ACTIVE_FULL_SYSTEM {
-            FullSystemKind::Legacy => SYS
-                .as_ref()
-                .map(|machine| machine.cpu.sys.as_ref().map_or(0, |cpu| cpu.satp)),
-            FullSystemKind::Virt => VIRT
-                .as_ref()
-                .map(|machine| machine.cpu.sys.as_ref().map_or(0, |cpu| cpu.satp)),
-            FullSystemKind::None => None,
-        };
+        let aspace = VIRT
+            .as_ref()
+            .map(|machine| machine.cpu.sys.as_ref().map_or(0, |cpu| cpu.satp));
         let Some(aspace) = aspace else { return 0 };
         let mut v = 0u64;
         if jit.superblocked.contains(&(aspace, vpage)) {
@@ -5402,42 +4297,9 @@ pub extern "C" fn jit_tlb_fill(context: i32, va: u64, store: u32) -> i64 {
     }
 }
 
-/// Current guest pc (diagnostic: host-side pc sampling for guest profiling).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_pc() -> u64 {
-    unsafe { SYS.as_ref().map_or(0, |m| m.cpu.pc) }
-}
-
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn sys_insn_count() -> u64 {
-    unsafe { SYS.as_ref().map(|m| m.cpu.insn_count).unwrap_or(0) }
-}
-
-// ---- JIT API (phase 6, v1) -------------------------------------------------
+// ---- Generated JIT module transfer -----------------------------------------
 
 static mut JIT_OUT: Vec<u8> = Vec::new();
-
-/// Translate a basic block: guest code bytes staged via staging_alloc,
-/// `base` = guest address of the staged bytes, `pc` = block entry.
-/// Returns number of guest instructions translated (0 = not translatable).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn jit_translate(base: u64, pc: u64) -> u32 {
-    unsafe {
-        match rv64_jit::translate_block(&STAGING, base, pc, rv64_jit::JitLayout::bare()) {
-            Some(b) => {
-                JIT_OUT = b.wasm;
-                b.n_insns
-            }
-            None => {
-                JIT_OUT.clear();
-                0
-            }
-        }
-    }
-}
 
 #[no_mangle]
 #[allow(static_mut_refs)]

@@ -1,18 +1,7 @@
-// rv64.js — browser/Node loader for the rv64-wasm module.
+// Lish browser runtime for the rv64-wasm module.
 //
-// v86-style: talks to plain extern "C" exports over wasm linear memory.
+// The runtime talks to plain extern "C" exports over Wasm linear memory.
 // No bundler, no wasm-bindgen glue; works as an ES module in browsers and Node.
-
-export const Stop = Object.freeze({
-  /** Resume execution: fuel ended or host events were delivered. */
-  YIELD: 0,
-  /** Backward-compatible name for YIELD. */
-  BUDGET: 0,
-  ECALL: 1,
-  BREAK: 2,
-  TRAP: 3,
-  EXITED: 4,
-});
 
 const DEFAULT_JIT_LIMITS = Object.freeze({
   maxModules: 32_768,
@@ -38,9 +27,6 @@ function asyncJitCompilerCount(value) {
 // events before the public run method returns. All other Wasm entries use the
 // microtask fallback so a host import never calls application code reentrantly.
 const SYNCHRONOUS_HOST_DRAIN_EXPORTS = new Set([
-  "user_run",
-  "run",
-  "sys_run",
   "virt_run",
 ]);
 
@@ -439,7 +425,7 @@ export class JitCodeStore {
   }
 }
 
-// Low-level bindings used by rv64.js itself and the repository's architecture
+// Low-level bindings used by Lish and the repository's architecture
 // and differential tests. This is intentionally not the supported embedding
 // API; applications should use RV64 below.
 export class RV64Debug {
@@ -487,19 +473,6 @@ export class RV64Debug {
     };
     /** Called with each Ethernet frame the guest sends; set by connectNet. */
     this.onNetSend = () => {};
-    /** Optional request-level WebSocket fallback configured by connectHttpRelay. */
-    this.httpRelay = null;
-    this.onWispOpen = () => {};
-    this.onWispData = () => {};
-    this.onWispClose = () => {};
-    this.onWispDatagram = () => {};
-    /** Request/response byte and error diagnostics for the stable API. */
-    this.onNetworkTraffic = () => {};
-    /** Optional async external virtio-9P handler: request => reply bytes. */
-    this.onP9Request = null;
-    this.p9Pending = false;
-    /** Origins known to require the relay, avoiding a failed fetch every time. */
-    this.httpRelayOrigins = new Set();
     this.jitRetirementFlushScheduled = false;
   }
 
@@ -788,80 +761,12 @@ export class RV64Debug {
           const frame = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len).slice();
           vm.#deferHostCall(vm.onNetSend, vm, [frame]);
         },
-        // HTTP egress for the guest's in-process proxy. Performed with fetch(),
-        // the browser's only egress primitive — and the reason the proxy design
-        // reaches the network with no external infrastructure. An embedder can
-        // intercept instead by setting `onHttpRequest`.
-        host_http_request: (id, ptr, len) => {
-          const bytes = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len).slice();
-          if (vm.onHttpRequest) {
-            vm.#deferHostCall(vm.onHttpRequest, vm, [id, bytes]);
-          } else {
-            vm.#deferHostCall(vm.performHttp, vm, [id, decodeRequest(bytes), bytes]);
-          }
-        },
-        host_wisp_open: (id, ptr, port) => {
-          const address = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, 4).slice();
-          vm.#deferHostCall(vm.onWispOpen, vm, [id, address, port]);
-        },
-        host_wisp_data: (id, ptr, len) => {
-          const bytes = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len).slice();
-          vm.#deferHostCall(vm.onWispData, vm, [id, bytes]);
-        },
-        host_wisp_close: (id) => vm.#deferHostCall(vm.onWispClose, vm, [id]),
-        host_wisp_datagram: (id, addressPtr, port, dataPtr, len) => {
-          const memory = vm.#wasmExports.memory.buffer;
-          const address = new Uint8Array(memory, addressPtr, 4).slice();
-          const bytes = new Uint8Array(memory, dataPtr, len).slice();
-          vm.#deferHostCall(vm.onWispDatagram, vm, [id, address, port, bytes]);
-        },
         host_now_ms: () =>
           typeof performance !== "undefined" ? performance.now() : Date.now(),
         host_unix_ms: () => Date.now(),
-        host_random: (ptr, len) => {
-          const buf = new Uint8Array(vm.#wasmExports.memory.buffer, ptr, len);
-          if (!globalThis.crypto?.getRandomValues) {
-            throw new Error("cryptographic randomness is unavailable");
-          }
-          // Web Crypto caps one getRandomValues call at 65536 bytes.
-          for (let off = 0; off < len; off += 65536) {
-            crypto.getRandomValues(buf.subarray(off, Math.min(off + 65536, len)));
-          }
-        },
         host_jit_retire: (idx, reason) => {
           vm.jitCodeStore.retire(idx, reason);
           vm.scheduleJitRetirementFlush();
-        },
-        // JIT: instantiate the module the core just emitted (JIT_OUT),
-        // register its `run` function in the core's function table, and
-        // return the table index for call_indirect dispatch.
-        host_jit_register: () => {
-          try {
-            const t0 = performance.now();
-            const bytes = new Uint8Array(
-              vm.#wasmExports.memory.buffer,
-              vm.#wasmExports.jit_out_ptr(),
-              vm.#wasmExports.jit_out_len(),
-            ).slice();
-            vm.jitRegCount = (vm.jitRegCount ?? 0) + 1;
-            vm.jitRegBytes = (vm.jitRegBytes ?? 0) + bytes.length;
-            if (!vm.jitCodeStore.canRegister(1, bytes.length)) {
-              vm.jitCodeStore.capacityRejects++;
-              return -2;
-            }
-            const mod = new WebAssembly.Module(bytes);
-            vm.jitRegMs = (vm.jitRegMs ?? 0) + (performance.now() - t0);
-            // tlb_fill passes the block's explicit execution context back to
-            // the core. The page-table walk stays wasm-to-wasm with no JS frame.
-            const inst = new WebAssembly.Instance(mod, vm.#jitModuleImports());
-            const idx = vm.jitCodeStore.register(inst, ["run"], bytes.length);
-            vm.jitRegTotalMs = (vm.jitRegTotalMs ?? 0) + (performance.now() - t0);
-            vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
-            return idx;
-          } catch (e) {
-            console.warn("jit register failed:", e);
-            return -1;
-          }
         },
         // All full-system modules use this path. WebAssembly.compile can run
         // outside the guest slice; the reservation keeps every batch's table
@@ -1012,419 +917,11 @@ export class RV64Debug {
     this.#pumpAsyncJit();
   }
 
-  // ---- user-mode Linux API ----
-
-  /** Copy bytes into the wasm staging buffer. */
-  #stage(bytes) {
-    const ptr = this.ex.staging_alloc(bytes.length);
-    new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
-  }
-
-  /**
-   * Load a static riscv64 Linux ELF (Uint8Array) with the given argv.
-   * @returns {boolean} success
-   */
-  loadElf(elfBytes, argv = ["guest"], memMB = 256) {
-    const enc = new TextEncoder();
-    for (const arg of argv) {
-      this.#stage(enc.encode(arg));
-      this.ex.user_arg_push();
-    }
-    this.#stage(elfBytes);
-    const loaded = this.ex.user_load(memMB << 20) === 0;
-    this.flushJitRetirements();
-    return loaded;
-  }
-
-  /** Run the loaded program; resume after Stop.YIELD (EXITED when done). */
-  runUser(budget = 10_000_000_000n) {
-    return this.ex.user_run(BigInt(budget));
-  }
-
-  userExitCode() {
-    return this.ex.user_exit_code();
-  }
-  userInsnCount() {
-    return this.ex.user_insn_count();
-  }
-  userPc() {
-    return this.ex.user_pc();
-  }
-
-  /** Allocate guest RAM at guest address `base` and reset the CPU (pc = base). */
-  init(base, size) {
-    this.ex.init(BigInt(base), size);
-  }
-
-  /** Guest RAM as a Uint8Array view into wasm linear memory.
-   *  NOTE: invalidated if wasm memory grows — take a fresh view per use. */
-  ram() {
-    return new Uint8Array(
-      this.ex.memory.buffer,
-      this.ex.mem_ptr(),
-      this.ex.mem_size(),
-    );
-  }
-
-  /** Copy a program (Uint8Array) into guest RAM at guest address `addr`. */
-  load(addr, bytes) {
-    const base = Number(this.ex.get_pc()); // pc === base right after init
-    this.ram().set(bytes, addr - base);
-  }
-
-  /** Run up to `budget` instructions; returns a Stop.* code. */
-  run(budget = 1_000_000n) {
-    return this.ex.run(BigInt(budget));
-  }
-
-  get pc() {
-    return this.ex.get_pc();
-  }
-  set pc(v) {
-    this.ex.set_pc(BigInt(v));
-  }
-
-  reg(i) {
-    return this.ex.get_reg(i);
-  }
-  setReg(i, v) {
-    this.ex.set_reg(i, BigInt(v));
-  }
-
-  trapCause() {
-    return this.ex.trap_cause();
-  }
-  insnCount() {
-    return this.ex.insn_count();
-  }
-
-  /** Dump architectural state (for debugging / differential testing). */
-  state() {
-    const x = [];
-    for (let i = 0; i < 32; i++) x.push(this.reg(i));
-    return { pc: this.pc, x };
-  }
 }
 
-// ---- full-system (boot Linux) API — appended to class via prototype ----
-
-/**
- * Boot Linux.
- *
- * `fsTar`/`fsTag` export a tar archive as a virtio-9p filesystem the guest can
- * mount (`mount -t 9p -o trans=virtio,version=9p2000.L <fsTag> /mnt`); there is
- * no host filesystem in a browser, so the export is an in-memory tree.
- * `net: true` adds a NIC — call `connectNet(url)` to give its frames somewhere
- * to go.
- */
-RV64Debug.prototype.bootLinux = function ({
-  bios,
-  kernel,
-  disk,
-  cmdline,
-  ramMB = 128,
-  fsTar,
-  fsTag,
-  net = false,
-  netMac,
-  proxy = false,
-  proxyUpgradeHttps = true,
-}) {
-  if (proxy && fsTar && (fsTag || "host") === "rv64-proxy") {
-    throw new Error("fsTag 'rv64-proxy' is reserved for the proxy CA");
-  }
-  const stage = (bytes, fn) => {
-    if (!bytes) return;
-    const ptr = this.ex.staging_alloc(bytes.length);
-    new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
-    fn();
-  };
-  stage(bios, () => this.ex.sys_stage_bios());
-  stage(kernel, () => this.ex.sys_stage_kernel());
-  stage(disk, () => this.ex.sys_stage_disk());
-  if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.sys_stage_cmdline());
-  stage(fsTar, () => this.ex.sys_stage_fs_tar());
-  if (fsTag) stage(new TextEncoder().encode(fsTag), () => this.ex.sys_stage_fs_tag());
-  if (netMac) stage(new Uint8Array(netMac), () => this.ex.sys_stage_net_mac());
-  this.ex.sys_net_enable(net ? 1 : 0);
-  // The proxy implies a NIC: the guest reaches it over ordinary TCP.
-  if (proxy) this.ex.sys_proxy_enable(1, proxyUpgradeHttps ? 1 : 0);
-  this.jitCodeStore.generation++;
-  this.ex.sys_boot(ramMB);
-  this.flushJitRetirements();
-};
-
-/**
- * Attach the guest's NIC to a WebSocket relay: one binary message per Ethernet
- * frame (websockproxy / v86's protocol). Returns the socket.
- *
- * The relay is what makes guest networking possible without privileges — it
- * holds them and does the NAT, so the emulator stays a pure layer-2 device.
- */
-RV64Debug.prototype.connectNet = function (url) {
-  const ws = new WebSocket(url);
-  ws.binaryType = "arraybuffer";
-  // Frames sent before the socket opens would throw; drop them the way a NIC
-  // drops frames on a down link.
-  this.onNetSend = (frame) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(frame);
-  };
-  ws.onmessage = (ev) => {
-    if (typeof ev.data === "string") return; // not our protocol
-    this.netInput(new Uint8Array(ev.data));
-  };
-  this.net = ws;
-  return ws;
-};
-
-/** Deliver one inbound Ethernet frame to the guest's NIC. */
-RV64Debug.prototype.netInput = function (frame) {
-  const ptr = this.ex.staging_alloc(frame.length);
-  new Uint8Array(this.ex.memory.buffer, ptr, frame.length).set(frame);
-  this.ex.sys_net_input();
-};
-
-// ---- request-level WebSocket relay ---------------------------------------
-//
-// This is deliberately separate from connectNet's Ethernet-frame relay. Once
-// the in-process proxy has terminated a guest connection, its parsed HTTP
-// request cannot be handed to a layer-2 websockproxy socket. The protocol here
-// preserves the request-shaped boundary and lets a small host relay perform
-// requests that browser fetch() cannot read because of CORS.
-
-const HTTP_RELAY_MAGIC = [0x52, 0x48, 0x52, 0x31]; // "RHR1"
-const HTTP_RELAY_REQUEST = 1;
-const HTTP_RELAY_HEAD = 2;
-const HTTP_RELAY_BODY = 3;
-const HTTP_RELAY_END = 4;
-const HTTP_RELAY_ERROR = 5;
-const HTTP_RELAY_SAFE_FALLBACK = new Set(["GET", "HEAD"]);
-
-function httpRelayFrame(type, id, payload = new Uint8Array()) {
-  const body =
-    payload instanceof Uint8Array
-      ? payload
-      : new Uint8Array(payload.buffer ?? payload);
-  const out = new Uint8Array(16 + body.length);
-  out.set(HTTP_RELAY_MAGIC, 0);
-  out[4] = type;
-  new DataView(out.buffer).setBigUint64(8, BigInt(id), true);
-  out.set(body, 16);
-  return out;
-}
-
-function decodeHttpRelayFrame(bytes) {
-  if (
-    bytes.length < 16 ||
-    HTTP_RELAY_MAGIC.some((byte, index) => bytes[index] !== byte)
-  ) {
-    throw new Error("malformed HTTP relay frame");
-  }
-  return {
-    type: bytes[4],
-    id: new DataView(
-      bytes.buffer,
-      bytes.byteOffset,
-      bytes.byteLength,
-    ).getBigUint64(8, true),
-    payload: bytes.subarray(16),
-  };
-}
-
-function requestOrigin(url) {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return "";
-  }
-}
-
-/**
- * Attach an optional request-level WebSocket relay used when fetch() is
- * rejected before a response head (normally CORS or mixed-content policy).
- *
- * Automatic retry is limited to GET/HEAD because a rejected fetch may still
- * have delivered a non-idempotent request. Once a safe request proves an
- * origin needs the relay, later requests to that origin route there directly.
- * Call routeHttpViaRelay(origin) to opt an origin in before its first request.
- */
-RV64Debug.prototype.connectHttpRelay = function (url, options = {}) {
-  const WebSocketImpl = options.WebSocket ?? globalThis.WebSocket;
-  if (!WebSocketImpl) throw new Error("WebSocket is unavailable");
-  this.disconnectHttpRelay();
-
-  const ws = new WebSocketImpl(url);
-  ws.binaryType = "arraybuffer";
-  const pending = new Set();
-  let opened = false;
-  let resolveReady;
-  let rejectReady;
-  const ready = new Promise((resolve, reject) => {
-    resolveReady = resolve;
-    rejectReady = reject;
-  });
-  // performHttp awaits this, but suppress an unhandled rejection when an
-  // embedder connects a relay before it has any proxy traffic.
-  ready.catch(() => {});
-
-  const relay = {
-    ws,
-    pending,
-    ready,
-    receive: Promise.resolve(),
-  };
-  this.httpRelay = relay;
-  for (const origin of options.origins ?? []) {
-    this.routeHttpViaRelay(origin);
-  }
-
-  const timeout = setTimeout(() => {
-    if (!opened) {
-      rejectReady(new Error(`HTTP relay connection timed out: ${url}`));
-      try {
-        ws.close();
-      } catch {
-        // A custom WebSocket implementation may already be closed.
-      }
-    }
-  }, options.timeoutMs ?? 10_000);
-
-  const failPending = (reason) => {
-    for (const id of pending) {
-      this.stageFor(new TextEncoder().encode(reason));
-      this.ex.sys_http_fail(id);
-    }
-    pending.clear();
-  };
-  ws.onopen = () => {
-    opened = true;
-    clearTimeout(timeout);
-    resolveReady(ws);
-  };
-  ws.onerror = () => {
-    if (!opened) {
-      clearTimeout(timeout);
-      rejectReady(new Error(`HTTP relay connection failed: ${url}`));
-    }
-  };
-  ws.onclose = () => {
-    clearTimeout(timeout);
-    if (!opened) rejectReady(new Error(`HTTP relay closed before opening: ${url}`));
-    failPending("HTTP relay connection closed");
-    if (this.httpRelay === relay) this.httpRelay = null;
-  };
-  ws.onmessage = (event) => {
-    // Preserve WebSocket message order even when a browser supplies Blob data.
-    relay.receive = relay.receive
-      .then(async () => {
-        const data =
-          typeof Blob !== "undefined" && event.data instanceof Blob
-            ? await event.data.arrayBuffer()
-            : event.data;
-        const message = decodeHttpRelayFrame(
-          data instanceof Uint8Array ? data : new Uint8Array(data),
-        );
-        if (!pending.has(message.id)) return;
-        switch (message.type) {
-          case HTTP_RELAY_HEAD:
-            this.onNetworkTraffic?.({
-              type: "response",
-              status: new DataView(
-                message.payload.buffer,
-                message.payload.byteOffset,
-                message.payload.byteLength,
-              ).getUint32(0, true),
-            });
-            this.stageFor(message.payload);
-            this.ex.sys_http_head(message.id);
-            break;
-          case HTTP_RELAY_BODY:
-            this.onNetworkTraffic?.({
-              type: "download",
-              bytes: message.payload.length,
-            });
-            this.stageFor(message.payload);
-            this.ex.sys_http_body(message.id);
-            break;
-          case HTTP_RELAY_END:
-            pending.delete(message.id);
-            this.onNetworkTraffic?.({ type: "end" });
-            this.ex.sys_http_end(message.id);
-            break;
-          case HTTP_RELAY_ERROR:
-            pending.delete(message.id);
-            this.onNetworkTraffic?.({
-              type: "error",
-              message: new TextDecoder().decode(message.payload),
-            });
-            this.stageFor(message.payload);
-            this.ex.sys_http_fail(message.id);
-            break;
-          default:
-            throw new Error(`unknown HTTP relay message type ${message.type}`);
-        }
-      })
-      .catch((error) => {
-        failPending(`HTTP relay protocol error: ${error.message}`);
-        try {
-          ws.close(1002, "protocol error");
-        } catch {
-          // Already closed.
-        }
-      });
-  };
-  return ws;
-};
-
-RV64Debug.prototype.disconnectHttpRelay = function () {
-  const relay = this.httpRelay;
-  this.httpRelay = null;
-  if (relay) {
-    try {
-      relay.ws.close();
-    } catch {
-      // Already closed.
-    }
-  }
-};
-
-/** Route an origin directly through the request relay, or remove that choice. */
-RV64Debug.prototype.routeHttpViaRelay = function (origin, enabled = true) {
-  const normalized = requestOrigin(origin) || origin.replace(/\/+$/, "");
-  if (enabled) this.httpRelayOrigins.add(normalized);
-  else this.httpRelayOrigins.delete(normalized);
-};
-
-RV64Debug.prototype.performHttpViaRelay = async function (id, encodedRequest) {
-  const relay = this.httpRelay;
-  if (!relay) throw new Error("HTTP relay is not connected");
-  await relay.ready;
-  if (relay.ws.readyState !== 1) throw new Error("HTTP relay is not open");
-  relay.pending.add(BigInt(id));
-  try {
-    relay.ws.send(httpRelayFrame(HTTP_RELAY_REQUEST, id, encodedRequest));
-  } catch (error) {
-    relay.pending.delete(BigInt(id));
-    throw error;
-  }
-};
+// ---- full-system API ------------------------------------------------------
 
 /** Run a slice of the booted system. Returns true when powered off. */
-RV64Debug.prototype.runSystem = function (maxInsns = 10_000_000n) {
-  return this.ex.sys_run(BigInt(maxInsns)) === 1;
-};
-
-/** Send keyboard input to the guest console. */
-RV64Debug.prototype.consoleInput = function (bytes) {
-  const ptr = this.ex.staging_alloc(bytes.length);
-  new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
-  this.ex.sys_console_input();
-};
-
-RV64Debug.prototype.sysInsnCount = function () {
-  return this.ex.sys_insn_count();
-};
-
 /** Boot the modern OpenSBI/Linux virt machine. */
 RV64Debug.prototype.bootVirtLinux = function ({
   opensbi,
@@ -1435,10 +932,6 @@ RV64Debug.prototype.bootVirtLinux = function ({
   ramMB = 512,
   net = false,
   netMac,
-  proxy = false,
-  proxyUpgradeHttps = true,
-  p9,
-  virtioConsole = false,
 }) {
   const stage = (bytes, fn) => {
     if (!bytes) return;
@@ -1452,11 +945,7 @@ RV64Debug.prototype.bootVirtLinux = function ({
   stage(disk, () => this.ex.virt_stage_disk());
   if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
   if (netMac) stage(new Uint8Array(netMac), () => this.ex.virt_stage_net_mac());
-  if (p9?.tag) stage(new TextEncoder().encode(p9.tag), () => this.ex.virt_stage_fs_external_tag());
-  this.onP9Request = p9?.handle ?? null;
-  this.ex.virt_console_enable(virtioConsole ? 1 : 0);
-  this.ex.virt_net_enable(net || proxy ? 1 : 0);
-  this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
+  this.ex.virt_net_enable(net ? 1 : 0);
   this.jitCodeStore.generation++;
   this.ex.virt_boot(ramMB);
   this.flushJitRetirements();
@@ -1471,10 +960,6 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
   ramMB = 512,
   net = false,
   netMac,
-  proxy = false,
-  proxyUpgradeHttps = true,
-  p9,
-  virtioConsole = false,
 }) {
   const stage = (bytes, fn) => {
     if (!bytes) return;
@@ -1487,11 +972,7 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
   stage(disk, () => this.ex.virt_stage_disk());
   if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
   if (netMac) stage(new Uint8Array(netMac), () => this.ex.virt_stage_net_mac());
-  if (p9?.tag) stage(new TextEncoder().encode(p9.tag), () => this.ex.virt_stage_fs_external_tag());
-  this.onP9Request = p9?.handle ?? null;
-  this.ex.virt_console_enable(virtioConsole ? 1 : 0);
-  this.ex.virt_net_enable(net || proxy ? 1 : 0);
-  this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
+  this.ex.virt_net_enable(net ? 1 : 0);
   this.jitCodeStore.generation++;
   this.ex.virt_boot_direct(ramMB);
   this.flushJitRetirements();
@@ -1499,41 +980,7 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
 
 /** Run a slice of the modern virt machine. Returns true when powered off. */
 RV64Debug.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
-  const stopped = this.ex.virt_run(BigInt(maxInsns)) === 1;
-  this.pumpP9();
-  return stopped;
-};
-
-RV64Debug.prototype.pumpP9 = function () {
-  if (!this.onP9Request || this.p9Pending) return;
-  const len = this.ex.virt_p9_take_request();
-  if (!len) return;
-  const request = new Uint8Array(this.ex.memory.buffer, this.ex.staging_ptr(), len).slice();
-  this.p9Pending = true;
-  Promise.resolve()
-    .then(() => this.onP9Request(request))
-    .then((reply) => {
-      if (!(reply instanceof Uint8Array)) reply = new Uint8Array(reply);
-      if (reply.length < 7) throw new Error("external 9P handler returned an invalid reply");
-      const ptr = this.ex.staging_alloc(reply.length);
-      new Uint8Array(this.ex.memory.buffer, ptr, reply.length).set(reply);
-      if (this.ex.virt_p9_reply() !== 1) throw new Error("unexpected external 9P reply");
-    })
-    .catch((error) => {
-      console.error("external 9P request failed", error);
-      // Rlerror(size=11, type=7, original tag, errno=EIO) keeps the guest
-      // queue moving even when the host handler rejects.
-      const reply = new Uint8Array(11);
-      new DataView(reply.buffer).setUint32(0, 11, true);
-      reply[4] = 7;
-      reply[5] = request[5];
-      reply[6] = request[6];
-      new DataView(reply.buffer).setUint32(7, 5, true);
-      const ptr = this.ex.staging_alloc(reply.length);
-      new Uint8Array(this.ex.memory.buffer, ptr, reply.length).set(reply);
-      this.ex.virt_p9_reply();
-    })
-    .finally(() => { this.p9Pending = false; });
+  return this.ex.virt_run(BigInt(maxInsns)) === 1;
 };
 
 /** Send keyboard input to the modern machine's 8250 UART. */
@@ -1543,34 +990,10 @@ RV64Debug.prototype.virtConsoleInput = function (bytes) {
   this.ex.virt_console_input();
 };
 
-RV64Debug.prototype.virtExportInput = function (bytes) {
-  const ptr = this.ex.staging_alloc(bytes.length);
-  new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
-  this.ex.virt_export_input();
-};
-
 RV64Debug.prototype.virtNetInput = function (frame) {
   const ptr = this.ex.staging_alloc(frame.length);
   new Uint8Array(this.ex.memory.buffer, ptr, frame.length).set(frame);
   this.ex.virt_net_input();
-};
-
-RV64Debug.prototype.wispEnable = function (enabled) {
-  this.ex.sys_wisp_enable(enabled ? 1 : 0);
-};
-
-RV64Debug.prototype.wispData = function (id, bytes) {
-  this.stageFor(bytes);
-  this.ex.sys_wisp_data(BigInt(id));
-};
-
-RV64Debug.prototype.wispClose = function (id) {
-  this.ex.sys_wisp_close(BigInt(id));
-};
-
-RV64Debug.prototype.wispDatagram = function (id, bytes) {
-  this.stageFor(bytes);
-  this.ex.sys_wisp_datagram(BigInt(id));
 };
 
 RV64Debug.prototype.virtInsnCount = function () {
@@ -1590,180 +1013,9 @@ RV64Debug.prototype.virtPc = function () {
   return this.ex.virt_pc();
 };
 
-// ---- in-process HTTP proxy ------------------------------------------------
-//
-// The guest points http_proxy at the emulated network's gateway and speaks
-// ordinary HTTP to it; the Rust side terminates TCP and parses the request, and
-// this performs it with fetch(). Nothing external is involved.
-//
-// Reachability is bounded by CORS unless connectHttpRelay() has attached the
-// optional request relay. fetch remains the zero-infrastructure fast path.
-
-/** The http_proxy URL to set in the guest, or "" when the proxy is off. */
-RV64Debug.prototype.proxyURL = function () {
-  const len = this.ex.sys_proxy_url();
-  if (!len) return "";
-  // staging_ptr, not staging_alloc: the latter is the write path and clears the
-  // buffer, which would wipe the value we are trying to read.
-  return new TextDecoder().decode(
-    new Uint8Array(this.ex.memory.buffer, this.ex.staging_ptr(), len),
-  );
-};
-
-/** Headers fetch() refuses to let a page set; forwarding them throws or is ignored. */
-const FORBIDDEN_HEADERS = new Set([
-  "host", "content-length", "connection", "keep-alive", "transfer-encoding",
-  "upgrade", "te", "trailer", "expect", "date", "origin", "referer", "via",
-  "cookie", "cookie2", "accept-charset", "accept-encoding", "dnt",
-  // Not CORS-safelisted: forwarding the guest's User-Agent would force a
-  // preflight on every otherwise-simple request, so drop it and let the browser
-  // send its own.
-  "user-agent",
-]);
-
-/** Perform one guest request, streaming the response back as it arrives. */
-RV64Debug.prototype.performHttp = async function (id, req, encodedRequest) {
-  const origin = requestOrigin(req.url);
-  this.onNetworkTraffic?.({
-    type: "request",
-    bytes: encodedRequest?.length ?? req.body.length,
-    method: req.method,
-    url: req.url,
-  });
-  if (
-    encodedRequest &&
-    this.httpRelay &&
-    this.httpRelayOrigins.has(origin)
-  ) {
-    try {
-      await this.performHttpViaRelay(id, encodedRequest);
-    } catch (error) {
-      this.stageFor(new TextEncoder().encode(String(error?.message ?? error)));
-      this.ex.sys_http_fail(BigInt(id));
-    }
-    return;
-  }
-
-  let headSent = false;
-  try {
-    const headers = {};
-    for (const [name, value] of req.headers) {
-      if (!FORBIDDEN_HEADERS.has(name.toLowerCase())) headers[name] = value;
-    }
-    const init = { method: req.method, headers, redirect: "follow" };
-    if (req.body.length) init.body = req.body;
-    const resp = await fetch(req.url, init);
-
-    this.onNetworkTraffic?.({ type: "response", status: resp.status, url: req.url });
-    this.stageFor(encodeHead(resp.status, [...resp.headers]));
-    this.ex.sys_http_head(BigInt(id));
-    headSent = true;
-
-    // Stream rather than await the whole body: an SSE response or a long
-    // download must reach the guest as it arrives, and nothing is buffered
-    // whole on the way past.
-    const reader = resp.body?.getReader();
-    if (reader) {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value?.length) {
-          this.onNetworkTraffic?.({ type: "download", bytes: value.length });
-          this.stageFor(value);
-          this.ex.sys_http_body(BigInt(id));
-        }
-      }
-    }
-    this.ex.sys_http_end(BigInt(id));
-    this.onNetworkTraffic?.({ type: "end", url: req.url });
-  } catch (e) {
-    // A CORS rejection occurs before fetch exposes a response head. GET and
-    // HEAD are safe to retry; retrying POST could duplicate a request that the
-    // origin received even though the browser hid its response.
-    if (
-      !headSent &&
-      encodedRequest &&
-      this.httpRelay &&
-      HTTP_RELAY_SAFE_FALLBACK.has(req.method.toUpperCase())
-    ) {
-      try {
-        if (origin) this.httpRelayOrigins.add(origin);
-        await this.performHttpViaRelay(id, encodedRequest);
-        return;
-      } catch (relayError) {
-        if (origin) this.httpRelayOrigins.delete(origin);
-        e = new Error(
-          `fetch failed (${String(e?.message ?? e)}); ` +
-            `HTTP relay failed (${String(relayError?.message ?? relayError)})`,
-        );
-      }
-    }
-    // The proxy turns this into a 502 the guest can read, rather than a silent
-    // hang. A CORS rejection lands here.
-    this.onNetworkTraffic?.({
-      type: "error",
-      message: String(e?.message ?? e),
-      url: req.url,
-    });
-    this.stageFor(new TextEncoder().encode(String(e?.message ?? e)));
-    this.ex.sys_http_fail(BigInt(id));
-  }
-};
-
-/** Copy bytes into the wasm staging buffer for the next sys_http_* call. */
-RV64Debug.prototype.stageFor = function (bytes) {
-  const ptr = this.ex.staging_alloc(bytes.length);
-  new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
-};
-
-/** Mirror of httpproxy::Request::encode. */
-function decodeRequest(bytes) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let p = 0;
-  const u32 = () => {
-    const v = dv.getUint32(p, true);
-    p += 4;
-    return v;
-  };
-  const buf = () => {
-    const n = u32();
-    const b = bytes.subarray(p, p + n);
-    p += n;
-    return b;
-  };
-  const str = () => new TextDecoder().decode(buf());
-  const method = str();
-  const url = str();
-  const n = u32();
-  const headers = [];
-  for (let i = 0; i < n; i++) headers.push([str(), str()]);
-  return { method, url, headers, body: buf() };
-}
-
-/** Mirror of httpproxy::decode_head. Bodies cross as raw bytes, unframed. */
-function encodeHead(status, headers) {
-  const enc = new TextEncoder();
-  const parts = [];
-  const u32 = (v) => {
-    const b = new Uint8Array(4);
-    new DataView(b.buffer).setUint32(0, v, true);
-    return b;
-  };
-  parts.push(u32(status), u32(headers.length));
-  for (const [name, value] of headers) {
-    const nb = enc.encode(name);
-    const vb = enc.encode(value);
-    parts.push(u32(nb.length), nb, u32(vb.length), vb);
-  }
-  const total = parts.reduce((n, b) => n + b.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const b of parts) {
-    out.set(b, off);
-    off += b.length;
-  }
-  return out;
-}
+// The browser runtime does not translate HTTP or expose a second transport.
+// Linux owns the complete network stack; the only browser boundary is the
+// Ethernet frame channel below.
 
 const PUBLIC_EVENTS = new Set([
   "ready",
@@ -1771,9 +1023,7 @@ const PUBLIC_EVENTS = new Set([
   "stop",
   "error",
   "console",
-  "export",
   "networkTransmit",
-  "networkTraffic",
   "downloadProgress",
 ]);
 
@@ -1834,147 +1084,6 @@ function hostYield(callback) {
     return;
   }
   return setTimeout(callback, 0);
-}
-
-function isOpenSBI(bytes) {
-  const needle = new TextEncoder().encode("OpenSBI");
-  outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
-    for (let j = 0; j < needle.length; j++) {
-      if (bytes[i + j] !== needle[j]) continue outer;
-    }
-    return true;
-  }
-  return false;
-}
-
-// WISP v1 transports stream payloads in binary WebSocket messages. The guest
-// side TCP state machine lives in Rust; this class is deliberately only the
-// WISP wire protocol and flow control.
-class WispClient {
-  constructor(url, protocols, core) {
-    this.core = core;
-    this.nextStream = 1;
-    this.credit = 0;
-    this.byGuest = new Map();
-    this.byStream = new Map();
-    this.queue = [];
-    const transportURL = url.replace(/^wisp:/, "ws:").replace(/^wisps:/, "wss:");
-    this.socket = new WebSocket(transportURL, protocols);
-    this.socket.binaryType = "arraybuffer";
-    this.socket.onopen = () => this.#flush();
-    this.socket.onmessage = ({ data }) => {
-      if (typeof data !== "string") this.#receive(new Uint8Array(data));
-    };
-    this.socket.onclose = () => {
-      for (const guest of this.byGuest.keys()) core.wispClose(guest);
-      this.byGuest.clear();
-      this.byStream.clear();
-    };
-  }
-
-  open(guest, address, port, transport = 1) {
-    const stream = this.nextStream++ >>> 0;
-    const host = Array.from(address).join(".");
-    const hostname = new TextEncoder().encode(host);
-    const packet = new Uint8Array(8 + hostname.length);
-    const view = new DataView(packet.buffer);
-    packet[0] = 1; // CONNECT
-    view.setUint32(1, stream, true);
-    packet[5] = transport;
-    view.setUint16(6, port, true);
-    packet.set(hostname, 8);
-    const state = { guest, stream, transport, credit: this.credit, pending: [] };
-    this.byGuest.set(guest, state);
-    this.byStream.set(stream, state);
-    this.#send(packet);
-  }
-
-  data(guest, bytes) {
-    const state = this.byGuest.get(guest);
-    if (!state) return;
-    const packet = new Uint8Array(5 + bytes.length);
-    packet[0] = 2; // DATA
-    new DataView(packet.buffer).setUint32(1, state.stream, true);
-    packet.set(bytes, 5);
-    if (state.credit > 0) {
-      state.credit--;
-      this.#send(packet);
-    } else {
-      state.pending.push(packet);
-    }
-  }
-
-  datagram(guest, address, port, bytes) {
-    if (!this.byGuest.has(guest)) this.open(guest, address, port, 2);
-    this.data(guest, bytes);
-  }
-
-  closeGuest(guest) {
-    const state = this.byGuest.get(guest);
-    if (!state) return;
-    const packet = new Uint8Array(6);
-    packet[0] = 4; // CLOSE
-    new DataView(packet.buffer).setUint32(1, state.stream, true);
-    packet[5] = 2; // voluntary closure
-    this.#send(packet);
-    this.#forget(state);
-  }
-
-  close() {
-    this.socket.onclose = null;
-    this.socket.close();
-    this.byGuest.clear();
-    this.byStream.clear();
-  }
-
-  #receive(packet) {
-    if (packet.length < 5) return;
-    const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
-    const type = packet[0];
-    const stream = view.getUint32(1, true);
-    const state = this.byStream.get(stream);
-    if (type === 2 && state) {
-      if (state.transport === 2) this.core.wispDatagram(state.guest, packet.subarray(5));
-      else this.core.wispData(state.guest, packet.subarray(5));
-    } else if (type === 3 && packet.length >= 9) {
-      if (stream === 0) {
-        this.credit = view.getUint32(5, true);
-        for (const connection of this.byStream.values()) {
-          if (connection.credit === 0) connection.credit = this.credit;
-          this.#drain(connection);
-        }
-        return;
-      }
-      if (!state) return;
-      state.credit = view.getUint32(5, true);
-      this.#drain(state);
-    } else if (type === 4 && state) {
-      this.core.wispClose(state.guest);
-      this.#forget(state);
-    }
-  }
-
-  #forget(state) {
-    this.byGuest.delete(state.guest);
-    this.byStream.delete(state.stream);
-  }
-
-  #drain(state) {
-    while (state.credit > 0 && state.pending.length) {
-      state.credit--;
-      this.#send(state.pending.shift());
-    }
-  }
-
-  #send(packet) {
-    if (this.socket.readyState === WebSocket.OPEN) this.socket.send(packet);
-    else this.queue.push(packet);
-  }
-
-  #flush() {
-    for (const packet of this.queue) this.socket.send(packet);
-    this.queue.length = 0;
-  }
 }
 
 const RAW_ETHERNET_MAX_FRAME_SIZE = 1_600;
@@ -2121,20 +1230,14 @@ class RawEthernetWebSocket {
   }
 }
 
-function normalizeNetwork(network, bootMode) {
+function normalizeNetwork(network) {
   const value = network ?? { mode: "none" };
   if (!value || typeof value !== "object") throw new TypeError("network must be an object");
-  if (!["none", "wsproxy", "wisp", "inbrowser", "external"].includes(value.mode)) {
+  if (!["none", "wsproxy", "external"].includes(value.mode)) {
     throw new TypeError(`unknown network mode: ${value.mode}`);
   }
-  if (bootMode === "bare-metal" && value.mode !== "none") {
-    throw new Error("bare-metal networking is not implemented");
-  }
-  if (["wsproxy", "wisp"].includes(value.mode) && typeof value.url !== "string") {
-    throw new TypeError(`${value.mode} networking requires url`);
-  }
-  if (value.mode === "inbrowser" && value.channel !== undefined && typeof value.channel !== "string") {
-    throw new TypeError("inbrowser network.channel must be a string");
+  if (value.mode === "wsproxy" && typeof value.url !== "string") {
+    throw new TypeError("wsproxy networking requires url");
   }
   if (value.mac !== undefined && (!(value.mac instanceof Uint8Array) || value.mac.length !== 6)) {
     throw new TypeError("network.mac must be a 6-byte Uint8Array");
@@ -2156,8 +1259,6 @@ export class RV64 {
   #networkConfig;
   #networkInput;
   #rawEthernet;
-  #networkChannel;
-  #wisp;
 
   constructor(core, boot, network, listeners) {
     this.#core = core;
@@ -2167,10 +1268,8 @@ export class RV64 {
       this.on(event, listener);
     }
     this.console = Object.freeze({ send: (data) => this.#sendConsole(data) });
-    this.export = Object.freeze({ send: (data) => this.#sendExport(data) });
     this.network = Object.freeze({
       mode: network.mode,
-      get proxyURL() { return undefined; },
       receive: (frame) => this.#receiveNetwork(frame),
     });
   }
@@ -2181,9 +1280,6 @@ export class RV64 {
       throw new TypeError("RV64.create expects an options object");
     }
     if (options.execution?.mode === "worker") {
-      if (options.boot?.p9) {
-        throw new TypeError("external 9P handlers require local execution mode");
-      }
       return RV64WorkerProxy.create(options);
     }
     if (options.execution?.mode !== undefined && options.execution.mode !== "local") {
@@ -2207,13 +1303,13 @@ export class RV64 {
 
     const wasmBytes = await imageBytes(wasm, "wasm", emit);
     const resolved = { ...boot };
-    for (const key of ["firmware", "kernel", "initrd", "disk", "image"]) {
+    for (const key of ["firmware", "kernel", "initrd", "disk"]) {
       const source = boot[key];
-      if (source !== undefined && source !== "default") {
+      if (source !== undefined) {
         resolved[key] = await imageBytes(source, key, emit);
       }
     }
-    const network = normalizeNetwork(options.network, boot.mode);
+    const network = normalizeNetwork(options.network);
     const core = await RV64Debug.create(wasmBytes, jit);
     const vm = new RV64(core, { ...resolved, memoryMB }, network, events);
     vm.#assemble();
@@ -2277,11 +1373,6 @@ export class RV64 {
     ++this.#generation;
     this.#rawEthernet?.close();
     this.#rawEthernet = null;
-    this.#networkChannel?.close();
-    this.#networkChannel = null;
-    this.#wisp?.close();
-    this.#wisp = null;
-    this.#core.disconnectHttpRelay();
     this.#core.destroyJit();
     this.#listeners.clear();
     this.#core = null;
@@ -2297,69 +1388,33 @@ export class RV64 {
       netMac: network.mac,
     };
     const modernCmdline = `${boot.cmdline ?? "console=ttyS0 root=/dev/vda rw"} rv64.network=${network.mode}`;
-    const legacyCmdline = `${boot.cmdline ?? "console=hvc0 root=/dev/vda rw"} rv64.network=${network.mode}`;
     if (boot.mode === "firmware") {
-      if (boot.firmware === "default") {
-        throw new Error("packaged default firmware is not available yet");
-      }
       if (!(boot.firmware instanceof Uint8Array)) {
-        throw new TypeError("firmware mode requires a firmware image");
+        throw new TypeError("firmware mode requires an OpenSBI image");
       }
-      if (isOpenSBI(boot.firmware)) {
-        this.#core.bootVirtLinux({
-          opensbi: boot.firmware,
-          kernel: boot.kernel,
-          initrd: boot.initrd,
-          disk: boot.disk,
-          cmdline: modernCmdline,
-          ramMB: memoryMB ?? 512,
-          ...networkOptions,
-        });
-        this.#runSlice = () => this.#core.runVirtSystem(2_000_000n);
-        this.#input = (bytes) => this.#core.virtConsoleInput(bytes);
-        this.#networkInput = (frame) => this.#core.virtNetInput(frame);
-        this.#instructions = () => this.#core.virtInsnCount();
-      } else {
-        if (boot.initrd) throw new Error("this firmware does not support a separate initrd");
-        this.#core.bootLinux({
-          bios: boot.firmware,
-          kernel: boot.kernel,
-          disk: boot.disk,
-          cmdline: legacyCmdline,
-          ramMB: memoryMB ?? 128,
-          ...networkOptions,
-        });
-        this.#runSlice = () => this.#core.runSystem(3_000_000n);
-        this.#input = (bytes) => this.#core.consoleInput(bytes);
-        this.#networkInput = (frame) => this.#core.netInput(frame);
-        this.#instructions = () => this.#core.sysInsnCount();
-      }
-    } else if (boot.mode === "bare-metal") {
-      if (!(boot.image instanceof Uint8Array)) {
-        throw new TypeError("bare-metal mode requires an image");
-      }
-      if (boot.privilege && boot.privilege !== "machine") {
-        throw new Error("bare-metal supervisor entry is not implemented");
-      }
-      const loadAddress = BigInt(boot.loadAddress);
-      this.#core.init(loadAddress, (memoryMB ?? 16) << 20);
-      this.#core.load(Number(loadAddress), boot.image);
-      this.#core.pc = boot.entry === undefined ? loadAddress : BigInt(boot.entry);
-      this.#runSlice = () => {
-        const stop = this.#core.run(250_000n);
-        return stop !== Stop.YIELD;
-      };
-      this.#input = null;
-      this.#instructions = () => this.#core.insnCount();
+      this.#core.bootVirtLinux({
+        opensbi: boot.firmware,
+        kernel: boot.kernel,
+        initrd: boot.initrd,
+        disk: boot.disk,
+        cmdline: modernCmdline,
+        ramMB: memoryMB ?? 512,
+        ...networkOptions,
+      });
+      this.#runSlice = () => this.#core.runVirtSystem(2_000_000n);
+      this.#input = (bytes) => this.#core.virtConsoleInput(bytes);
+      this.#networkInput = (frame) => this.#core.virtNetInput(frame);
+      this.#instructions = () => this.#core.virtInsnCount();
     } else if (boot.mode === "linux-direct") {
+      if (!(boot.kernel instanceof Uint8Array)) {
+        throw new TypeError("linux-direct mode requires a kernel image");
+      }
       this.#core.bootVirtLinuxDirect({
         kernel: boot.kernel,
         initrd: boot.initrd,
         disk: boot.disk,
         cmdline: modernCmdline,
         ramMB: memoryMB ?? 512,
-        p9: boot.p9,
-        virtioConsole: boot.virtioConsole,
         ...networkOptions,
       });
       this.#runSlice = () => {
@@ -2377,10 +1432,8 @@ export class RV64 {
     } else {
       throw new TypeError(`unknown boot mode: ${boot.mode}`);
     }
-    this.#core.wispEnable(network.mode === "wisp");
-    this.#core.onWrite = (fd, bytes) => this.#emit(fd === 3 ? "export" : "console", bytes);
+    this.#core.onWrite = (_fd, bytes) => this.#emit("console", bytes);
     this.#core.onNetSend = (frame) => this.#transmitNetwork(frame);
-    this.#core.onNetworkTraffic = (detail) => this.#emit("networkTraffic", detail);
     this.#connectNetwork();
   }
 
@@ -2408,54 +1461,30 @@ export class RV64 {
     this.#input(bytes);
   }
 
-  #sendExport(data) {
-    this.#assertLive();
-    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-    if (!(bytes instanceof Uint8Array)) throw new TypeError("export data must be a string or Uint8Array");
-    this.#core.virtExportInput(bytes);
-  }
-
   #connectNetwork() {
     const network = this.#networkConfig;
     this.#rawEthernet?.close();
     this.#rawEthernet = null;
-    this.#networkChannel?.close();
-    this.#networkChannel = null;
-    this.#wisp?.close();
-    this.#wisp = null;
-    this.#core.disconnectHttpRelay();
     if (network.mode === "wsproxy") {
       this.#rawEthernet = new RawEthernetWebSocket(
         network.url,
         network.protocols,
         (frame) => this.#networkInput?.(frame),
-        (error) => this.#emit("networkTraffic", { type: "error", message: error.message }),
+        (error) => {
+          if (this.#running) {
+            this.#running = false;
+            ++this.#generation;
+            this.#emit("error", error);
+            this.#emit("stop", { reason: "error" });
+          } else {
+            this.#emit("error", error);
+          }
+        },
       );
-    } else if (network.mode === "inbrowser") {
-      if (typeof BroadcastChannel === "undefined") {
-        throw new Error("inbrowser networking requires BroadcastChannel");
-      }
-      const channel = new BroadcastChannel(network.channel ?? "rv64.js-network");
-      channel.onmessage = ({ data }) => {
-        if (data instanceof ArrayBuffer) this.#networkInput?.(new Uint8Array(data));
-        else if (ArrayBuffer.isView(data)) {
-          this.#networkInput?.(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-        }
-      };
-      this.#networkChannel = channel;
-    } else if (network.mode === "wisp") {
-      const wisp = new WispClient(network.url, network.protocols, this.#core);
-      this.#core.onWispOpen = (id, address, port) => wisp.open(id, address, port);
-      this.#core.onWispData = (id, bytes) => wisp.data(id, bytes);
-      this.#core.onWispClose = (id) => wisp.closeGuest(id);
-      this.#core.onWispDatagram = (id, address, port, bytes) =>
-        wisp.datagram(id, address, port, bytes);
-      this.#wisp = wisp;
     }
   }
 
   #transmitNetwork(frame) {
-    if (this.#networkChannel) this.#networkChannel.postMessage(frame);
     this.#rawEthernet?.send(frame);
     this.#emit("networkTransmit", frame);
   }
@@ -2499,7 +1528,6 @@ class RV64WorkerProxy {
       this.on(event, listener);
     }
     this.console = Object.freeze({ send: (data) => this.#sendConsole(data) });
-    const proxy = this;
     this.network = Object.freeze({
       mode: networkMode,
       receive: (frame) => this.#receiveNetwork(frame),
@@ -2513,11 +1541,11 @@ class RV64WorkerProxy {
     const execution = options.execution;
     const workerURL = execution.workerURL
       ? new URL(execution.workerURL, import.meta.url)
-      : new URL("./rv64.worker.js", import.meta.url);
+      : new URL("./rv64.worker.js?v=3", import.meta.url);
     // Validate and copy transferable inputs before allocating a Worker so a
     // rejected source (notably Response) cannot leave an idle thread behind.
     const { options: clonedOptions, transfers } = cloneWorkerOptions(options);
-    const worker = new Worker(workerURL, { name: "rv64.js", type: "module" });
+    const worker = new Worker(workerURL, { name: "lish-vm", type: "module" });
     const networkMode =
       options.network?.mode ?? "none";
     const proxy = new RV64WorkerProxy(worker, networkMode, options.events);
@@ -2544,7 +1572,11 @@ class RV64WorkerProxy {
         } else proxy.#handleMessage(event.data);
       };
     });
-    worker.postMessage({ type: "create", options: clonedOptions }, transfers);
+    worker.postMessage({
+      type: "create",
+      eventNames: Object.keys(options.events ?? {}),
+      options: clonedOptions,
+    }, transfers);
     try {
       proxy.#applyState(await created);
       const interval = Number(execution.statisticsIntervalMs);
@@ -2711,7 +1743,7 @@ class RV64WorkerProxy {
 function cloneWorkerOptions(options) {
   const transfers = [];
   const cloneImage = (source, name) => {
-    if (source === undefined || source === "default") return source;
+    if (source === undefined) return source;
     if (source instanceof Response) {
       throw new TypeError(`${name} cannot be a Response in worker execution mode`);
     }
@@ -2732,7 +1764,7 @@ function cloneWorkerOptions(options) {
   };
 
   const boot = { ...options.boot };
-  for (const key of ["firmware", "kernel", "initrd", "disk", "image"]) {
+  for (const key of ["firmware", "kernel", "initrd", "disk"]) {
     if (key in boot) boot[key] = cloneImage(boot[key], key);
   }
   const network = options.network

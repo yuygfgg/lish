@@ -3,9 +3,7 @@ name = "rv64-core"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Portable RV64 CPU core (no_std-friendly, no I/O) for rv64.js"
+description = "Portable RV64 CPU core for the Lish VM"
 publish = false
-repository.workspace = true
-homepage.workspace = true
 
 [dependencies]

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Run Cargo from the toolchain selected by rust-toolchain.toml.
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+toolchain_file="$root/rust-toolchain.toml"
+toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$toolchain_file" | head -1)
+
+[ -n "$toolchain" ] || {
+    echo "rust-toolchain.toml has no channel" >&2
+    exit 2
+}
+command -v rustup >/dev/null 2>&1 || {
+    echo "rustup is required for the pinned Rust toolchain" >&2
+    exit 2
+}
+
+sysroot=$(rustup run "$toolchain" rustc --print sysroot)
+PATH="$sysroot/bin:$PATH"
+export PATH
+exec "$sysroot/bin/cargo" "$@"

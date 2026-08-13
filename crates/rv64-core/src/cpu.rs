@@ -8,12 +8,12 @@ use crate::exception::Exception;
 pub enum StopReason {
     /// Instruction budget exhausted; just call run() again.
     Budget,
-    /// ECALL executed. The host services user-mode syscalls and may opt into
-    /// servicing supervisor-mode SBI calls for direct Linux boot.
+    /// ECALL returned to the caller. Architecture tests use this as a stop
+    /// marker. Direct Linux boot uses it for supervisor SBI calls.
     Ecall,
-    /// EBREAK executed (user-mode emulation only).
+    /// EBREAK executed without a configured trap handler.
     Break,
-    /// An exception with no handler configured (user-mode emulation only).
+    /// An exception occurred without a configured trap handler.
     Trap(Exception),
     /// WFI with no pending interrupt (full-system only): host may idle.
     Wfi,
@@ -30,8 +30,8 @@ enum Access {
 // 12 bits = 4096 entries/class. 256 was fine for small-working-set loops but
 // direct-mapped-thrashes on multi-MB working sets (a compiler's symbol tables
 // and mallocs): every conflict is a page walk in the interpreter and a block
-// BAIL in the JIT. v86 never capacity-misses (full 2^20-page index for 32-bit
-// guests); 4096 entries is the closest affordable equivalent for sv39.
+// BAIL in the JIT. 4096 entries cover common Sv39 working sets without a
+// large cold-state allocation.
 const TLB_BITS: u32 = 12;
 const TLB_SIZE: usize = 1 << TLB_BITS;
 const TLB_INVALID: u64 = !0;
@@ -40,8 +40,8 @@ const IRQ_POLL_INTERVAL: u32 = 32;
 
 /// RV64I hart state + interpreter.
 ///
-/// Generic over [`Bus`] — the same execute code runs user-mode (flat memory)
-/// and, later, full-system (MMU + MMIO). See /DESIGN.md.
+/// Generic over [`Bus`]. Architecture tests use flat memory. The product
+/// machine uses translated RAM, MMIO, and interrupts.
 pub struct Cpu {
     /// x0..x31; x0 reads as zero (enforced at write sites).
     pub x: [u64; 32],
@@ -58,7 +58,7 @@ pub struct Cpu {
     pub f: [u64; 32],
     /// fcsr: fflags[4:0] | frm[7:5].
     pub fcsr: u32,
-    /// Privileged state; None = pure user-mode emulation (no MMU/traps).
+    /// Privileged state. Architecture tests can omit MMU and trap state.
     pub sys: Option<SysCsrs>,
     /// Return supervisor ECALLs to the machine instead of trapping to M-mode.
     /// Used by firmware-free Linux boot, where the emulator is the SBI layer.
@@ -163,7 +163,7 @@ impl Cpu {
     /// Fused JIT-TLB rows (load tag, load off, store tag, store off), for JIT
     /// blocks that probe it inline: `tag[(va>>12)&(size-1)] == va>>12` means hit
     /// and `linear_index = va + off[idx]` (no range or compiled-page check).
-    /// Address of mstatus for the JIT's FP-state guard (0 in user mode):
+    /// Address of mstatus for the JIT's FP-state guard (0 in flat tests):
     /// compiled FP instructions bail unless mstatus.FS == Dirty, so FS=Off
     /// traps and Initial/Clean transition through the interpreter exactly
     /// like fp_check/fp_dirty.

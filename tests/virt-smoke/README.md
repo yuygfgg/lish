@@ -1,20 +1,21 @@
-# virt-smoke — modern-system (Debian-class) boot harness
+# virt-smoke — modern-system boot harness
 
 Boots the **virt** machine (`crates/rv64-system/src/virt.rs`, runner
-`bin/rv64-vboot`) — OpenSBI `fw_dynamic` + a riscv64 Linux kernel whose
+`bin/rv64-vboot`) — a riscv64 Linux kernel whose
 boot-critical virtio paths are built in — and
 runs a tiny initramfs whose `init` (`init.c`) drives the full-system paths that
 were once broken. On success it prints `SMOKE_OK` and powers off; a hang makes
 the harness time out and fail.
 
 ```
-nix develop -c tests/virt-smoke/run.sh
+web/prepare-images.sh
+tests/virt-smoke/run.sh
 ```
 
-First run builds the kernel from the flake (`.#virt-kernel`, plus
-`.#virt-opensbi`); the freestanding init is built by the bare-metal cross-gcc
-already in the dev shell. The kernel is cached afterwards, so later runs take a
-few seconds.
+The default kernel is a versioned Lish image. The freestanding init is built by
+the compiler selected by `RISCV_PREFIX` or the local Zig toolchain. The custom
+linker script keeps code and read-only data in one executable segment because
+Linux applies page permissions at `PT_LOAD` granularity.
 
 ## What it exercises, and why it's layered
 
@@ -36,7 +37,7 @@ reverting its fix and confirming the guard fails:
 - LR/SC reservation reverted → this harness still passes (bug is probabilistic),
   but the unit test fails. ✓ → that's why the reservation and rdtime invariants
   live in fast, deterministic `cargo test -p rv64-core` unit tests, and the
-  integration test only claims to guard the THRE hang + "Debian userland runs".
+  integration test only claims to guard the THRE hang and direct Linux boot.
 
 So the regression coverage is **layered**: unit tests pin the subtle CPU-core
 invariants; this smoke test pins the emergent full-system behavior.
@@ -47,17 +48,12 @@ Runs as PID 1 in the initramfs and, in order:
 
 1. `rdtime` delta across a `nanosleep` (sanity that the monotonic clock moves).
 2. `CLOCK_REALTIME` is a modern Unix epoch, seeded from the goldfish RTC.
-3. A large console-output burst + `tcsetattr(TCSADRAIN)` — forces the 8250
+3. A large console-output burst + `tcdrain` — forces the 8250
    driver into interrupt-driven TX and blocks on the drain if THRE is missing.
-4. A `fork`+`exec` loop with the timer ticking underneath (multi-process /
+4. A `fork`+`wait` loop with the timer ticking underneath (multi-process /
    atomic churn).
 5. `SMOKE_OK`, then `reboot(RB_POWER_OFF)`.
 
-## Heavier tier — full Debian + kernel compile (manual)
-
-The smoke test uses a ~10 KB initramfs. The full capability — booting a real
-Debian riscv64 rootfs and compiling the Linux kernel in-guest — is a separate,
-much heavier workload (multi-GB image, ~100× slower than native under the
-interpreter, impractical for CI). It's documented in `ROADMAP.md`; the rootfs is
-assembled with `debootstrap --foreign` + `dpkg-deb -x` + `mkfs.ext4 -d` and
-booted with `rv64-vboot … --disk <ext4.img> -- "root=/dev/vda rw init=…"`.
+The smoke test uses a small initramfs. The Alpine image test covers a writable
+root filesystem and package-manager boot path. Larger guest workloads belong in
+separate, explicitly provisioned benchmarks.

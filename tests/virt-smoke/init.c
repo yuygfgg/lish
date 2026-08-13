@@ -1,4 +1,4 @@
-/* rv64.js virt-machine smoke/regression init — freestanding (no libc).
+/* Lish virt-machine smoke/regression init: freestanding, with no libc.
  *
  * Runs as PID 1 in a tiny initramfs. Built with `-nostdlib -ffreestanding` so
  * it needs no C library (any riscv64 gcc works). Deliberately drives the

@@ -1,26 +1,12 @@
-//! virtio-mmio (version 2, "modern") transport with split virtqueues, plus
-//! console, block, 9p filesystem and network backends. Register layout mirrors
-//! TinyEMU's virtio.c (which follows the virtio 1.0 spec).
+//! virtio-mmio (version 2) transport with split virtqueues, block, and network
+//! backends.
 
 use crate::{checked_ram_range, JitPageState};
 
 /// Device backends the transport can host.
 pub enum Backend {
-    /// virtio-console (device id 3). RX = queue 0, TX = queue 1.
-    Console { rx_buf: Vec<u8>, tx_out: Vec<u8> },
     /// virtio-blk (device id 2), backed by an in-memory disk image.
     Block { disk: Vec<u8> },
-    /// virtio-9p (device id 9): host filesystem sharing. One queue, carrying
-    /// 9P2000.L messages that `p9::Server` answers.
-    Fs { srv: crate::p9::Server },
-    /// virtio-9p whose server lives in the JavaScript host. Requests remain on
-    /// the virtqueue until `fs_external_reply` supplies the matching reply.
-    FsExternal {
-        tag: String,
-        request: Option<Vec<u8>>,
-        reply: Option<Vec<u8>>,
-        awaiting_reply: bool,
-    },
     /// virtio-net (device id 1). RX = queue 0, TX = queue 1.
     ///
     /// The device works purely at layer 2: it moves whole Ethernet frames
@@ -105,9 +91,7 @@ impl VirtioDev {
 
     pub fn device_id(&self) -> u32 {
         match self.backend {
-            Backend::Console { .. } => 3,
             Backend::Block { .. } => 2,
-            Backend::Fs { .. } | Backend::FsExternal { .. } => 9,
             Backend::Net { .. } => 1,
         }
     }
@@ -118,9 +102,6 @@ impl VirtioDev {
             // bit 32: VIRTIO_F_VERSION_1 — modern queue layout.
             1 => 1,
             0 => match self.backend {
-                // bit 0: VIRTIO_9P_MOUNT_TAG — config space carries the tag
-                // the guest mounts by. Without it the driver refuses to probe.
-                Backend::Fs { .. } | Backend::FsExternal { .. } => 1,
                 // bit 5: VIRTIO_NET_F_MAC — the MAC in config space is ours to
                 // give. Offering nothing else keeps the driver off checksum
                 // offload, GSO and mergeable RX buffers, none of which a
@@ -135,11 +116,6 @@ impl VirtioDev {
     /// Ring depth advertised to the driver.
     fn queue_num_max(&self) -> u32 {
         match self.backend {
-            // A 9P message up to p9::MAX_MSIZE must fit in ONE descriptor
-            // chain, and the client scatters payload across page-sized
-            // descriptors — so the ring needs MAX_MSIZE/4096 entries plus
-            // headroom. 128 is also the driver's own VIRTQUEUE_NUM.
-            Backend::Fs { .. } | Backend::FsExternal { .. } => 128,
             // Modern virtio_net stops a TX queue unless it has enough free
             // descriptors for a maximally fragmented skb plus its header.
             // A 16-entry ring can transmit once and then remain stopped even
@@ -160,23 +136,6 @@ impl VirtioDev {
             .get(qi)
             .filter(|q| q.ready != 0)
             .map(|q| (q.ready, q.num, q.avail, q.used, q.last_avail_idx))
-    }
-
-    /// Queue console input; delivered to the guest via the RX virtqueue on
-    /// the next `process` call.
-    pub fn console_input(&mut self, bytes: &[u8]) {
-        if let Backend::Console { rx_buf, .. } = &mut self.backend {
-            rx_buf.extend_from_slice(bytes);
-        }
-    }
-
-    /// Drain console output produced by the guest.
-    pub fn console_take_output(&mut self) -> Vec<u8> {
-        if let Backend::Console { tx_out, .. } = &mut self.backend {
-            core::mem::take(tx_out)
-        } else {
-            Vec::new()
-        }
     }
 
     pub fn read(&mut self, offset: u64) -> u32 {
@@ -205,11 +164,6 @@ impl VirtioDev {
     }
 
     /// MMIO read of `size` bytes (1, 2 or 4).
-    ///
-    /// Only config space is meaningful below word width, and it is not
-    /// optional: Linux reads the 9p mount tag one byte at a time
-    /// (`virtio_cread_bytes` → `vm_get(len=1)`), so a device that only answers
-    /// aligned 32-bit reads never gets mounted.
     pub fn read_sized(&mut self, offset: u64, size: u32) -> u32 {
         if offset >= 0x100 && size < 4 {
             let o = offset - 0x100;
@@ -269,7 +223,6 @@ impl VirtioDev {
     /// One byte of device-specific config space (`off` is relative to 0x100).
     fn config_u8(&self, off: u64) -> u8 {
         match &self.backend {
-            Backend::Console { .. } => 0, // cols/rows: unused
             Backend::Block { disk } => {
                 // struct virtio_blk_config { le64 capacity; ... } in sectors.
                 let sectors = (disk.len() / SECTOR) as u64;
@@ -278,23 +231,6 @@ impl VirtioDev {
                     .get(off as usize)
                     .copied()
                     .unwrap_or(0)
-            }
-            Backend::Fs { srv } => {
-                // struct virtio_9p_config { le16 tag_len; u8 tag[tag_len]; }
-                let tag = srv.tag().as_bytes();
-                match off {
-                    0 => tag.len() as u8,
-                    1 => (tag.len() >> 8) as u8,
-                    _ => tag.get(off as usize - 2).copied().unwrap_or(0),
-                }
-            }
-            Backend::FsExternal { tag, .. } => {
-                let tag = tag.as_bytes();
-                match off {
-                    0 => tag.len() as u8,
-                    1 => (tag.len() >> 8) as u8,
-                    _ => tag.get(off as usize - 2).copied().unwrap_or(0),
-                }
             }
             Backend::Net { mac, .. } => {
                 // struct virtio_net_config { u8 mac[6]; le16 status; ... }
@@ -328,39 +264,6 @@ impl VirtioDev {
     /// True when this device has inbound frames waiting for an RX buffer.
     pub fn net_rx_pending(&self) -> bool {
         matches!(&self.backend, Backend::Net { inbox, .. } if !inbox.is_empty())
-    }
-
-    /// Take the external 9P request waiting for the JavaScript host.
-    pub fn fs_external_take_request(&mut self) -> Option<Vec<u8>> {
-        match &mut self.backend {
-            Backend::FsExternal {
-                request,
-                awaiting_reply,
-                ..
-            } => {
-                let request = request.take();
-                if request.is_some() {
-                    *awaiting_reply = true;
-                }
-                request
-            }
-            _ => None,
-        }
-    }
-
-    /// Supply the reply for the outstanding external 9P request.
-    pub fn fs_external_reply(&mut self, bytes: Vec<u8>) -> bool {
-        match &mut self.backend {
-            Backend::FsExternal {
-                reply,
-                awaiting_reply,
-                ..
-            } if *awaiting_reply && reply.is_none() => {
-                *reply = Some(bytes);
-                true
-            }
-            _ => false,
-        }
     }
 
     // ---- virtqueue processing ------------------------------------------
@@ -478,44 +381,6 @@ impl VirtioDev {
         jit: &mut JitPageState,
     ) -> Option<u32> {
         match &mut self.backend {
-            Backend::Console { rx_buf, tx_out } => {
-                if qi == 0 {
-                    // RX: fill writable buffers with pending input.
-                    if rx_buf.is_empty() {
-                        return None;
-                    }
-                    let mut written = 0u32;
-                    for &(addr, len, writable) in chain {
-                        if !writable || rx_buf.is_empty() {
-                            continue;
-                        }
-                        let n = rx_buf.len().min(len as usize);
-                        if !guest_write(ram, ram_base, addr, &rx_buf[..n], jit) {
-                            continue;
-                        }
-                        rx_buf.drain(..n);
-                        written += n as u32;
-                        if rx_buf.is_empty() {
-                            break;
-                        }
-                    }
-                    Some(written)
-                } else {
-                    // TX: collect guest output.
-                    let mut output = Vec::new();
-                    for &(addr, len, writable) in chain {
-                        if writable {
-                            continue;
-                        }
-                        match guest_slice(ram, ram_base, addr, len) {
-                            Some(bytes) => output.extend_from_slice(bytes),
-                            None => return Some(0),
-                        }
-                    }
-                    tx_out.extend_from_slice(&output);
-                    Some(0)
-                }
-            }
             Backend::Block { disk } => {
                 // Layout: header (16B, read-only) | data buffers | status (1B, writable)
                 let (hdr_addr, ..) = *chain.first()?;
@@ -561,74 +426,6 @@ impl VirtioDev {
                     written += 1;
                 }
                 Some(written)
-            }
-            Backend::Fs { srv } => {
-                // One chain carries the whole exchange: the device-readable
-                // descriptors hold the T-message, the device-writable ones are
-                // the reply buffer the client sized to msize.
-                let mut req = Vec::new();
-                for &(addr, len, writable) in chain {
-                    if writable {
-                        continue;
-                    }
-                    match guest_slice(ram, ram_base, addr, len) {
-                        Some(s) => req.extend_from_slice(s),
-                        // A descriptor pointing outside RAM is a broken guest,
-                        // not something to panic over: consume it unanswered.
-                        None => return Some(0),
-                    }
-                }
-                if req.is_empty() {
-                    return Some(0);
-                }
-                let reply = srv.handle(&req);
-                let mut pos = 0usize;
-                for &(addr, len, writable) in chain {
-                    if !writable || pos >= reply.len() {
-                        continue;
-                    }
-                    let n = (reply.len() - pos).min(len as usize);
-                    if !guest_write(ram, ram_base, addr, &reply[pos..pos + n], jit) {
-                        break;
-                    }
-                    pos += n;
-                }
-                Some(pos as u32)
-            }
-            Backend::FsExternal {
-                request,
-                reply,
-                awaiting_reply,
-                ..
-            } => {
-                if let Some(reply) = reply.take() {
-                    let mut pos = 0usize;
-                    for &(addr, len, writable) in chain {
-                        if !writable || pos >= reply.len() {
-                            continue;
-                        }
-                        let n = (reply.len() - pos).min(len as usize);
-                        if !guest_write(ram, ram_base, addr, &reply[pos..pos + n], jit) {
-                            break;
-                        }
-                        pos += n;
-                    }
-                    *awaiting_reply = false;
-                    return Some(pos as u32);
-                }
-                if request.is_none() && !*awaiting_reply {
-                    let mut bytes = Vec::new();
-                    for &(addr, len, writable) in chain {
-                        if !writable {
-                            bytes.extend_from_slice(guest_slice(ram, ram_base, addr, len)?);
-                        }
-                    }
-                    if bytes.is_empty() {
-                        return Some(0);
-                    }
-                    *request = Some(bytes);
-                }
-                None
             }
             Backend::Net { inbox, outbox, .. } => {
                 if qi == 0 {
@@ -757,8 +554,6 @@ fn write32(ram: &mut [u8], base: u64, addr: u64, v: u32, jit: &mut JitPageState)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p9;
-    use crate::p9fs::MemFs;
 
     // A small guest RAM with a hand-built split virtqueue, so these tests
     // exercise the same path a real driver takes: descriptor chain in, reply
@@ -768,17 +563,7 @@ mod tests {
     const AVAIL: usize = 0x2000;
     const USED: usize = 0x3000;
     const REQ: usize = 0x4000;
-    const REPLY: usize = 0x5000;
     const NUM: u32 = 8;
-
-    fn fs_device() -> (VirtioDev, Vec<u8>) {
-        let mut fs = MemFs::new();
-        fs.add_file("/greeting", b"from-the-host", 0o644);
-        let dev = VirtioDev::new(Backend::Fs {
-            srv: p9::Server::new("hostshare", Box::new(fs)),
-        });
-        (dev, vec![0u8; 64 * 1024])
-    }
 
     /// Ring addresses for one queue. Queue 0 lives at the low set; a
     /// two-queue device (net) puts queue 1 at the high set.
@@ -798,10 +583,6 @@ mod tests {
         used: 0x8000,
     };
 
-    fn setup_queue(dev: &mut VirtioDev) {
-        setup_ring(dev, 0, &RING0);
-    }
-
     fn setup_ring(dev: &mut VirtioDev, qi: u32, r: &Ring) {
         dev.write(0x030, qi); // queue_sel
         dev.write(0x038, NUM); // queue_num
@@ -812,10 +593,6 @@ mod tests {
         dev.write(0x0a0, (BASE + r.used as u64) as u32);
         dev.write(0x0a4, ((BASE + r.used as u64) >> 32) as u32);
         dev.write(0x044, 1); // queue_ready
-    }
-
-    fn put_desc(ram: &mut [u8], i: usize, addr: usize, len: u32, flags: u16, next: u16) {
-        put_desc_in(ram, &RING0, i, addr, len, flags, next);
     }
 
     fn put_desc_in(
@@ -862,214 +639,80 @@ mod tests {
         dev.process(qi, ram, BASE, &mut jit);
     }
 
-    /// Body builder for T-messages.
-    #[derive(Default)]
-    struct B(Vec<u8>);
-    impl B {
-        fn u16(mut self, v: u16) -> B {
-            self.0.extend_from_slice(&v.to_le_bytes());
-            self
-        }
-        fn u32(mut self, v: u32) -> B {
-            self.0.extend_from_slice(&v.to_le_bytes());
-            self
-        }
-        fn u64(mut self, v: u64) -> B {
-            self.0.extend_from_slice(&v.to_le_bytes());
-            self
-        }
-        fn str(mut self, s: &str) -> B {
-            self.0.extend_from_slice(&(s.len() as u16).to_le_bytes());
-            self.0.extend_from_slice(s.as_bytes());
-            self
-        }
-    }
-
-    /// Submit one T-message on the ring, notify, and return the R-message the
-    /// device wrote back. `n` is the 1-based submission count.
-    fn round_trip(dev: &mut VirtioDev, ram: &mut [u8], id: u8, body: &B, n: u16) -> Vec<u8> {
-        let mut msg = ((body.0.len() + 7) as u32).to_le_bytes().to_vec();
-        msg.push(id);
-        msg.extend_from_slice(&0u16.to_le_bytes()); // tag
-        msg.extend_from_slice(&body.0);
-        ram[REQ..REQ + msg.len()].copy_from_slice(&msg);
-        put_desc(ram, 0, REQ, msg.len() as u32, 1 /* NEXT */, 1);
-        put_desc(ram, 1, REPLY, 4096, 2 /* WRITE */, 0);
-        publish(ram, &RING0, 0, n);
-
-        assert_eq!(dev.write(0x050, 0), Some(0), "QueueNotify selects queue 0");
-        process(dev, 0, ram);
-
-        // The device must have published exactly one more used entry.
-        assert_eq!(u16_at(ram, USED + 2), n, "used.idx after request {n}");
-        let (head, len) = used_entry(ram, &RING0, n);
-        assert_eq!(head, 0, "used entry is chain 0");
-        let len = len as usize;
-        let reply = ram[REPLY..REPLY + len].to_vec();
-        assert_eq!(u32_at(&reply, 0) as usize, len, "reply size field");
-        assert_ne!(reply[4], 7, "unexpected Rlerror: {:?}", &reply[7..11]);
-        assert_eq!(reply[4], id + 1, "reply id");
-        reply
-    }
-
     #[test]
-    fn advertises_a_9p_device_and_its_mount_tag() {
-        let (mut dev, _) = fs_device();
-        assert_eq!(dev.read(0x008), 9); // virtio device id 9 = 9p
-        dev.write(0x014, 0);
-        assert_eq!(dev.read(0x010), 1, "VIRTIO_9P_MOUNT_TAG in feature word 0");
-        dev.write(0x014, 1);
-        assert_eq!(dev.read(0x010), 1, "VIRTIO_F_VERSION_1 in feature word 1");
-        assert_eq!(dev.read(0x034), 128, "ring must hold a whole msize message");
-        // Read the tag exactly as Linux does: a 16-bit length, then one byte at
-        // a time. This is what a 32-bit-only config space would break.
-        assert_eq!(dev.read_sized(0x100, 2), 9);
-        let tag: Vec<u8> = (0..9).map(|i| dev.read_sized(0x102 + i, 1) as u8).collect();
-        assert_eq!(&tag, b"hostshare");
-    }
-
-    #[test]
-    fn external_9p_leaves_the_chain_pending_until_the_host_replies() {
-        let mut dev = VirtioDev::new(Backend::FsExternal {
-            tag: "host9p".into(),
-            request: None,
-            reply: None,
-            awaiting_reply: false,
-        });
-        let mut ram = vec![0u8; 64 * 1024];
-        setup_queue(&mut dev);
-        let request = [7, 0, 0, 0, 100, 3, 0];
-        ram[REQ..REQ + request.len()].copy_from_slice(&request);
-        put_desc(&mut ram, 0, REQ, request.len() as u32, 1, 1);
-        put_desc(&mut ram, 1, REPLY, 4096, 2, 0);
-        publish(&mut ram, &RING0, 0, 1);
-
-        process(&mut dev, 0, &mut ram);
-        assert_eq!(u16_at(&ram, USED + 2), 0);
-        assert_eq!(
-            dev.fs_external_take_request().as_deref(),
-            Some(request.as_slice())
-        );
-        assert_eq!(
-            dev.fs_external_take_request(),
-            None,
-            "request is emitted once"
-        );
-        process(&mut dev, 0, &mut ram);
-        assert_eq!(
-            dev.fs_external_take_request(),
-            None,
-            "in-flight request is not re-emitted"
-        );
-
-        let reply = [7, 0, 0, 0, 101, 3, 0];
-        assert!(dev.fs_external_reply(reply.to_vec()));
-        process(&mut dev, 0, &mut ram);
-        assert_eq!(u16_at(&ram, USED + 2), 1);
-        assert_eq!(&ram[REPLY..REPLY + reply.len()], &reply);
-        assert!(dev.irq_pending());
-    }
-
-    #[test]
-    fn console_and_block_config_still_read_as_words() {
-        // Assembling config space from bytes must not disturb the existing
-        // devices: virtio-blk's capacity is a le64 sector count at offset 0.
+    fn block_config_reports_capacity_in_sectors() {
         let mut dev = VirtioDev::new(Backend::Block {
             disk: vec![0u8; 8 * 512],
         });
         assert_eq!(dev.read(0x100), 8);
         assert_eq!(dev.read(0x104), 0);
-        assert_eq!(dev.read(0x034), 16, "unchanged ring depth for blk");
-        let mut dev = VirtioDev::new(Backend::Console {
-            rx_buf: Vec::new(),
-            tx_out: Vec::new(),
-        });
-        assert_eq!(dev.read(0x008), 3);
-        dev.write(0x014, 0);
-        assert_eq!(dev.read(0x010), 0, "console offers no feature bits");
+        assert_eq!(dev.read(0x034), 16);
     }
 
-    #[test]
-    fn console_tx_rejects_out_of_ram_and_wasm32_alias_descriptors() {
-        let mut dev = VirtioDev::new(Backend::Console {
-            rx_buf: Vec::new(),
-            tx_out: Vec::new(),
-        });
-        let mut ram = vec![0u8; 64 * 1024];
-        setup_ring(&mut dev, 1, &RING1);
-        ram[REQ..REQ + 4].copy_from_slice(b"nope");
-
-        for (submission, address) in [(1, 0xdead_0000), (2, BASE + (1u64 << 32) + REQ as u64)] {
-            put_desc_in(&mut ram, &RING1, 0, REQ, 4, 0, 0);
-            ram[RING1.desc..RING1.desc + 8].copy_from_slice(&address.to_le_bytes());
-            publish(&mut ram, &RING1, 0, submission);
-
-            process(&mut dev, 1, &mut ram);
-
-            assert_eq!(u16_at(&ram, RING1.used + 2), submission);
-            assert!(dev.console_take_output().is_empty());
-        }
+    fn block_device() -> (VirtioDev, Vec<u8>) {
+        let mut disk = vec![0u8; 4 * SECTOR];
+        disk[SECTOR..2 * SECTOR].fill(0x5a);
+        (
+            VirtioDev::new(Backend::Block { disk }),
+            vec![0u8; 64 * 1024],
+        )
     }
 
-    #[test]
-    fn services_a_mount_and_read_over_the_virtqueue() {
-        let (mut dev, mut ram) = fs_device();
-        setup_queue(&mut dev);
-
-        // Tversion — negotiate msize.
-        let r = round_trip(
-            &mut dev,
-            &mut ram,
-            100,
-            &B::default().u32(8192).str("9P2000.L"),
+    fn submit_block(
+        dev: &mut VirtioDev,
+        ram: &mut [u8],
+        request_type: u32,
+        sector: u64,
+        writable_data: bool,
+    ) {
+        setup_ring(dev, 0, &RING0);
+        ram[REQ..REQ + 4].copy_from_slice(&request_type.to_le_bytes());
+        ram[REQ + 8..REQ + 16].copy_from_slice(&sector.to_le_bytes());
+        put_desc_in(ram, &RING0, 0, REQ, 16, 1, 1);
+        put_desc_in(
+            ram,
+            &RING0,
             1,
-        );
-        assert_eq!(u32_at(&r, 7), 8192);
-        assert!(dev.irq_pending(), "used-ring update must raise the irq");
-
-        // Tattach fid 0 -> the export root.
-        round_trip(
-            &mut dev,
-            &mut ram,
-            104,
-            &B::default().u32(0).u32(!0).str("root").str("").u32(0),
+            REQ + 0x100,
+            SECTOR as u32,
+            1 | if writable_data { 2 } else { 0 },
             2,
         );
-
-        // Twalk fid 0 -> fid 1 = "greeting", then Tlopen and Tread it.
-        let r = round_trip(
-            &mut dev,
-            &mut ram,
-            110,
-            &B::default().u32(0).u32(1).u16(1).str("greeting"),
-            3,
-        );
-        assert_eq!(u16_at(&r, 7), 1, "one qid walked");
-        round_trip(&mut dev, &mut ram, 12, &B::default().u32(1).u32(0), 4);
-        let r = round_trip(
-            &mut dev,
-            &mut ram,
-            116,
-            &B::default().u32(1).u64(0).u32(4096),
-            5,
-        );
-        let n = u32_at(&r, 7) as usize;
-        assert_eq!(&r[11..11 + n], b"from-the-host");
+        put_desc_in(ram, &RING0, 2, REQ + 0x300, 1, 2, 0);
+        publish(ram, &RING0, 0, 1);
+        process(dev, 0, ram);
     }
 
     #[test]
-    fn a_descriptor_outside_ram_is_consumed_not_panicked_on() {
-        let (mut dev, mut ram) = fs_device();
-        setup_queue(&mut dev);
-        // A buggy guest can point a descriptor anywhere; the device must not
-        // fault the host process over it.
-        put_desc(&mut ram, 0, 0, 64, 1, 1);
-        let o = DESC;
-        ram[o..o + 8].copy_from_slice(&0xdead_0000u64.to_le_bytes());
-        put_desc(&mut ram, 1, REPLY, 4096, 2, 0);
-        publish(&mut ram, &RING0, 0, 1);
-        process(&mut dev, 0, &mut ram);
-        assert_eq!(u16_at(&ram, USED + 2), 1, "chain consumed");
+    fn block_reads_a_sector_into_guest_memory() {
+        let (mut dev, mut ram) = block_device();
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_IN, 1, true);
+
+        assert_eq!(&ram[REQ + 0x100..REQ + 0x100 + SECTOR], &[0x5a; SECTOR]);
+        assert_eq!(ram[REQ + 0x300], 0);
+        assert_eq!(u16_at(&ram, USED + 2), 1);
+    }
+
+    #[test]
+    fn block_writes_persist_in_the_backing_image() {
+        let (mut dev, mut ram) = block_device();
+        ram[REQ + 0x100..REQ + 0x100 + SECTOR].fill(0xa5);
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_OUT, 2, false);
+
+        let Backend::Block { disk } = &dev.backend else {
+            unreachable!()
+        };
+        assert_eq!(&disk[2 * SECTOR..3 * SECTOR], &[0xa5; SECTOR]);
+        assert_eq!(ram[REQ + 0x300], 0);
+    }
+
+    #[test]
+    fn block_rejects_requests_beyond_the_image() {
+        let (mut dev, mut ram) = block_device();
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_IN, 4, true);
+
+        assert_eq!(ram[REQ + 0x300], 1);
+        assert_eq!(u16_at(&ram, USED + 2), 1);
     }
 
     // ---- virtio-net ----

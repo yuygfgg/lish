@@ -3,24 +3,24 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="description" content="Boot RISC-V Linux in your browser with rv64.js" />
-  <title>rv64.js — RISC-V Linux in your browser</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" />
+  <meta name="description" content="Run the Lish RISC-V Linux system" />
+  <title>Lish</title>
+  <link rel="stylesheet" href="./vendor/xterm/xterm.css" />
   <link rel="stylesheet" href="./site.css?v=3" />
 </head>
 <body>
   <header>
-    <a class="brand" href="https://github.com/ibuildthecloud/rv64.js">rv64.js</a>
-    <span>RISC-V Linux, entirely in your browser</span>
+    <span class="brand">Lish</span>
+    <span>RISC-V Linux shell</span>
   </header>
 
   <main>
     <section class="hero">
-      <p class="eyebrow">Rust · WebAssembly · RV64GC</p>
-      <h1>Boot Alpine Linux in your browser.</h1>
+      <p class="eyebrow">WebAssembly · RV64GC</p>
+      <h1>Lish</h1>
       <p>
-        No server-side emulator. The CPU, devices, and JIT execute locally in
-        this tab. Image downloads are cached by your browser.
+        The terminal connects to a full RISC-V Linux machine. The emulator and
+        its JIT run in a dedicated Web Worker.
       </p>
     </section>
 
@@ -29,35 +29,36 @@
       <button id="clear" class="secondary" type="button">Clear terminal</button>
       <div class="telemetry" aria-label="Virtual machine telemetry">
         <div><span class="telemetry-label">CPU</span><span id="status" role="status">Ready · worker</span></div>
-        <div><span class="telemetry-label">NET</span><span id="network-status" role="status">Network idle</span></div>
+        <div><span class="telemetry-label">NET</span><span id="network-status" role="status">Ethernet idle</span></div>
       </div>
     </section>
 
     <section class="terminal-wrap">
       <div class="terminal-bar">
         <span></span><span></span><span></span>
-        <b id="terminal-title">rv64.js console</b>
+        <b id="terminal-title">Lish console</b>
       </div>
       <div id="terminal" aria-label="Linux terminal"></div>
     </section>
 
     <section class="notes">
       <h2>Run it locally</h2>
-      <pre><code>nix develop -c web/prepare-images.sh
-cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
-python3 -m http.server -d . 8000
-# open http://localhost:8000/web/</code></pre>
+      <pre><code>brew install coreutils genext2fs zig
+npm ci && npm run stage-web-dependencies
+web/prepare-images.sh
+tools/cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
+python3 -m http.server 4173
+# open http://127.0.0.1:4173/web/</code></pre>
       <p>
-        The demo uses the current direct-boot kernel and Alpine root image.
-        See the <a href="https://github.com/ibuildthecloud/rv64.js#quick-start">README</a>
-        for native and Node examples.
+        The page loads local build artifacts from the same origin. Run the
+        native network host to enable guest networking.
       </p>
     </section>
   </main>
 
   <footer>
     <span>MIT licensed</span>
-    <a href="https://github.com/ibuildthecloud/rv64.js">Source on GitHub</a>
+    <span>macOS-first development build</span>
   </footer>
 
   <script type="module" src="./site.mjs?v=12"></script>

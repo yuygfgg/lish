@@ -1,0 +1,5 @@
+module CLibSlirp [system] {
+    header "shim.h"
+    link "slirp"
+    export *
+}

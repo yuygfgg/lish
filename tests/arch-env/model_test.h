@@ -1,4 +1,4 @@
-// riscv-arch-test target environment shared by rv64.js and Spike:
+// riscv-arch-test target environment shared by Lish and Spike:
 // both terminate via the HTIF tohost protocol and take software interrupts
 // from a CLINT at 0x0200_0000, so one compiled binary serves DUT and
 // reference alike (signatures must then match bit-for-bit).

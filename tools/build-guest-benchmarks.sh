@@ -9,6 +9,9 @@ mkdir -p "$out"
 if command -v zig >/dev/null 2>&1; then
     compiler=(zig cc -target riscv64-linux-musl)
     architecture=(-mcpu=generic_rv64+m+a+f+d+c)
+    # Keep Zig's cache inside the repository build tree. This works in CI and
+    # in sandboxed macOS environments where the user cache may be read-only.
+    export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$root/target/zig-cache}"
 elif command -v riscv64-linux-musl-gcc >/dev/null 2>&1; then
     compiler=(riscv64-linux-musl-gcc)
     architecture=(-march=rv64gc -mabi=lp64d)

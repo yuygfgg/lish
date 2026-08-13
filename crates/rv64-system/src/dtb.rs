@@ -1,5 +1,5 @@
 //! Minimal flattened-device-tree (DTB) builder — just enough to describe
-//! the TinyEMU-compatible machine to Linux/BBL. FDT v17.
+//! the RISC-V `virt` machine to Linux. FDT v17.
 
 pub struct Fdt {
     struct_: Vec<u8>,

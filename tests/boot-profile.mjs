@@ -2,9 +2,8 @@
 // Structured full-system boot profiler. Image loading is timed separately from
 // execution so network/storage changes cannot be mistaken for emulator wins.
 //
-//   node tests/boot-profile.mjs fast --reps 3
-//   node --max-old-space-size=2048 tests/boot-profile.mjs modern --reps 5
-//   node tests/boot-profile.mjs modern --out target/boot-modern.json
+//   node tests/boot-profile.mjs direct --reps 5
+//   node tests/boot-profile.mjs direct --out target/boot-direct.json
 
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -15,7 +14,7 @@ import { BootTimeline, summarizeTrials } from "./boot-profile-lib.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
-const presetName = args.shift() || "modern";
+const presetName = args.shift() || "direct";
 let repetitions = 1;
 let outputPath;
 for (let i = 0; i < args.length; i++) {
@@ -28,105 +27,32 @@ if (!Number.isInteger(repetitions) || repetitions < 1) {
 }
 
 const presets = {
-  fast: {
+  direct: {
     files: [
-      "web/images/bbl64.bin",
-      "web/images/kernel-riscv64.bin",
-      "web/images/root-riscv64.bin",
-    ],
-    markers: {
-      firstOutput: /./s,
-      kernel: /Linux version/,
-      rootMounted: /VFS: Mounted root/,
-      ready: /~ #/,
-    },
-    boot(vm, [bios, kernel, disk]) {
-      vm.bootLinux({ bios, kernel, disk });
-    },
-    run(vm) { return vm.runSystem(3_000_000n); },
-    instructions(vm) { return vm.sysInsnCount(); },
-  },
-  modern: {
-    files: [
-      "web/images/alpine/opensbi.bin",
       process.env.RV64_MODERN_KERNEL || "web/images/alpine/Image",
-      "web/images/alpine/debian.ext4",
+      "web/images/alpine/alpine.ext4",
     ],
     markers: {
       firstOutput: /./s,
-      firmware: /OpenSBI v/,
-      firmwareComplete: /Boot HART MEDELEG/,
       kernel: /Linux version/,
       rootMounted: /VFS: Mounted root/,
-      ready: /BENCH_READY/,
+      ready: /ALPINE_READY/,
     },
-    boot(vm, [opensbi, kernel, disk]) {
-      vm.bootVirtLinux({
-        opensbi,
+    boot(vm, [kernel, disk]) {
+      vm.bootVirtLinuxDirect({
         kernel,
         disk,
         ramMB: 512,
-        cmdline: "console=ttyS0 root=/dev/vda rw init=/binit.sh",
+        cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
       });
     },
     run(vm) { return vm.runVirtSystem(2_000_000n); },
-    runBeforeKernel(vm) { return vm.runVirtSystem(100_000n); },
     instructions(vm) { return vm.virtInsnCount(); },
     pc(vm) { return vm.virtPc(); },
   },
 };
-presets["modern-direct"] = {
-  files: [
-    process.env.RV64_MODERN_KERNEL || "web/images/alpine/Image",
-    "web/images/alpine/debian.ext4",
-  ],
-  markers: {
-    firstOutput: /./s,
-    kernel: /Linux version/,
-    rootMounted: /VFS: Mounted root/,
-    ready: /BENCH_READY/,
-  },
-  boot(vm, [kernel, disk]) {
-    vm.bootVirtLinuxDirect({
-      kernel,
-      disk,
-      ramMB: 512,
-      cmdline: "console=ttyS0 root=/dev/vda rw init=/binit.sh",
-    });
-  },
-  run(vm) { return vm.runVirtSystem(2_000_000n); },
-  instructions(vm) { return vm.virtInsnCount(); },
-  pc(vm) { return vm.virtPc(); },
-};
-presets["modern-alpine"] = {
-  files: [
-    process.env.RV64_MODERN_KERNEL || "web/images/alpine/Image",
-    "web/images/alpine/alpine.ext4",
-  ],
-  markers: {
-    firstOutput: /./s,
-    kernel: /Linux version/,
-    rootMounted: /VFS: Mounted root/,
-    ready: /ALPINE_READY/,
-  },
-  boot(vm, [kernel, disk]) {
-    vm.bootVirtLinuxDirect({
-      kernel,
-      disk,
-      ramMB: 512,
-      cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
-    });
-  },
-  run(vm) { return vm.runVirtSystem(2_000_000n); },
-  instructions(vm) { return vm.virtInsnCount(); },
-  pc(vm) { return vm.virtPc(); },
-};
 const preset = presets[presetName];
-if (!preset) {
-  throw new Error(
-    "preset must be 'fast', 'modern', 'modern-direct', or 'modern-alpine'",
-  );
-}
+if (!preset) throw new Error("preset must be 'direct'");
 
 const loadStarted = performance.now();
 const [wasm, ...images] = await Promise.all([

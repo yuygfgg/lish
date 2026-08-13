@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { RV64 } from "../web/rv64.js";
+import { idleKernel } from "./synthetic-kernels.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const wasm = await readFile(
@@ -12,11 +13,10 @@ const wasm = await readFile(
 const events = [];
 const vm = await RV64.create({
   wasm,
-  memoryMB: 1,
+  memoryMB: 8,
   boot: {
-    mode: "bare-metal",
-    image: new Uint8Array([0x73, 0x00, 0x10, 0x00]), // ebreak
-    loadAddress: 0x80000000n,
+    mode: "linux-direct",
+    kernel: idleKernel(),
   },
   events: {
     ready: () => events.push("ready"),
@@ -43,15 +43,17 @@ for (const removed of [
 const unsubscribe = vm.on("start", () => events.push("second-start"));
 await vm.start();
 assert.equal(vm.running, true);
-while (vm.running) await new Promise((resolve) => setImmediate(resolve));
-assert.deepEqual(events, ["ready", "start", "second-start", "stop:powered-off"]);
+while (vm.instructions === 0n) await new Promise((resolve) => setImmediate(resolve));
+await vm.stop();
+assert.deepEqual(events, ["ready", "start", "second-start", "stop:requested"]);
 assert.ok(vm.instructions > 0n);
 
 unsubscribe();
 await vm.reset();
 assert.equal(vm.instructions, 0n);
 await vm.start();
-while (vm.running) await new Promise((resolve) => setImmediate(resolve));
+while (vm.instructions === 0n) await new Promise((resolve) => setImmediate(resolve));
+await vm.stop();
 assert.equal(events.filter((event) => event === "second-start").length, 1);
 
 await vm.destroy();
@@ -109,11 +111,7 @@ class TestWebSocket {
   send() {}
 }
 globalThis.WebSocket = TestWebSocket;
-for (const network of [
-  { mode: "wsproxy", url: "wss://relay.example/" },
-  { mode: "wisp", url: "wisps://relay.example/" },
-  { mode: "inbrowser", channel: "rv64-api-test" },
-]) {
+for (const network of [{ mode: "wsproxy", url: "wss://relay.example/" }]) {
   const networkVM = await RV64.create({
     wasm,
     memoryMB: 8,
@@ -131,15 +129,14 @@ await assert.rejects(
     boot: { mode: "linux-direct", kernel: new Uint8Array(4) },
     network: { mode: "wisp" },
   }),
-  /wisp networking requires url/,
+  /unknown network mode: wisp/,
 );
 
 await assert.rejects(
   RV64.create({
     wasm,
-    boot: { mode: "bare-metal", image: new Uint8Array(4), loadAddress: 0x80000000n },
-    network: { mode: "external" },
+    boot: { mode: "bare-metal", image: new Uint8Array(4) },
   }),
-  /bare-metal networking is not implemented/,
+  /unknown boot mode: bare-metal/,
 );
 console.log("PASS stable public API lifecycle");

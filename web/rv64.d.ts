@@ -23,25 +23,15 @@ export type BootConfig =
       initrd?: ImageSource;
       disk?: ImageSource;
       cmdline?: string;
-      /** Delegate a virtio-9P mount to an asynchronous host handler. Local execution only. */
-      p9?: { tag: string; handle(request: Uint8Array): Uint8Array | Promise<Uint8Array> };
-      /** Add a secondary virtio console, used by integrations such as WANIX host export. */
-      virtioConsole?: boolean;
     }
   | {
       mode: "firmware";
-      firmware: ImageSource | "default";
+      /** OpenSBI firmware image. */
+      firmware: ImageSource;
       kernel?: ImageSource;
       initrd?: ImageSource;
       disk?: ImageSource;
       cmdline?: string;
-    }
-  | {
-      mode: "bare-metal";
-      image: ImageSource;
-      loadAddress: bigint;
-      entry?: bigint;
-      privilege?: "machine" | "supervisor";
     };
 
 export type NetworkConfig =
@@ -54,23 +44,10 @@ export type NetworkConfig =
       protocols?: string | string[];
       mac?: Uint8Array;
     }
-  | {
-      /** TCP/UDP payload transport through a WISP-compatible relay. */
-      mode: "wisp";
-      url: string;
-      protocols?: string | string[];
-      mac?: Uint8Array;
-    }
-  | {
-      /** Browser-local Ethernet shared over BroadcastChannel. */
-      mode: "inbrowser";
-      channel?: string;
-      mac?: Uint8Array;
-    }
   | { mode: "external"; mac?: Uint8Array };
 
 export interface DownloadProgress {
-  image: "wasm" | "firmware" | "kernel" | "initrd" | "disk" | "image";
+  image: "wasm" | "firmware" | "kernel" | "initrd" | "disk";
   loaded: number;
   total?: number;
 }
@@ -81,15 +58,7 @@ export interface RV64EventMap {
   stop: { reason: "requested" | "powered-off" | "error" };
   error: unknown;
   console: Uint8Array;
-  /** Bytes from the optional secondary virtio-console host-export channel. */
-  export: Uint8Array;
   networkTransmit: Uint8Array;
-  networkTraffic:
-    | { type: "request"; bytes: number; method: string; url: string }
-    | { type: "response"; status: number; url?: string }
-    | { type: "download"; bytes: number }
-    | { type: "end"; url?: string }
-    | { type: "error"; message: string; url?: string };
   downloadProgress: DownloadProgress;
 }
 
@@ -142,7 +111,6 @@ export class RV64 {
   /** JIT ownership and asynchronous compiler queue state. */
   jitMetrics(): JitMetrics | null;
   readonly console: { send(data: string | Uint8Array): void };
-  readonly export: { send(data: string | Uint8Array): void };
   readonly network: {
     readonly mode: NetworkConfig["mode"];
     /** Supply an Ethernet frame when network.mode is "external". */

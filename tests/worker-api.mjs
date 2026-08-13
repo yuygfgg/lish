@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { Worker as NodeWorker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { RV64 } from "../web/rv64.js";
+import { powerOffKernel } from "./synthetic-kernels.mjs";
 
 const bootstrap = new URL("./web-worker-node-bootstrap.mjs", import.meta.url);
 class BrowserWorker {
@@ -32,12 +33,11 @@ const wasm = await readFile(
 const events = [];
 const vm = await RV64.create({
   wasm,
-  memoryMB: 1,
+  memoryMB: 8,
   execution: { mode: "worker", statisticsIntervalMs: 50 },
   boot: {
-    mode: "bare-metal",
-    image: new Uint8Array([0x73, 0x00, 0x10, 0x00]),
-    loadAddress: 0x80000000n,
+    mode: "linux-direct",
+    kernel: powerOffKernel(),
   },
   events: {
     ready: () => events.push("ready"),
@@ -67,9 +67,8 @@ await assert.rejects(
     wasm: new Response(wasm),
     execution: { mode: "worker" },
     boot: {
-      mode: "bare-metal",
-      image: new Uint8Array(4),
-      loadAddress: 0x80000000n,
+      mode: "linux-direct",
+      kernel: new Uint8Array(4),
     },
   }),
   /Response in worker execution mode/,
