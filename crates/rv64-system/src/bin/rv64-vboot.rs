@@ -92,6 +92,7 @@ fn main() {
         cmdline: &cmdline,
         initrd: initrd.as_deref(),
         disk,
+        external_disk_size: None,
         net,
     };
     let mut m = if direct {

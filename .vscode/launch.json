@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:lish}/native",
+            "name": "Debug lish-network-host (native)",
+            "target": "lish-network-host",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug lish-network-host (native)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:lish}/native",
+            "name": "Release lish-network-host (native)",
+            "target": "lish-network-host",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release lish-network-host (native)"
+        }
+    ]
+}

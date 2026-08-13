@@ -531,6 +531,9 @@ pub struct VirtImages<'a> {
     pub cmdline: &'a str,
     pub initrd: Option<&'a [u8]>,
     pub disk: Option<Vec<u8>>,
+    /// Size of a native disk image. When present, the block device keeps the
+    /// image outside guest RAM and exposes requests through the host ABI.
+    pub external_disk_size: Option<u64>,
     /// MAC address for a layer-2 virtio-net device.
     pub net: Option<[u8; 6]>,
 }
@@ -583,7 +586,8 @@ impl VirtMachine {
         let kend = kbase + images.kernel.len();
 
         let _ = kend;
-        let n_virtio = images.disk.is_some() as usize + images.net.is_some() as usize;
+        let n_virtio = (images.disk.is_some() || images.external_disk_size.is_some()) as usize
+            + images.net.is_some() as usize;
         // Place initrd + DTB near the TOP of RAM (as QEMU/U-Boot do) so the
         // kernel's early allocations near the Image don't clobber them.
         // Layout from the top down: [DTB][initrd][fw_dynamic_info], each
@@ -617,6 +621,11 @@ impl VirtMachine {
         let mut virtio = Vec::new();
         if let Some(disk) = images.disk {
             virtio.push(VirtioDev::new(Backend::Block { disk }));
+        } else if let Some(size) = images.external_disk_size {
+            virtio.push(VirtioDev::new(Backend::ExternalBlock {
+                size,
+                pending: None,
+            }));
         }
         if let Some(mac) = images.net {
             virtio.push(VirtioDev::new(Backend::Net {
@@ -716,6 +725,40 @@ impl VirtMachine {
             .find(|d| d.device_id() == 1)
             .map(|d| d.net_take_output())
             .unwrap_or_default()
+    }
+
+    pub fn pending_block_request(&self) -> Option<crate::virtio::PendingBlockRequest> {
+        self.bus
+            .virtio
+            .iter()
+            .find_map(|dev| dev.pending_block_request())
+    }
+
+    pub fn complete_block_request(&mut self, id: u64, data: &[u8], ok: bool) -> bool {
+        let Some(dev) = self
+            .bus
+            .virtio
+            .iter_mut()
+            .find(|dev| dev.pending_block_request().is_some())
+        else {
+            return false;
+        };
+        let result = dev.complete_block_request(
+            id,
+            data,
+            ok,
+            &mut self.bus.ram,
+            RAM_BASE,
+            &mut self.bus.jit,
+        );
+        if result {
+            self.sync_devices();
+        }
+        result
+    }
+
+    pub fn pending_block_request_len(&self) -> Option<u64> {
+        self.pending_block_request().map(|request| request.len())
     }
 
     /// Supply the RTC's Unix-epoch time from the embedding host.
@@ -963,10 +1006,16 @@ impl VirtMachine {
         let start = self.cpu.insn_count;
         self.bus.poll_virtio();
         self.sync_devices();
+        if self.pending_block_request().is_some() {
+            return RunSliceOutcome {
+                retired: 0,
+                idle: false,
+            };
+        }
         let mut remaining = max_insns;
         let mut stop = InterpreterStop::Cpu(StopReason::Budget);
         while remaining != 0 && !self.power_off {
-            let chunk = if compiled.is_some() {
+            let chunk = if compiled.is_some() || self.has_external_disk() {
                 remaining.min(INTERPRETER_SYNC_INTERVAL)
             } else {
                 remaining
@@ -994,10 +1043,14 @@ impl VirtMachine {
                     }
                     continue;
                 }
-                InterpreterStop::Cpu(StopReason::Budget)
-                    if compiled.is_some() && remaining != 0 =>
-                {
+                InterpreterStop::Cpu(StopReason::Budget) if remaining != 0 => {
                     self.sync_devices();
+                    if self.pending_block_request().is_some() {
+                        break;
+                    }
+                    if compiled.is_none() && !self.has_external_disk() {
+                        break;
+                    }
                     continue;
                 }
                 _ => break,
@@ -1021,6 +1074,13 @@ impl VirtMachine {
             retired: self.cpu.insn_count - start,
             idle,
         }
+    }
+
+    fn has_external_disk(&self) -> bool {
+        self.bus
+            .virtio
+            .iter()
+            .any(|device| matches!(device.backend, Backend::ExternalBlock { .. }))
     }
 }
 
@@ -1201,6 +1261,7 @@ mod tests {
                 cmdline: "console=ttyS0",
                 initrd: None,
                 disk: None,
+                external_disk_size: None,
                 net: None,
             },
         )

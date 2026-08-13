@@ -59,6 +59,7 @@ if command -v node >/dev/null 2>&1; then
     run_stage "$CARGO" build --release -q -p rv64-wasm --target wasm32-unknown-unknown
     run_stage node tests/boot-profile-selftest.mjs
     run_stage node tests/jit-code-store.mjs
+    run_stage node tests/native-disk.mjs
     if [ -f target/wasm32-unknown-unknown/release/rv64_wasm.wasm ]; then
         run_stage node tests/host-callback-boundary.mjs
         run_stage node tests/public-api.mjs

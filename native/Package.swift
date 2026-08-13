@@ -8,10 +8,15 @@ let package = Package(
         .iOS(.v17),
     ],
     products: [
+        .library(name: "LishDisk", targets: ["LishDisk"]),
         .library(name: "LishNetwork", targets: ["LishNetwork"]),
         .executable(name: "lish-network-host", targets: ["LishNetworkHost"]),
     ],
     targets: [
+        .target(
+            name: "LishDisk",
+            linkerSettings: [.linkedFramework("Network")]
+        ),
         .systemLibrary(
             name: "CLibSlirp",
             pkgConfig: "slirp",
@@ -30,6 +35,10 @@ let package = Package(
         .executableTarget(
             name: "LishNetworkHost",
             dependencies: ["LishNetwork"]
+        ),
+        .testTarget(
+            name: "LishDiskTests",
+            dependencies: ["LishDisk"]
         ),
         .testTarget(
             name: "LishNetworkTests",

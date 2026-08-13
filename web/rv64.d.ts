@@ -5,6 +5,14 @@ export type ImageSource =
   | Response
   | { url: string };
 
+export type NativeDiskSource = {
+  /** Authenticated `/disk` endpoint. The client appends `offset` and `length`. */
+  mode: "native";
+  url: string;
+  /** Raw image size. If omitted, the client obtains it with HEAD. */
+  size?: number;
+};
+
 export type ExecutionConfig =
   | { mode: "local" }
   | {
@@ -21,7 +29,7 @@ export type BootConfig =
       mode: "linux-direct";
       kernel: ImageSource;
       initrd?: ImageSource;
-      disk?: ImageSource;
+      disk?: ImageSource | NativeDiskSource;
       cmdline?: string;
     }
   | {
@@ -30,7 +38,7 @@ export type BootConfig =
       firmware: ImageSource;
       kernel?: ImageSource;
       initrd?: ImageSource;
-      disk?: ImageSource;
+      disk?: ImageSource | NativeDiskSource;
       cmdline?: string;
     };
 

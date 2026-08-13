@@ -598,7 +598,7 @@ impl JitState {
 
 #[cfg(test)]
 mod jit_state_tests {
-    use super::{block_should_replace_region, JitBlock, JitState};
+    use super::{account_compiled_dispatch, block_should_replace_region, JitBlock, JitState};
     use std::collections::HashSet;
 
     #[test]
@@ -669,6 +669,21 @@ mod jit_state_tests {
         assert_eq!(super::jit_tlb_fill(1, 0, 0), -1);
         assert_eq!(super::jit_tlb_fill(0x1234, 0, 0), -1);
         super::chain_next(0x1234);
+    }
+
+    #[test]
+    fn pending_host_io_still_accounts_compiled_dispatch() {
+        let mut retired_sum = 5;
+        let mut chained = 2;
+
+        assert!(account_compiled_dispatch(
+            &mut retired_sum,
+            &mut chained,
+            7,
+            true,
+        ));
+        assert_eq!(retired_sum, 12);
+        assert_eq!(chained, 3);
     }
 
     #[test]
@@ -1554,16 +1569,31 @@ static mut TLB_FILLS: u64 = 0;
 /// the cap trims cold reachable code, not the hot core.
 const MAX_LEADERS: usize = 512;
 
+trait FullSystemJitBus: Bus {
+    fn pending_host_io(&self) -> bool;
+}
+
+impl FullSystemJitBus for rv64_system::virt::VirtBus {
+    #[inline]
+    fn pending_host_io(&self) -> bool {
+        self.virtio
+            .iter()
+            .any(rv64_system::virtio::VirtioDev::has_pending_block_request)
+    }
+}
+
 /// Context passed to full-system compiled code. Generated modules treat this
 /// as opaque and pass it back when they need a host TLB refill or a chained
-/// dispatch. The callback makes the concrete bus type explicit without tying
+/// dispatch. The callbacks make the concrete bus type explicit without tying
 /// the generated-module ABI to either full-system machine implementation.
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct JitExecutionContext {
     cpu: *mut Cpu,
     bus: *mut (),
     jit: *mut JitState,
     tlb_fill: unsafe extern "C" fn(*mut Cpu, *mut (), u64, u32) -> i64,
+    host_io_pending: unsafe fn(*const ()) -> bool,
 }
 
 // Generated full-system modules receive this opaque handle, never a linear-
@@ -1574,7 +1604,7 @@ static mut ACTIVE_JIT_CONTEXT: Option<JitExecutionContext> = None;
 static mut FULL_SYSTEM_DISPATCH_ACTIVE: bool = false;
 
 impl JitExecutionContext {
-    fn new<B: Bus>(cpu: &mut Cpu, bus: &mut B, jit: &mut JitState) -> Self {
+    fn new<B: FullSystemJitBus>(cpu: &mut Cpu, bus: &mut B, jit: &mut JitState) -> Self {
         unsafe extern "C" fn fill<B: Bus>(cpu: *mut Cpu, bus: *mut (), va: u64, store: u32) -> i64 {
             unsafe {
                 (*cpu)
@@ -1583,11 +1613,16 @@ impl JitExecutionContext {
             }
         }
 
+        unsafe fn pending<B: FullSystemJitBus>(bus: *const ()) -> bool {
+            unsafe { (*bus.cast::<B>()).pending_host_io() }
+        }
+
         Self {
             cpu,
             bus: (bus as *mut B).cast(),
             jit,
             tlb_fill: fill::<B>,
+            host_io_pending: pending::<B>,
         }
     }
 
@@ -1597,6 +1632,10 @@ impl JitExecutionContext {
 
     unsafe fn dispatch_parts(&mut self) -> (&mut Cpu, &mut JitState) {
         unsafe { (&mut *self.cpu, &mut *self.jit) }
+    }
+
+    unsafe fn pending_host_io(self) -> bool {
+        unsafe { (self.host_io_pending)(self.bus.cast_const()) }
     }
 }
 
@@ -1636,6 +1675,11 @@ fn end_full_system_dispatch() {
         ACTIVE_JIT_CONTEXT = None;
         FULL_SYSTEM_DISPATCH_ACTIVE = false;
     }
+}
+
+#[inline]
+unsafe fn active_jit_context() -> Option<JitExecutionContext> {
+    unsafe { core::ptr::addr_of!(ACTIVE_JIT_CONTEXT).read() }
 }
 
 /// Clear dispatcher-owned context after a Wasm trap escaped a run export.
@@ -1681,6 +1725,7 @@ static mut VIRT_OPENSBI: Vec<u8> = Vec::new();
 static mut VIRT_KERNEL: Vec<u8> = Vec::new();
 static mut VIRT_INITRD: Vec<u8> = Vec::new();
 static mut VIRT_DISK: Vec<u8> = Vec::new();
+static mut VIRT_EXTERNAL_DISK_SIZE: u64 = 0;
 static mut VIRT_CMDLINE: Vec<u8> = Vec::new();
 static mut VIRT_NET_ON: bool = false;
 static mut VIRT_NET_MAC: Vec<u8> = Vec::new();
@@ -1698,6 +1743,12 @@ stage_into!(virt_stage_net_mac, VIRT_NET_MAC);
 #[no_mangle]
 pub extern "C" fn virt_net_enable(on: u32) {
     unsafe { VIRT_NET_ON = on != 0 }
+}
+
+/// Configure a native disk image without copying its contents into Wasm.
+#[no_mangle]
+pub extern "C" fn virt_external_disk_size(size: u64) {
+    unsafe { VIRT_EXTERNAL_DISK_SIZE = size }
 }
 
 /// Assemble and boot the modern virt machine from staged images.
@@ -1726,12 +1777,16 @@ fn boot_virt(ram_mb: u32, direct: bool) {
         let net = VIRT_NET_ON.then(|| {
             <[u8; 6]>::try_from(VIRT_NET_MAC.as_slice()).unwrap_or(rv64_system::virtio::DEFAULT_MAC)
         });
+        let disk = (!VIRT_DISK.is_empty()).then(|| core::mem::take(&mut VIRT_DISK));
+        let external_disk_size =
+            (disk.is_none() && VIRT_EXTERNAL_DISK_SIZE != 0).then_some(VIRT_EXTERNAL_DISK_SIZE);
         let images = rv64_system::virt::VirtImages {
             opensbi: &VIRT_OPENSBI,
             kernel: &VIRT_KERNEL,
             cmdline,
             initrd: (!VIRT_INITRD.is_empty()).then_some(VIRT_INITRD.as_slice()),
-            disk: (!VIRT_DISK.is_empty()).then(|| core::mem::take(&mut VIRT_DISK)),
+            disk,
+            external_disk_size,
             net,
         };
         let mut machine = if direct {
@@ -1744,6 +1799,7 @@ fn boot_virt(ram_mb: u32, direct: bool) {
         VIRT_KERNEL.clear();
         VIRT_INITRD.clear();
         VIRT_CMDLINE.clear();
+        VIRT_EXTERNAL_DISK_SIZE = 0;
         VIRT = Some(machine);
         VIRT_LAST_MONOTONIC_MS = host_now_ms();
         reset_full_system_jit();
@@ -1766,7 +1822,88 @@ pub extern "C" fn virt_run(max_insns: u64) -> i32 {
     let jit = unsafe { SYS_JIT.get_or_insert_with(JitState::new) };
     let result = run_full_system_jit(machine, jit, max_insns);
     end_full_system_dispatch();
-    result
+    if machine.pending_block_request().is_some() {
+        2
+    } else {
+        result
+    }
+}
+
+/// Return the pending native disk operation kind: 1=read, 2=write, 3=flush.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_disk_request_kind() -> u32 {
+    unsafe {
+        VIRT.as_ref()
+            .and_then(|machine| machine.pending_block_request())
+            .map_or(0, |request| match request.kind {
+                rv64_system::virtio::BlockRequestKind::Read => 1,
+                rv64_system::virtio::BlockRequestKind::Write => 2,
+                rv64_system::virtio::BlockRequestKind::Flush => 3,
+            })
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_disk_request_id() -> u64 {
+    unsafe {
+        VIRT.as_ref()
+            .and_then(|machine| machine.pending_block_request())
+            .map_or(0, |request| request.id)
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_disk_request_offset() -> u64 {
+    unsafe {
+        VIRT.as_ref()
+            .and_then(|machine| machine.pending_block_request())
+            .map_or(0, |request| request.offset)
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_disk_request_length() -> u64 {
+    unsafe {
+        VIRT.as_ref()
+            .and_then(|machine| machine.pending_block_request())
+            .map_or(0, |request| request.len())
+    }
+}
+
+/// Copy the pending write body into the staging buffer and return its length.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_disk_request_body() -> *mut u8 {
+    unsafe {
+        let body = VIRT
+            .as_ref()
+            .and_then(|machine| machine.pending_block_request())
+            .map(|request| request.data().to_vec())
+            .unwrap_or_default();
+        STAGING = body;
+        STAGING.as_mut_ptr()
+    }
+}
+
+/// Complete the pending native disk operation. The current staging buffer is
+/// used as read data when `ok` is non-zero.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_disk_complete(ok: u32) -> u32 {
+    unsafe {
+        let data = core::mem::take(&mut STAGING);
+        let Some(machine) = VIRT.as_mut() else {
+            return 0;
+        };
+        let Some(request) = machine.pending_block_request() else {
+            return 0;
+        };
+        machine.complete_block_request(request.id, &data, ok != 0) as u32
+    }
 }
 
 #[no_mangle]
@@ -1844,7 +1981,7 @@ pub extern "C" fn virt_unsupported_sbi_function() -> u64 {
 /// is private and statically dispatched: it defines the semantic boundary
 /// without adding virtual calls to the execution path.
 trait FullSystemJitMachine {
-    type Bus: Bus;
+    type Bus: FullSystemJitBus;
 
     fn cpu(&self) -> &Cpu;
     fn cpu_mut(&mut self) -> &mut Cpu;
@@ -1865,6 +2002,7 @@ trait FullSystemJitMachine {
     fn powered_off(&self) -> bool;
     fn refresh_jit_time(&mut self, force: bool);
     fn flush_host_io(&mut self);
+    fn pending_host_io(&self) -> bool;
 
     #[inline]
     fn ram_range(&self, physical: u64, len: usize) -> Option<core::ops::Range<usize>> {
@@ -1993,6 +2131,11 @@ impl FullSystemJitMachine for rv64_system::virt::VirtMachine {
             emit_host_write(1, &out);
         }
         pump_virt_net(self);
+    }
+
+    #[inline]
+    fn pending_host_io(&self) -> bool {
+        self.bus.pending_host_io()
     }
 }
 
@@ -2559,6 +2702,18 @@ fn try_extend_region<M: FullSystemJitMachine>(m: &mut M, jit: &mut JitState, idx
     }
 }
 
+#[inline]
+fn account_compiled_dispatch(
+    retired_sum: &mut u64,
+    chained: &mut u32,
+    retired: u64,
+    stop_requested: bool,
+) -> bool {
+    *retired_sum += retired;
+    *chained += 1;
+    stop_requested || retired == 0
+}
+
 #[allow(clippy::needless_range_loop)] // avoids references to mutable profiling statics
 #[allow(static_mut_refs)]
 fn run_full_system_jit<M: FullSystemJitMachine>(
@@ -2590,6 +2745,9 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
         // tick) or after 64 iterations without insn progress (WFI idle — time
         // must still advance or timers never fire).
         m.refresh_jit_time(false);
+        if m.pending_host_io() {
+            break;
+        }
         // Address-space switch (satp write): compiled blocks SURVIVE — they're
         // va-keyed and every dispatch lazily re-verifies its va→pa mapping when
         // cpu.map_gen moved, so a block whose va now maps elsewhere (or nowhere)
@@ -2661,6 +2819,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
         let map_gen = m.cpu().map_gen as u32;
         let mut chained = 0u32;
         let mut retired_sum = 0u64;
+        let mut pending_host_io = false;
         // Budget/interrupt contract: this round may retire at most
         // min(remaining, INTERRUPT_QUANTUM) instructions (to block/iteration
         // granularity); each dispatch is granted the leftover as loop fuel.
@@ -2743,6 +2902,8 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                 jit.touch(pc);
             }
             call_block(idx & !SB_IDX_BIT, FULL_SYSTEM_CONTEXT_HANDLE);
+            pending_host_io = m.pending_host_io();
+            let mut stop_after_dispatch = pending_host_io;
             // Observed successor + stability count (JitState::succ). A
             // trace ends at its first indirect jump, so this records where
             // that jump actually goes. Once the target is proven stable,
@@ -2764,7 +2925,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                     jit.cache_remove(&pc);
                     jit.dispatch[sl].pc = NO_PC;
                     unsafe { IC_EXTENDS += 1 };
-                    break; // recompile on the next pass through tier-up
+                    stop_after_dispatch = true; // recompile on the next tier-up pass
                 }
             }
             // Sampled exit attribution: after a region function returns,
@@ -2827,8 +2988,12 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                     }
                 }
             }
-            retired_sum += retired;
-            chained += 1;
+            stop_after_dispatch = account_compiled_dispatch(
+                &mut retired_sum,
+                &mut chained,
+                retired,
+                stop_after_dispatch,
+            );
             // A block that retired nothing bailed on its very first instruction
             // (TLB miss / MMIO / FP fast-path). It makes no progress, so stop
             // chaining and let the interpreter handle that instruction — never
@@ -2850,6 +3015,8 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                         }
                     }
                 }
+            }
+            if stop_after_dispatch {
                 break;
             }
         }
@@ -2859,6 +3026,9 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
             JIT_DISPATCHES += chained as u64;
         }
         remaining = remaining.saturating_sub(retired_sum);
+        if pending_host_io {
+            break;
+        }
 
         // If we stopped only because we hit the chain cap (the next pc is still
         // compiled and making progress), keep running in the JIT: advance the
@@ -3425,6 +3595,9 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
             if outcome.idle {
                 break;
             }
+            if m.pending_host_io() {
+                break;
+            }
         } else {
             // Warm: interpret ONLY the uncompiled stretch — stop the moment pc
             // reaches a compiled block again. A fixed warm slice overshoots into
@@ -3481,6 +3654,9 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
             if outcome.idle {
                 break;
             }
+            if m.pending_host_io() {
+                break;
+            }
         }
 
         // Stream console output at quantum granularity, DURING execution —
@@ -3515,7 +3691,6 @@ static mut CHAIN_HOPS: u64 = 0;
 /// ONE place in Rust and the transfer is a plain indirect call through the
 /// table the main module owns.
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn chain_next(context: i32) {
     unsafe {
         if context != FULL_SYSTEM_CONTEXT_HANDLE
@@ -3524,9 +3699,12 @@ pub extern "C" fn chain_next(context: i32) {
         {
             return;
         }
-        let Some(context) = ACTIVE_JIT_CONTEXT.as_mut() else {
+        let Some(mut context) = active_jit_context() else {
             return;
         };
+        if context.pending_host_io() {
+            return;
+        }
         let next_idx = {
             let (cpu, jit) = context.dispatch_parts();
             // Fuel: the cumulative retired cell against this dispatch's grant.
@@ -4283,13 +4461,12 @@ pub extern "C" fn jit_set_tlb_fill(on: u32) {
 /// context owns the concrete CPU/bus callback for that call, so this ABI does
 /// not consult a global machine or assume one machine layout.
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn jit_tlb_fill(context: i32, va: u64, store: u32) -> i64 {
     unsafe {
         if context != FULL_SYSTEM_CONTEXT_HANDLE || !FULL_SYSTEM_DISPATCH_ACTIVE {
             return -1;
         }
-        let Some(context) = ACTIVE_JIT_CONTEXT.as_mut() else {
+        let Some(mut context) = active_jit_context() else {
             return -1;
         };
         TLB_FILLS += 1;

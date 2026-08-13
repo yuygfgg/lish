@@ -1,3 +1,9 @@
+import {
+  isNativeDisk,
+  NativeDiskClient,
+  serviceNativeDiskRequest,
+} from "./native-disk.js";
+
 // Lish browser runtime for the rv64-wasm module.
 //
 // The runtime talks to plain extern "C" exports over Wasm linear memory.
@@ -928,6 +934,7 @@ RV64Debug.prototype.bootVirtLinux = function ({
   kernel,
   initrd,
   disk,
+  externalDiskSize,
   cmdline,
   ramMB = 512,
   net = false,
@@ -943,6 +950,7 @@ RV64Debug.prototype.bootVirtLinux = function ({
   stage(kernel, () => this.ex.virt_stage_kernel());
   stage(initrd, () => this.ex.virt_stage_initrd());
   stage(disk, () => this.ex.virt_stage_disk());
+  if (externalDiskSize !== undefined) this.ex.virt_external_disk_size(BigInt(externalDiskSize));
   if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
   if (netMac) stage(new Uint8Array(netMac), () => this.ex.virt_stage_net_mac());
   this.ex.virt_net_enable(net ? 1 : 0);
@@ -956,6 +964,7 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
   kernel,
   initrd,
   disk,
+  externalDiskSize,
   cmdline,
   ramMB = 512,
   net = false,
@@ -970,6 +979,7 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
   stage(kernel, () => this.ex.virt_stage_kernel());
   stage(initrd, () => this.ex.virt_stage_initrd());
   stage(disk, () => this.ex.virt_stage_disk());
+  if (externalDiskSize !== undefined) this.ex.virt_external_disk_size(BigInt(externalDiskSize));
   if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
   if (netMac) stage(new Uint8Array(netMac), () => this.ex.virt_stage_net_mac());
   this.ex.virt_net_enable(net ? 1 : 0);
@@ -981,6 +991,37 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
 /** Run a slice of the modern virt machine. Returns true when powered off. */
 RV64Debug.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
   return this.ex.virt_run(BigInt(maxInsns)) === 1;
+};
+
+RV64Debug.prototype.virtRunSystemOutcome = function (maxInsns = 2_000_000n) {
+  return this.ex.virt_run(BigInt(maxInsns));
+};
+
+RV64Debug.prototype.virtDiskRequest = function () {
+  const kind = Number(this.ex.virt_disk_request_kind?.() ?? 0);
+  if (!kind) return null;
+  const request = {
+    id: this.ex.virt_disk_request_id(),
+    kind: ["", "read", "write", "flush"][kind] ?? "unknown",
+    offset: this.ex.virt_disk_request_offset(),
+    length: this.ex.virt_disk_request_length(),
+  };
+  if (kind === 2) {
+    const ptr = this.ex.virt_disk_request_body();
+    request.body = new Uint8Array(this.ex.memory.buffer, ptr, Number(request.length)).slice();
+  }
+  return request;
+};
+
+RV64Debug.prototype.virtDiskComplete = function (bytes, ok = true) {
+  if (bytes !== undefined) {
+    const body = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const ptr = this.ex.staging_alloc(body.length);
+    new Uint8Array(this.ex.memory.buffer, ptr, body.length).set(body);
+  } else {
+    this.ex.staging_alloc(0);
+  }
+  return this.ex.virt_disk_complete(ok ? 1 : 0) !== 0;
 };
 
 /** Send keyboard input to the modern machine's 8250 UART. */
@@ -1259,11 +1300,14 @@ export class RV64 {
   #networkConfig;
   #networkInput;
   #rawEthernet;
+  #disk;
+  #diskOperation = null;
 
-  constructor(core, boot, network, listeners) {
+  constructor(core, boot, network, listeners, disk = null) {
     this.#core = core;
     this.#boot = boot;
     this.#networkConfig = network;
+    this.#disk = disk;
     for (const [event, listener] of Object.entries(listeners ?? {})) {
       this.on(event, listener);
     }
@@ -1306,12 +1350,16 @@ export class RV64 {
     for (const key of ["firmware", "kernel", "initrd", "disk"]) {
       const source = boot[key];
       if (source !== undefined) {
-        resolved[key] = await imageBytes(source, key, emit);
+        resolved[key] = key === "disk" && isNativeDisk(source)
+          ? source
+          : await imageBytes(source, key, emit);
       }
     }
+    const disk = isNativeDisk(resolved.disk) ? await NativeDiskClient.create(resolved.disk) : null;
+    if (disk) resolved.disk = undefined;
     const network = normalizeNetwork(options.network);
     const core = await RV64Debug.create(wasmBytes, jit);
-    const vm = new RV64(core, { ...resolved, memoryMB }, network, events);
+    const vm = new RV64(core, { ...resolved, memoryMB }, network, events, disk);
     vm.#assemble();
     vm.#emit("ready", undefined);
     return vm;
@@ -1351,10 +1399,12 @@ export class RV64 {
 
   async stop() {
     this.#assertLive();
-    if (!this.#running) return;
-    this.#running = false;
-    ++this.#generation;
-    this.#emit("stop", { reason: "requested" });
+    if (this.#running) {
+      this.#running = false;
+      ++this.#generation;
+      this.#emit("stop", { reason: "requested" });
+    }
+    await this.#waitForDiskOperation();
   }
 
   async reset() {
@@ -1368,7 +1418,7 @@ export class RV64 {
 
   async destroy() {
     if (this.#destroyed) return;
-    if (this.#running) await this.stop();
+    await this.stop();
     this.#destroyed = true;
     ++this.#generation;
     this.#rawEthernet?.close();
@@ -1376,6 +1426,8 @@ export class RV64 {
     this.#core.destroyJit();
     this.#listeners.clear();
     this.#core = null;
+    this.#disk?.destroy();
+    this.#disk = null;
   }
 
   #assemble() {
@@ -1397,11 +1449,12 @@ export class RV64 {
         kernel: boot.kernel,
         initrd: boot.initrd,
         disk: boot.disk,
+        externalDiskSize: this.#disk?.size,
         cmdline: modernCmdline,
         ramMB: memoryMB ?? 512,
         ...networkOptions,
       });
-      this.#runSlice = () => this.#core.runVirtSystem(2_000_000n);
+      this.#runSlice = () => this.#core.virtRunSystemOutcome(2_000_000n);
       this.#input = (bytes) => this.#core.virtConsoleInput(bytes);
       this.#networkInput = (frame) => this.#core.virtNetInput(frame);
       this.#instructions = () => this.#core.virtInsnCount();
@@ -1413,12 +1466,13 @@ export class RV64 {
         kernel: boot.kernel,
         initrd: boot.initrd,
         disk: boot.disk,
+        externalDiskSize: this.#disk?.size,
         cmdline: modernCmdline,
         ramMB: memoryMB ?? 512,
         ...networkOptions,
       });
       this.#runSlice = () => {
-        const poweredOff = this.#core.runVirtSystem(2_000_000n);
+        const poweredOff = this.#core.virtRunSystemOutcome(2_000_000n);
         const ext = this.#core.ex.virt_unsupported_sbi_ext();
         if (ext !== 0n) {
           const fn = this.#core.ex.virt_unsupported_sbi_function();
@@ -1437,20 +1491,42 @@ export class RV64 {
     this.#connectNetwork();
   }
 
-  #tick(generation) {
+  async #tick(generation) {
     if (!this.#running || generation !== this.#generation) return;
     try {
-      if (this.#runSlice()) {
+      const outcome = this.#runSlice();
+      if (outcome === 2) {
+        const operation = this.#serviceDisk();
+        this.#diskOperation = operation;
+        try {
+          await operation;
+        } finally {
+          if (this.#diskOperation === operation) this.#diskOperation = null;
+        }
+        if (!this.#running || generation !== this.#generation) return;
+      } else if (outcome === 1) {
         this.#running = false;
         this.#emit("stop", { reason: "powered-off" });
         return;
       }
-      hostYield(() => this.#tick(generation));
+      hostYield(() => { void this.#tick(generation); });
     } catch (error) {
       this.#running = false;
       this.#emit("error", error);
       this.#emit("stop", { reason: "error" });
     }
+  }
+
+  async #serviceDisk() {
+    if (!this.#disk) throw new Error("VM requested native disk I/O without a disk service");
+    const request = this.#core.virtDiskRequest();
+    if (!request) throw new Error("VM reported disk I/O without a request");
+    await serviceNativeDiskRequest(this.#core, this.#disk, request);
+  }
+
+  async #waitForDiskOperation() {
+    const operation = this.#diskOperation;
+    if (operation) await operation;
   }
 
   #sendConsole(data) {
@@ -1765,7 +1841,12 @@ function cloneWorkerOptions(options) {
 
   const boot = { ...options.boot };
   for (const key of ["firmware", "kernel", "initrd", "disk"]) {
-    if (key in boot) boot[key] = cloneImage(boot[key], key);
+    if (!(key in boot)) continue;
+    if (key === "disk" && isNativeDisk(boot[key])) {
+      boot[key] = { ...boot[key] };
+    } else {
+      boot[key] = cloneImage(boot[key], key);
+    }
   }
   const network = options.network
     ? {

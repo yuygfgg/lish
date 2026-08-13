@@ -7,6 +7,13 @@ use crate::{checked_ram_range, JitPageState};
 pub enum Backend {
     /// virtio-blk (device id 2), backed by an in-memory disk image.
     Block { disk: Vec<u8> },
+    /// virtio-blk backed by a native file service. The device keeps only the
+    /// descriptor that is waiting for the host operation; the file remains
+    /// outside Wasm memory.
+    ExternalBlock {
+        size: u64,
+        pending: Option<PendingBlockRequest>,
+    },
     /// virtio-net (device id 1). RX = queue 0, TX = queue 1.
     ///
     /// The device works purely at layer 2: it moves whole Ethernet frames
@@ -20,6 +27,43 @@ pub enum Backend {
         /// Frames the guest has sent, awaiting collection by the host.
         outbox: Vec<Vec<u8>>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBlockRequest {
+    pub id: u64,
+    pub kind: BlockRequestKind,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    length: u64,
+    read_buffers: Vec<(u64, u32)>,
+    status_addr: u64,
+    queue_index: usize,
+    head: u16,
+    used_index_addr: u64,
+    used_entry: u64,
+    used_idx: u16,
+}
+
+impl PendingBlockRequest {
+    pub fn len(&self) -> u64 {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockRequestKind {
+    Read,
+    Write,
+    Flush,
 }
 
 const MAX_QUEUES: usize = 2;
@@ -73,6 +117,8 @@ pub struct VirtioDev {
 // virtio-blk request types
 const VIRTIO_BLK_T_IN: u32 = 0; // read
 const VIRTIO_BLK_T_OUT: u32 = 1; // write
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const MAX_DISK_OPERATION: u64 = 64 * 1024;
 
 const SECTOR: usize = 512;
 
@@ -91,7 +137,7 @@ impl VirtioDev {
 
     pub fn device_id(&self) -> u32 {
         match self.backend {
-            Backend::Block { .. } => 2,
+            Backend::Block { .. } | Backend::ExternalBlock { .. } => 2,
             Backend::Net { .. } => 1,
         }
     }
@@ -107,6 +153,7 @@ impl VirtioDev {
                 // offload, GSO and mergeable RX buffers, none of which a
                 // frame-shuffling device benefits from.
                 Backend::Net { .. } => 1 << 5,
+                Backend::ExternalBlock { .. } => 1 << 9, // VIRTIO_BLK_F_FLUSH
                 _ => 0,
             },
             _ => 0,
@@ -200,6 +247,9 @@ impl VirtioDev {
                     // reset
                     self.queues = Default::default();
                     self.int_status = 0;
+                    if let Backend::ExternalBlock { pending, .. } = &mut self.backend {
+                        *pending = None;
+                    }
                 }
             }
             0x080 => set_lo(&mut self.qm().desc, val),
@@ -226,6 +276,14 @@ impl VirtioDev {
             Backend::Block { disk } => {
                 // struct virtio_blk_config { le64 capacity; ... } in sectors.
                 let sectors = (disk.len() / SECTOR) as u64;
+                sectors
+                    .to_le_bytes()
+                    .get(off as usize)
+                    .copied()
+                    .unwrap_or(0)
+            }
+            Backend::ExternalBlock { size, .. } => {
+                let sectors = size / SECTOR as u64;
                 sectors
                     .to_le_bytes()
                     .get(off as usize)
@@ -278,6 +336,15 @@ impl VirtioDev {
                     self.queues.get(qi).map_or(0, |q| q.ready)
                 );
             }
+            return;
+        }
+        if matches!(
+            &self.backend,
+            Backend::ExternalBlock {
+                pending: Some(_),
+                ..
+            }
+        ) {
             return;
         }
         let mut serviced = 0u32;
@@ -350,6 +417,16 @@ impl VirtioDev {
             if written.is_none() {
                 // Not serviceable now (e.g. console RX with no input):
                 // leave the descriptor for later.
+                if let Backend::ExternalBlock {
+                    pending: Some(pending),
+                    ..
+                } = &mut self.backend
+                {
+                    pending.head = head;
+                    pending.used_index_addr = used_index_addr;
+                    pending.used_entry = used_entry;
+                    pending.used_idx = used_idx;
+                }
                 break;
             }
 
@@ -370,6 +447,103 @@ impl VirtioDev {
         }
     }
 
+    /// Return the one host operation that is waiting for completion.
+    pub fn pending_block_request(&self) -> Option<PendingBlockRequest> {
+        match &self.backend {
+            Backend::ExternalBlock { pending, .. } => pending.clone(),
+            _ => None,
+        }
+    }
+
+    pub fn has_pending_block_request(&self) -> bool {
+        matches!(
+            &self.backend,
+            Backend::ExternalBlock {
+                pending: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Complete a native disk operation and publish its guest descriptor.
+    /// `data` is required only for reads; writes and flushes use an empty body.
+    pub fn complete_block_request(
+        &mut self,
+        id: u64,
+        data: &[u8],
+        ok: bool,
+        ram: &mut [u8],
+        ram_base: u64,
+        jit: &mut JitPageState,
+    ) -> bool {
+        let Backend::ExternalBlock { pending, .. } = &mut self.backend else {
+            return false;
+        };
+        let Some(request) = pending.take() else {
+            return false;
+        };
+        if request.id != id {
+            *pending = Some(request);
+            return false;
+        }
+
+        // A completion is one commit. Validate every destination before the
+        // first guest write so an invalid scatter list cannot produce a
+        // partially updated read buffer.
+        let read_targets_valid = request.kind != BlockRequestKind::Read
+            || request.read_buffers.iter().all(|&(addr, len)| {
+                checked_ram_range(ram.len(), ram_base, addr, len as usize).is_some()
+            });
+        let completion_targets_valid = read_targets_valid
+            && checked_ram_range(ram.len(), ram_base, request.status_addr, 1).is_some()
+            && checked_ram_range(ram.len(), ram_base, request.used_entry, 8).is_some()
+            && checked_ram_range(ram.len(), ram_base, request.used_index_addr, 2).is_some();
+        if !completion_targets_valid {
+            *pending = Some(request);
+            return false;
+        }
+
+        let data_valid = match request.kind {
+            BlockRequestKind::Read => data.len() as u64 == request.length,
+            BlockRequestKind::Write | BlockRequestKind::Flush => data.is_empty(),
+        };
+        let mut success = ok && data_valid;
+        if success && request.kind == BlockRequestKind::Read {
+            let mut copied = 0usize;
+            for &(addr, len) in &request.read_buffers {
+                let end = copied + len as usize;
+                success &= guest_write(ram, ram_base, addr, &data[copied..end], jit);
+                copied = end;
+            }
+        }
+        success &= guest_write(
+            ram,
+            ram_base,
+            request.status_addr,
+            &[if success { 0 } else { 1 }],
+            jit,
+        );
+        write32(ram, ram_base, request.used_entry, request.head as u32, jit);
+        let written = if request.kind == BlockRequestKind::Read && success {
+            request.length as u32 + 1
+        } else {
+            1
+        };
+        write32(ram, ram_base, request.used_entry + 4, written, jit);
+        write16(
+            ram,
+            ram_base,
+            request.used_index_addr,
+            request.used_idx.wrapping_add(1),
+            jit,
+        );
+        self.queues[request.queue_index].last_avail_idx = self.queues[request.queue_index]
+            .last_avail_idx
+            .wrapping_add(1);
+        self.int_status |= 1;
+        true
+    }
+
     /// Service one descriptor chain; returns bytes written to guest buffers,
     /// or None if the request can't be serviced yet.
     fn service(
@@ -384,7 +558,9 @@ impl VirtioDev {
             Backend::Block { disk } => {
                 // Layout: header (16B, read-only) | data buffers | status (1B, writable)
                 let (hdr_addr, ..) = *chain.first()?;
-                let header = guest_slice(ram, ram_base, hdr_addr, 16)?;
+                let Some(header) = guest_slice(ram, ram_base, hdr_addr, 16) else {
+                    return Some(0);
+                };
                 let req_type = u32::from_le_bytes(header[..4].try_into().unwrap());
                 let sector = u64::from_le_bytes(header[8..16].try_into().unwrap());
                 let mut pos = usize::try_from(sector)
@@ -426,6 +602,122 @@ impl VirtioDev {
                     written += 1;
                 }
                 Some(written)
+            }
+            Backend::ExternalBlock { size, pending } => {
+                if qi != 0 {
+                    return Some(0);
+                }
+                if pending.is_some() {
+                    return None;
+                }
+                let Some(&(status_addr, status_len, status_writable)) = chain.last() else {
+                    return Some(0);
+                };
+                if status_len < 1
+                    || !status_writable
+                    || checked_ram_range(ram.len(), ram_base, status_addr, 1).is_none()
+                {
+                    return Some(0);
+                }
+                let reject = |ram: &mut [u8], jit: &mut JitPageState| {
+                    let _ = guest_write(ram, ram_base, status_addr, &[1], jit);
+                    Some(1)
+                };
+                let Some(&(hdr_addr, hdr_len, hdr_writable)) = chain.first() else {
+                    return Some(0);
+                };
+                if chain.len() < 2 || hdr_len < 16 || hdr_writable {
+                    return reject(ram, jit);
+                }
+                let Some(header) = guest_slice(ram, ram_base, hdr_addr, 16) else {
+                    return reject(ram, jit);
+                };
+                let req_type = u32::from_le_bytes(header[..4].try_into().unwrap());
+                let kind = match req_type {
+                    VIRTIO_BLK_T_IN => BlockRequestKind::Read,
+                    VIRTIO_BLK_T_OUT => BlockRequestKind::Write,
+                    VIRTIO_BLK_T_FLUSH => BlockRequestKind::Flush,
+                    _ => return reject(ram, jit),
+                };
+                let sector = u64::from_le_bytes(header[8..16].try_into().unwrap());
+                let Some(offset) = sector.checked_mul(SECTOR as u64) else {
+                    return reject(ram, jit);
+                };
+                let body = chain.get(1..chain.len().saturating_sub(1))?;
+                let mut body_len = 0u64;
+                let mut read_buffers = Vec::new();
+                for &(addr, len, writable) in body {
+                    let descriptor_valid = match kind {
+                        BlockRequestKind::Read => {
+                            let valid = writable
+                                && checked_ram_range(ram.len(), ram_base, addr, len as usize)
+                                    .is_some();
+                            if valid {
+                                read_buffers.push((addr, len));
+                            }
+                            valid
+                        }
+                        BlockRequestKind::Write => {
+                            !writable && guest_slice(ram, ram_base, addr, len).is_some()
+                        }
+                        BlockRequestKind::Flush => len == 0,
+                    };
+                    if !descriptor_valid {
+                        return reject(ram, jit);
+                    }
+                    let Some(next) = body_len.checked_add(len as u64) else {
+                        return reject(ram, jit);
+                    };
+                    if next > MAX_DISK_OPERATION {
+                        return reject(ram, jit);
+                    }
+                    body_len = next;
+                }
+                if kind == BlockRequestKind::Flush && chain.len() != 2 {
+                    return reject(ram, jit);
+                }
+                let range_end = match kind {
+                    BlockRequestKind::Flush => 0,
+                    BlockRequestKind::Read | BlockRequestKind::Write => {
+                        let Some(end) = offset.checked_add(body_len) else {
+                            return reject(ram, jit);
+                        };
+                        end
+                    }
+                };
+                if range_end > *size
+                    || (kind != BlockRequestKind::Flush && body_len == 0)
+                    || (kind == BlockRequestKind::Flush && body_len != 0)
+                {
+                    return reject(ram, jit);
+                }
+                let data = if kind == BlockRequestKind::Write {
+                    let mut data = Vec::with_capacity(body_len as usize);
+                    for &(addr, len, _) in body {
+                        let source = guest_slice(ram, ram_base, addr, len)
+                            .expect("write source was validated");
+                        data.extend_from_slice(source);
+                    }
+                    data
+                } else {
+                    Vec::new()
+                };
+                let id = NEXT_BLOCK_REQUEST_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                *pending = Some(PendingBlockRequest {
+                    id,
+                    kind,
+                    offset,
+                    data,
+                    length: body_len,
+                    read_buffers,
+                    status_addr,
+                    queue_index: qi,
+                    head: 0,
+                    used_index_addr: 0,
+                    used_entry: 0,
+                    used_idx: 0,
+                });
+                None
             }
             Backend::Net { inbox, outbox, .. } => {
                 if qi == 0 {
@@ -491,6 +783,8 @@ impl VirtioDev {
         }
     }
 }
+
+static NEXT_BLOCK_REQUEST_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Guest-physical view of a descriptor, or `None` if it does not lie entirely
 /// within RAM.
@@ -683,6 +977,42 @@ mod tests {
         process(dev, 0, ram);
     }
 
+    fn submit_split_block(
+        dev: &mut VirtioDev,
+        ram: &mut [u8],
+        request_type: u32,
+        sector: u64,
+        writable_data: bool,
+        first_len: u32,
+    ) {
+        assert!(first_len < SECTOR as u32);
+        setup_ring(dev, 0, &RING0);
+        ram[REQ..REQ + 4].copy_from_slice(&request_type.to_le_bytes());
+        ram[REQ + 8..REQ + 16].copy_from_slice(&sector.to_le_bytes());
+        put_desc_in(ram, &RING0, 0, REQ, 16, 1, 1);
+        put_desc_in(
+            ram,
+            &RING0,
+            1,
+            REQ + 0x100,
+            first_len,
+            1 | if writable_data { 2 } else { 0 },
+            2,
+        );
+        put_desc_in(
+            ram,
+            &RING0,
+            2,
+            REQ + 0x200,
+            SECTOR as u32 - first_len,
+            1 | if writable_data { 2 } else { 0 },
+            3,
+        );
+        put_desc_in(ram, &RING0, 3, REQ + 0x400, 1, 2, 0);
+        publish(ram, &RING0, 0, 1);
+        process(dev, 0, ram);
+    }
+
     #[test]
     fn block_reads_a_sector_into_guest_memory() {
         let (mut dev, mut ram) = block_device();
@@ -713,6 +1043,267 @@ mod tests {
 
         assert_eq!(ram[REQ + 0x300], 1);
         assert_eq!(u16_at(&ram, USED + 2), 1);
+    }
+
+    fn external_block_device() -> (VirtioDev, Vec<u8>) {
+        (
+            VirtioDev::new(Backend::ExternalBlock {
+                size: 4 * SECTOR as u64,
+                pending: None,
+            }),
+            vec![0u8; 64 * 1024],
+        )
+    }
+
+    #[test]
+    fn external_block_advertises_capacity_and_flush() {
+        let (mut dev, _) = external_block_device();
+        assert_eq!(dev.read(0x100), 4);
+        dev.write(0x014, 0);
+        assert_eq!(dev.read(0x010), 1 << 9, "VIRTIO_BLK_F_FLUSH");
+        dev.write(0x014, 1);
+        assert_eq!(dev.read(0x010), 1, "VIRTIO_F_VERSION_1");
+    }
+
+    #[test]
+    fn external_block_read_commits_exact_host_data() {
+        let (mut dev, mut ram) = external_block_device();
+        ram[REQ + 0x100..REQ + 0x100 + SECTOR].fill(0xa5);
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_IN, 1, true);
+
+        let request = dev.pending_block_request().expect("pending read");
+        assert_eq!(request.kind, BlockRequestKind::Read);
+        assert_eq!(request.offset, SECTOR as u64);
+        assert_eq!(request.len(), SECTOR as u64);
+        assert_eq!(u16_at(&ram, USED + 2), 0, "descriptor stays pending");
+
+        let mut jit = JitPageState::new(ram.len());
+        let data = vec![0x5a; SECTOR];
+        assert!(dev.complete_block_request(request.id, &data, true, &mut ram, BASE, &mut jit,));
+        assert_eq!(&ram[REQ + 0x100..REQ + 0x100 + SECTOR], &data);
+        assert_eq!(ram[REQ + 0x300], 0);
+        assert_eq!(u16_at(&ram, USED + 2), 1);
+        assert_eq!(used_entry(&ram, &RING0, 1), (0, SECTOR as u32 + 1));
+        assert!(!dev.has_pending_block_request());
+        assert!(dev.irq_pending());
+        assert!(!dev.complete_block_request(request.id, &data, true, &mut ram, BASE, &mut jit,));
+        assert_eq!(u16_at(&ram, USED + 2), 1, "completion publishes once");
+    }
+
+    #[test]
+    fn external_block_failed_reads_do_not_modify_guest_data() {
+        let cases = [
+            ("short", vec![0x5a; SECTOR - 1], true),
+            ("long", vec![0x5a; SECTOR + 1], true),
+            ("host failure", vec![0x5a; SECTOR], false),
+        ];
+
+        for (case, data, ok) in cases {
+            let (mut dev, mut ram) = external_block_device();
+            ram[REQ + 0x100..REQ + 0x100 + SECTOR].fill(0xa5);
+            submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_IN, 1, true);
+            let request = dev.pending_block_request().expect("pending read");
+            let mut jit = JitPageState::new(ram.len());
+
+            assert!(dev.complete_block_request(request.id, &data, ok, &mut ram, BASE, &mut jit,));
+            assert_eq!(
+                &ram[REQ + 0x100..REQ + 0x100 + SECTOR],
+                &[0xa5; SECTOR],
+                "{case} modified the guest read buffer"
+            );
+            assert_eq!(ram[REQ + 0x300], 1, "{case} must report IOERR");
+            assert_eq!(u16_at(&ram, USED + 2), 1);
+            assert_eq!(used_entry(&ram, &RING0, 1), (0, 1));
+            assert!(!dev.has_pending_block_request());
+        }
+    }
+
+    #[test]
+    fn external_block_read_scatters_across_descriptors() {
+        let (mut dev, mut ram) = external_block_device();
+        let first_len = 173usize;
+        submit_split_block(
+            &mut dev,
+            &mut ram,
+            VIRTIO_BLK_T_IN,
+            1,
+            true,
+            first_len as u32,
+        );
+        let request = dev.pending_block_request().expect("pending read");
+        let data: Vec<u8> = (0..SECTOR).map(|index| (index % 251) as u8).collect();
+        let mut jit = JitPageState::new(ram.len());
+
+        assert!(dev.complete_block_request(request.id, &data, true, &mut ram, BASE, &mut jit,));
+        assert_eq!(
+            &ram[REQ + 0x100..REQ + 0x100 + first_len],
+            &data[..first_len]
+        );
+        assert_eq!(
+            &ram[REQ + 0x200..REQ + 0x200 + SECTOR - first_len],
+            &data[first_len..]
+        );
+        assert_eq!(ram[REQ + 0x400], 0);
+        assert_eq!(used_entry(&ram, &RING0, 1), (0, SECTOR as u32 + 1));
+    }
+
+    #[test]
+    fn external_block_wrong_id_preserves_the_pending_request() {
+        let (mut dev, mut ram) = external_block_device();
+        ram[REQ + 0x100..REQ + 0x100 + SECTOR].fill(0xa5);
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_IN, 1, true);
+        let request = dev.pending_block_request().expect("pending read");
+        let mut jit = JitPageState::new(ram.len());
+
+        assert!(!dev.complete_block_request(
+            request.id.wrapping_add(1),
+            &[0x5a; SECTOR],
+            true,
+            &mut ram,
+            BASE,
+            &mut jit,
+        ));
+        assert_eq!(dev.pending_block_request(), Some(request.clone()));
+        assert_eq!(&ram[REQ + 0x100..REQ + 0x100 + SECTOR], &[0xa5; SECTOR]);
+        assert_eq!(u16_at(&ram, USED + 2), 0);
+
+        assert!(dev.complete_block_request(
+            request.id,
+            &[0x5a; SECTOR],
+            true,
+            &mut ram,
+            BASE,
+            &mut jit,
+        ));
+        assert_eq!(u16_at(&ram, USED + 2), 1);
+    }
+
+    #[test]
+    fn external_block_repeated_notify_preserves_the_pending_request() {
+        let (mut dev, mut ram) = external_block_device();
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_IN, 1, true);
+        let request = dev.pending_block_request().expect("pending read");
+
+        process(&mut dev, 0, &mut ram);
+
+        assert_eq!(dev.pending_block_request(), Some(request.clone()));
+        assert_eq!(u16_at(&ram, USED + 2), 0);
+        let mut jit = JitPageState::new(ram.len());
+        assert!(dev.complete_block_request(
+            request.id,
+            &[0x5a; SECTOR],
+            true,
+            &mut ram,
+            BASE,
+            &mut jit,
+        ));
+        assert_eq!(u16_at(&ram, USED + 2), 1);
+        assert_eq!(used_entry(&ram, &RING0, 1), (0, SECTOR as u32 + 1));
+    }
+
+    #[test]
+    fn external_block_reset_cancels_the_pending_request() {
+        let (mut dev, mut ram) = external_block_device();
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_IN, 1, true);
+        let request = dev.pending_block_request().expect("pending read");
+        dev.write(0x070, 0);
+
+        assert!(!dev.has_pending_block_request());
+        assert!(!dev.irq_pending());
+        let mut jit = JitPageState::new(ram.len());
+        assert!(!dev.complete_block_request(
+            request.id,
+            &[0x5a; SECTOR],
+            true,
+            &mut ram,
+            BASE,
+            &mut jit,
+        ));
+        assert_eq!(u16_at(&ram, USED + 2), 0);
+    }
+
+    #[test]
+    fn external_block_write_and_flush_are_host_requests() {
+        let (mut dev, mut ram) = external_block_device();
+        ram[REQ + 0x100..REQ + 0x100 + SECTOR].fill(0xa5);
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_OUT, 2, false);
+
+        let write = dev.pending_block_request().expect("pending write");
+        assert_eq!(write.kind, BlockRequestKind::Write);
+        assert_eq!(write.offset, (2 * SECTOR) as u64);
+        assert_eq!(write.data(), &[0xa5; SECTOR]);
+        let mut jit = JitPageState::new(ram.len());
+        assert!(dev.complete_block_request(write.id, &[], true, &mut ram, BASE, &mut jit,));
+        assert_eq!(ram[REQ + 0x300], 0);
+
+        ram[REQ..REQ + 4].copy_from_slice(&VIRTIO_BLK_T_FLUSH.to_le_bytes());
+        ram[REQ + 8..REQ + 16].fill(0);
+        put_desc_in(&mut ram, &RING0, 0, REQ, 16, 1, 2);
+        put_desc_in(&mut ram, &RING0, 2, REQ + 0x300, 1, 2, 0);
+        publish(&mut ram, &RING0, 0, 2);
+        process(&mut dev, 0, &mut ram);
+
+        let flush = dev.pending_block_request().expect("pending flush");
+        assert_eq!(flush.kind, BlockRequestKind::Flush);
+        assert!(flush.is_empty());
+        assert!(dev.complete_block_request(flush.id, &[], true, &mut ram, BASE, &mut jit,));
+        assert_eq!(u16_at(&ram, USED + 2), 2);
+        assert_eq!(ram[REQ + 0x300], 0);
+    }
+
+    #[test]
+    fn external_block_write_gathers_multiple_descriptors() {
+        let (mut dev, mut ram) = external_block_device();
+        let first_len = 173usize;
+        ram[REQ + 0x100..REQ + 0x100 + first_len].fill(0x11);
+        ram[REQ + 0x200..REQ + 0x200 + SECTOR - first_len].fill(0x22);
+        submit_split_block(
+            &mut dev,
+            &mut ram,
+            VIRTIO_BLK_T_OUT,
+            2,
+            false,
+            first_len as u32,
+        );
+
+        let request = dev.pending_block_request().expect("pending write");
+        assert_eq!(request.kind, BlockRequestKind::Write);
+        assert_eq!(&request.data()[..first_len], &[0x11; 173]);
+        assert_eq!(&request.data()[first_len..], &[0x22; SECTOR - 173]);
+        let mut jit = JitPageState::new(ram.len());
+        assert!(dev.complete_block_request(request.id, &[], true, &mut ram, BASE, &mut jit,));
+        assert_eq!(ram[REQ + 0x400], 0);
+        assert_eq!(used_entry(&ram, &RING0, 1), (0, 1));
+    }
+
+    #[test]
+    fn external_block_rejects_invalid_flush_synchronously() {
+        let (mut dev, mut ram) = external_block_device();
+        submit_block(&mut dev, &mut ram, VIRTIO_BLK_T_FLUSH, 0, false);
+
+        assert!(!dev.has_pending_block_request());
+        assert_eq!(ram[REQ + 0x300], 1);
+        assert_eq!(u16_at(&ram, USED + 2), 1);
+        assert_eq!(used_entry(&ram, &RING0, 1), (0, 1));
+    }
+
+    #[test]
+    fn external_block_flush_failure_reports_ioerr() {
+        let (mut dev, mut ram) = external_block_device();
+        setup_ring(&mut dev, 0, &RING0);
+        ram[REQ..REQ + 4].copy_from_slice(&VIRTIO_BLK_T_FLUSH.to_le_bytes());
+        put_desc_in(&mut ram, &RING0, 0, REQ, 16, 1, 1);
+        put_desc_in(&mut ram, &RING0, 1, REQ + 0x300, 1, 2, 0);
+        publish(&mut ram, &RING0, 0, 1);
+        process(&mut dev, 0, &mut ram);
+
+        let request = dev.pending_block_request().expect("pending flush");
+        assert_eq!(request.kind, BlockRequestKind::Flush);
+        let mut jit = JitPageState::new(ram.len());
+        assert!(dev.complete_block_request(request.id, &[], false, &mut ram, BASE, &mut jit,));
+        assert_eq!(ram[REQ + 0x300], 1);
+        assert_eq!(u16_at(&ram, USED + 2), 1);
+        assert_eq!(used_entry(&ram, &RING0, 1), (0, 1));
     }
 
     // ---- virtio-net ----
