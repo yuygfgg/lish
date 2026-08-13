@@ -70,15 +70,47 @@ final class DiskHTTPServerTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: store.url)[4..<8], body[...])
     }
 
-    func testCorsPreflightAllowsDiskMethods() throws {
+    func testMaximumReadReturnsTheCompleteResponseBody() throws {
+        let image = Data((0..<(128 * 1024)).map { UInt8(truncatingIfNeeded: $0) })
+        let (server, store, port) = try makeServer(image: image)
+        defer {
+            server.stop()
+            store.close()
+        }
+        let path = try configuration().diskPath
+        let offset = 64 * 1024
+        let length = DiskStore.defaultMaximumOperationBytes
+
+        let response = try send(
+            port: port,
+            request: request(
+                method: "GET",
+                target: "\(path)?offset=\(offset)&length=\(length)"
+            )
+        )
+
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.headers["content-length"], String(length))
+        XCTAssertEqual(response.body, image[offset..<(offset + length)])
+    }
+
+    func testCorsPreflightAllowsDiskWriteWithOffset() throws {
         let (server, store, port) = try makeServer()
         defer {
             server.stop()
             store.close()
         }
+        let path = try configuration().diskPath
         let response = try send(
             port: port,
-            request: request(method: "OPTIONS", target: try configuration().diskPath)
+            request: request(
+                method: "OPTIONS",
+                target: "\(path)?offset=4",
+                headers: [
+                    "Access-Control-Request-Method": "PUT",
+                    "Access-Control-Request-Headers": "content-type",
+                ]
+            )
         )
 
         XCTAssertEqual(response.status, 204)
@@ -88,6 +120,48 @@ final class DiskHTTPServerTests: XCTestCase {
             "GET, HEAD, PUT, POST, OPTIONS"
         )
         XCTAssertEqual(response.headers["access-control-allow-headers"], "content-type")
+
+        XCTAssertEqual(try send(
+            port: port,
+            request: request(
+                method: "OPTIONS",
+                target: "\(path)?offset=4",
+                headers: ["Access-Control-Request-Method": "PUT"]
+            )
+        ).status, 204)
+    }
+
+    func testCorsPreflightRejectsInvalidDiskRequests() throws {
+        let (server, store, port) = try makeServer()
+        defer {
+            server.stop()
+            store.close()
+        }
+        let path = try configuration().diskPath
+
+        XCTAssertEqual(try send(
+            port: port,
+            request: request(method: "OPTIONS", target: "\(path)?offset=4")
+        ).status, 400)
+        XCTAssertEqual(try send(
+            port: port,
+            request: request(
+                method: "OPTIONS",
+                target: path,
+                headers: ["Access-Control-Request-Method": "PUT"]
+            )
+        ).status, 400)
+        XCTAssertEqual(try send(
+            port: port,
+            request: request(
+                method: "OPTIONS",
+                target: "\(path)?offset=4",
+                headers: [
+                    "Access-Control-Request-Method": "PUT",
+                    "Access-Control-Request-Headers": "authorization",
+                ]
+            )
+        ).status, 400)
     }
 
     func testRequestValidationAndRangeErrors() throws {
@@ -164,9 +238,11 @@ final class DiskHTTPServerTests: XCTestCase {
         )
     }
 
-    private func makeServer() throws -> (DiskHTTPServer, DiskStore, UInt16) {
+    private func makeServer(
+        image data: Data = Data(repeating: 0x11, count: 1024)
+    ) throws -> (DiskHTTPServer, DiskStore, UInt16) {
         let image = directory.appendingPathComponent("disk.img")
-        try Data(repeating: 0x11, count: 1024).write(to: image)
+        try data.write(to: image)
         let store = try DiskStore(url: image)
         let server = DiskHTTPServer(store: store, configuration: try configuration())
         let started = expectation(description: "disk HTTP server started")

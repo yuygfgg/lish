@@ -9,30 +9,47 @@ export function isNativeDisk(value) {
     typeof value.url === "string";
 }
 
-export async function serviceNativeDiskRequest(core, disk, request) {
+export async function serviceNativeDiskRequest(core, disk, request, onFailure) {
   let data;
   let ok = false;
+  let failure;
   switch (request.kind) {
     case "read":
       try {
         data = await disk.read(Number(request.offset), Number(request.length));
         ok = true;
-      } catch {}
+      } catch (error) {
+        failure = error;
+      }
       break;
     case "write":
       try {
         await disk.write(Number(request.offset), request.body);
         ok = true;
-      } catch {}
+      } catch (error) {
+        failure = error;
+      }
       break;
     case "flush":
       try {
         await disk.flush();
         ok = true;
-      } catch {}
+      } catch (error) {
+        failure = error;
+      }
       break;
     default:
       throw new Error(`unknown native disk request: ${request.kind}`);
+  }
+  if (failure && globalThis.LISH_DIAGNOSTICS) {
+    const detail = {
+      kind: request.kind,
+      offset: String(request.offset),
+      length: String(request.length),
+      error: String(failure?.message ?? failure),
+    };
+    console.error("native disk request failed", detail);
+    onFailure?.(detail);
   }
   if (!core.virtDiskComplete(data, ok)) {
     throw new Error(`VM rejected native disk completion for request ${request.id}`);

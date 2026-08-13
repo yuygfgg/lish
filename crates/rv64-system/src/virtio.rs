@@ -118,7 +118,10 @@ pub struct VirtioDev {
 const VIRTIO_BLK_T_IN: u32 = 0; // read
 const VIRTIO_BLK_T_OUT: u32 = 1; // write
 const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const VIRTIO_BLK_F_SIZE_MAX: u32 = 1;
+const VIRTIO_BLK_F_SEG_MAX: u32 = 2;
 const MAX_DISK_OPERATION: u64 = 64 * 1024;
+const MAX_DISK_SEGMENTS: u32 = 1;
 
 const SECTOR: usize = 512;
 
@@ -153,7 +156,10 @@ impl VirtioDev {
                 // offload, GSO and mergeable RX buffers, none of which a
                 // frame-shuffling device benefits from.
                 Backend::Net { .. } => 1 << 5,
-                Backend::ExternalBlock { .. } => 1 << 9, // VIRTIO_BLK_F_FLUSH
+                Backend::ExternalBlock { .. } => {
+                    (1 << VIRTIO_BLK_F_SIZE_MAX) | (1 << VIRTIO_BLK_F_SEG_MAX) | (1 << 9)
+                    // SIZE_MAX, SEG_MAX, FLUSH
+                }
                 _ => 0,
             },
             _ => 0,
@@ -283,12 +289,15 @@ impl VirtioDev {
                     .unwrap_or(0)
             }
             Backend::ExternalBlock { size, .. } => {
-                let sectors = size / SECTOR as u64;
-                sectors
-                    .to_le_bytes()
-                    .get(off as usize)
-                    .copied()
-                    .unwrap_or(0)
+                let sectors = (size / SECTOR as u64).to_le_bytes();
+                let size_max = (MAX_DISK_OPERATION as u32).to_le_bytes();
+                let seg_max = MAX_DISK_SEGMENTS.to_le_bytes();
+                match off {
+                    0..=7 => sectors[off as usize],
+                    8..=11 => size_max[(off - 8) as usize],
+                    12..=15 => seg_max[(off - 12) as usize],
+                    _ => 0,
+                }
             }
             Backend::Net { mac, .. } => {
                 // struct virtio_net_config { u8 mac[6]; le16 status; ... }
@@ -1056,11 +1065,17 @@ mod tests {
     }
 
     #[test]
-    fn external_block_advertises_capacity_and_flush() {
+    fn external_block_advertises_capacity_limits_and_flush() {
         let (mut dev, _) = external_block_device();
         assert_eq!(dev.read(0x100), 4);
+        assert_eq!(dev.read(0x108), MAX_DISK_OPERATION as u32);
+        assert_eq!(dev.read(0x10c), MAX_DISK_SEGMENTS);
         dev.write(0x014, 0);
-        assert_eq!(dev.read(0x010), 1 << 9, "VIRTIO_BLK_F_FLUSH");
+        assert_eq!(
+            dev.read(0x010),
+            (1 << VIRTIO_BLK_F_SIZE_MAX) | (1 << VIRTIO_BLK_F_SEG_MAX) | (1 << 9),
+            "VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_FLUSH"
+        );
         dev.write(0x014, 1);
         assert_eq!(dev.read(0x010), 1, "VIRTIO_F_VERSION_1");
     }

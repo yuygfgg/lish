@@ -366,7 +366,7 @@ private final class DiskHTTPSession: @unchecked Sendable {
             return
         }
         if request.method == "OPTIONS" {
-            guard request.bodyLength == 0, request.origin != nil, request.query.isEmpty else {
+            guard request.isValidPreflight(configuration: configuration) else {
                 respond(status: 400, body: Data("invalid preflight request".utf8))
                 return
             }
@@ -456,7 +456,12 @@ private final class DiskHTTPSession: @unchecked Sendable {
         }
         response.append(Data("Content-Length: \(body.count)\r\nContent-Type: application/octet-stream\r\n\r\n".utf8))
         response.append(body)
-        connection.send(content: response, completion: .contentProcessed { [weak self] _ in self?.stop() })
+        connection.send(
+            content: response,
+            contentContext: .finalMessage,
+            isComplete: true,
+            completion: .contentProcessed { [weak self] _ in self?.stop() }
+        )
     }
 
     private func respond(diskError error: Error) {
@@ -494,6 +499,8 @@ private final class DiskHTTPSession: @unchecked Sendable {
             path: target.path,
             query: target.queryItems ?? [],
             origin: headers["origin"],
+            accessControlRequestMethod: headers["access-control-request-method"],
+            accessControlRequestHeaders: headers["access-control-request-headers"],
             bodyLength: bodyLength
         )
     }
@@ -504,6 +511,8 @@ private struct HTTPRequest {
     let path: String
     let query: [URLQueryItem]
     let origin: String?
+    let accessControlRequestMethod: String?
+    let accessControlRequestHeaders: String?
     let bodyLength: Int
 
     func queryUInt64(_ name: String) -> UInt64? {
@@ -514,6 +523,42 @@ private struct HTTPRequest {
 
     func hasOnlyQueryItems(_ names: Set<String>) -> Bool {
         Set(query.map(\.name)) == names && query.count == names.count
+    }
+
+    func isValidPreflight(configuration: DiskHTTPServerConfiguration) -> Bool {
+        guard bodyLength == 0,
+              origin != nil,
+              let requestedMethod = accessControlRequestMethod?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .uppercased(),
+              let requestedHeaders else { return false }
+
+        switch (path, requestedMethod) {
+        case (configuration.diskPath, "HEAD"):
+            return query.isEmpty && requestedHeaders.isEmpty
+        case (configuration.diskPath, "GET"):
+            return queryUInt64("offset") != nil
+                && queryUInt64("length") != nil
+                && hasOnlyQueryItems(["offset", "length"])
+                && requestedHeaders.isEmpty
+        case (configuration.diskPath, "PUT"):
+            return queryUInt64("offset") != nil
+                && hasOnlyQueryItems(["offset"])
+                && requestedHeaders.isSubset(of: ["content-type"])
+        case (configuration.flushPath, "POST"):
+            return query.isEmpty && requestedHeaders.isEmpty
+        default:
+            return false
+        }
+    }
+
+    private var requestedHeaders: Set<String>? {
+        guard let value = accessControlRequestHeaders else { return [] }
+        let names = value.split(separator: ",", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        guard names.allSatisfy({ !$0.isEmpty }) else { return nil }
+        return Set(names)
     }
 }
 

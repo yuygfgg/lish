@@ -1,6 +1,6 @@
-import { RV64 } from "./rv64.js?v=3";
+import { RV64 } from "./rv64.js";
 
-const INTERNAL_EVENTS = ["stop", "error"];
+const INTERNAL_EVENTS = ["stop", "error", "diskError"];
 
 let vm = null;
 
@@ -29,6 +29,7 @@ function postEvent(event, detail) {
 }
 
 async function create(message) {
+  globalThis.LISH_DIAGNOSTICS = message.diagnostics === true;
   const eventNames = new Set([...INTERNAL_EVENTS, ...(message.eventNames ?? [])]);
   const events = Object.fromEntries(
     [...eventNames].map((event) => [event, (detail) => postEvent(event, detail)]),

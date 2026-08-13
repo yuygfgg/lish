@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Build a self-contained, ad-hoc signed macOS application bundle.
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+output_root="$root/target/macos"
+output_app="$output_root/Lish.app"
+plist_source="$root/native/LishApp-Info.plist"
+web_source="$root/web"
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "missing required command: $1" >&2
+        exit 2
+    }
+}
+
+require_file() {
+    [ -s "$1" ] || {
+        echo "required file is missing or empty: $1" >&2
+        exit 2
+    }
+}
+
+copy_web_file() {
+    local relative="$1"
+    local source="$web_source/$relative"
+    local destination="$resources/web/$relative"
+    require_file "$source"
+    mkdir -p "$(dirname "$destination")"
+    install -m 0644 "$source" "$destination"
+}
+
+bundled_dylib_name() {
+    case "$(basename "$1")" in
+        libslirp.0.dylib | libglib-2.0.0.dylib | libintl.8.dylib | libpcre2-8.0.dylib)
+            basename "$1"
+            ;;
+    esac
+}
+
+rewrite_bundled_dependencies() {
+    local binary="$1"
+    local binary_name
+    local dependency
+    local dylib_name
+    binary_name="$(basename "$binary")"
+
+    while IFS= read -r dependency; do
+        dylib_name="$(bundled_dylib_name "$dependency")"
+        [ -n "$dylib_name" ] || continue
+        [ "$binary_name" != "$dylib_name" ] || continue
+        [ "$dependency" = "@rpath/$dylib_name" ] || \
+            install_name_tool -change "$dependency" "@rpath/$dylib_name" "$binary"
+    done < <(otool -L "$binary" | awk 'NR > 1 { print $1 }')
+}
+
+verify_macho_dependencies() {
+    local candidate
+    local dependency
+    local file_type
+    local failed=0
+    local macho_count=0
+
+    while IFS= read -r -d '' candidate; do
+        file_type="$(file -b "$candidate")"
+        case "$file_type" in
+            Mach-O*) ;;
+            *) continue ;;
+        esac
+        macho_count=$((macho_count + 1))
+
+        while IFS= read -r dependency; do
+            case "$dependency" in
+                /System/Library/* | /usr/lib/* | @rpath/* | @loader_path/* | @executable_path/*)
+                    ;;
+                *)
+                    echo "external dynamic library reference in $candidate: $dependency" >&2
+                    failed=1
+                    ;;
+            esac
+            case "$dependency" in
+                /opt/homebrew/* | /usr/local/opt/* | /usr/local/Cellar/*)
+                    echo "Homebrew dynamic library reference in $candidate: $dependency" >&2
+                    failed=1
+                    ;;
+            esac
+        done < <(otool -L "$candidate" | awk 'NR > 1 { print $1 }')
+    done < <(find "$stage_app" -type f -print0)
+
+    [ "$macho_count" -gt 0 ] || {
+        echo "application bundle contains no Mach-O files" >&2
+        return 1
+    }
+    [ "$failed" -eq 0 ]
+}
+
+for command_name in \
+    awk basename brew codesign dirname file find grep install install_name_tool \
+    mkdir mktemp mv npm otool plutil rm swift; do
+    require_command "$command_name"
+done
+
+require_file "$plist_source"
+plutil -lint "$plist_source" >/dev/null
+
+if [ ! -s "$web_source/vendor/xterm/xterm.js" ] || \
+   [ ! -s "$web_source/vendor/xterm/xterm.css" ] || \
+   [ ! -s "$web_source/vendor/xterm/addon-fit.js" ]; then
+    echo "staging xterm dependencies"
+    (cd "$root" && npm run stage-web-dependencies)
+fi
+
+require_file "$web_source/images/alpine/Image"
+require_file "$web_source/images/alpine/alpine.ext4"
+
+echo "building WebAssembly runtime"
+(cd "$root" && "$root/tools/cargo" build -p rv64-wasm --target wasm32-unknown-unknown --release)
+wasm_source="$root/target/wasm32-unknown-unknown/release/rv64_wasm.wasm"
+require_file "$wasm_source"
+
+swift_module_cache="$root/target/swift-module-cache"
+mkdir -p "$swift_module_cache"
+echo "building macOS executable"
+(
+    cd "$root"
+    CLANG_MODULE_CACHE_PATH="$swift_module_cache" \
+    SWIFTPM_MODULECACHE_OVERRIDE="$swift_module_cache" \
+        swift build --disable-sandbox --package-path native -c release --product lish-macos
+)
+swift_bin="$({
+    CLANG_MODULE_CACHE_PATH="$swift_module_cache" \
+    SWIFTPM_MODULECACHE_OVERRIDE="$swift_module_cache" \
+        swift build --disable-sandbox --package-path "$root/native" -c release --show-bin-path
+} 2>/dev/null)"
+executable_source="$swift_bin/lish-macos"
+require_file "$executable_source"
+
+libslirp_source="$(brew --prefix libslirp)/lib/libslirp.0.dylib"
+glib_source="$(brew --prefix glib)/lib/libglib-2.0.0.dylib"
+intl_source="$(brew --prefix gettext)/lib/libintl.8.dylib"
+pcre2_source="$(brew --prefix pcre2)/lib/libpcre2-8.0.dylib"
+for dylib_source in "$libslirp_source" "$glib_source" "$intl_source" "$pcre2_source"; do
+    require_file "$dylib_source"
+done
+
+mkdir -p "$output_root"
+stage="$(mktemp -d "$output_root/.Lish.app.XXXXXX")"
+stage_app="$stage/Lish.app"
+contents="$stage_app/Contents"
+macos="$contents/MacOS"
+frameworks="$contents/Frameworks"
+resources="$contents/Resources"
+trap 'rm -rf "$stage"' EXIT
+mkdir -p "$macos" "$frameworks" "$resources/web"
+
+install -m 0644 "$plist_source" "$contents/Info.plist"
+install -m 0755 "$executable_source" "$macos/Lish"
+
+for relative in \
+    app/index.html \
+    app/app.css \
+    app/app.mjs \
+    rv64.js \
+    rv64.worker.js \
+    native-disk.js \
+    vendor/xterm/xterm.js \
+    vendor/xterm/xterm.css \
+    vendor/xterm/addon-fit.js \
+    images/alpine/Image \
+    images/alpine/alpine.ext4; do
+    copy_web_file "$relative"
+done
+install -m 0644 "$wasm_source" "$resources/web/rv64_wasm.wasm"
+
+for dylib_source in "$libslirp_source" "$glib_source" "$intl_source" "$pcre2_source"; do
+    install -m 0755 "$dylib_source" "$frameworks/$(basename "$dylib_source")"
+done
+
+executable="$macos/Lish"
+rewrite_bundled_dependencies "$executable"
+for dylib in "$frameworks"/*.dylib; do
+    rewrite_bundled_dependencies "$dylib"
+    install_name_tool -id "@rpath/$(basename "$dylib")" "$dylib"
+done
+if ! otool -l "$executable" | grep -Fq "path @executable_path/../Frameworks "; then
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$executable"
+fi
+
+verify_macho_dependencies
+
+for dylib in "$frameworks"/*.dylib; do
+    codesign --force --sign - "$dylib"
+done
+codesign --force --sign - "$stage_app"
+codesign --verify --deep --strict "$stage_app"
+
+rm -rf "$output_app"
+mv "$stage_app" "$output_app"
+rm -rf "$stage"
+trap - EXIT
+
+echo "built $output_app"

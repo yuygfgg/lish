@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://[::1]:* ws://127.0.0.1:* ws://[::1]:*; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>Lish</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../vendor/xterm/xterm.css">
+  <link rel="stylesheet" href="./app.css">
+</head>
+<body>
+  <header class="toolbar" aria-label="Lish controls">
+    <div class="identity">
+      <span class="brand">Lish</span>
+      <span class="machine">Alpine Linux</span>
+      <span id="state" class="state" role="status" aria-live="polite">Waiting for host</span>
+    </div>
+    <nav class="actions" aria-label="Machine actions">
+      <button id="start" type="button" data-action="start">Start</button>
+      <button id="stop" type="button" data-action="stop">Stop</button>
+      <button id="reset" type="button" data-action="reset">Reset</button>
+      <button id="clear" type="button" data-action="clear">Clear</button>
+    </nav>
+  </header>
+
+  <main class="workspace">
+    <section class="terminal-panel" aria-label="Linux terminal">
+      <div id="terminal" class="terminal" tabindex="-1"></div>
+      <div id="loading" class="overlay" aria-live="polite">
+        <div class="overlay-title" id="loading-title">Waiting for host</div>
+        <div class="overlay-detail" id="loading-detail">The native session will start this machine.</div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="statusbar" aria-label="Session status">
+    <span id="connection">Host disconnected</span>
+    <span id="queue" aria-label="Terminal output queue">Queue 0 B</span>
+    <span id="dimensions">-- x --</span>
+  </footer>
+
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>

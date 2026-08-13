@@ -1064,6 +1064,7 @@ const PUBLIC_EVENTS = new Set([
   "stop",
   "error",
   "console",
+  "diskError",
   "networkTransmit",
   "downloadProgress",
 ]);
@@ -1521,7 +1522,12 @@ export class RV64 {
     if (!this.#disk) throw new Error("VM requested native disk I/O without a disk service");
     const request = this.#core.virtDiskRequest();
     if (!request) throw new Error("VM reported disk I/O without a request");
-    await serviceNativeDiskRequest(this.#core, this.#disk, request);
+    await serviceNativeDiskRequest(
+      this.#core,
+      this.#disk,
+      request,
+      (detail) => this.#emit("diskError", detail),
+    );
   }
 
   async #waitForDiskOperation() {
@@ -1617,10 +1623,10 @@ class RV64WorkerProxy {
     const execution = options.execution;
     const workerURL = execution.workerURL
       ? new URL(execution.workerURL, import.meta.url)
-      : new URL("./rv64.worker.js?v=3", import.meta.url);
+      : new URL("./rv64.worker.js", import.meta.url);
     // Validate and copy transferable inputs before allocating a Worker so a
     // rejected source (notably Response) cannot leave an idle thread behind.
-    const { options: clonedOptions, transfers } = cloneWorkerOptions(options);
+    const { options: clonedOptions, diagnostics, transfers } = cloneWorkerOptions(options);
     const worker = new Worker(workerURL, { name: "lish-vm", type: "module" });
     const networkMode =
       options.network?.mode ?? "none";
@@ -1651,6 +1657,7 @@ class RV64WorkerProxy {
     worker.postMessage({
       type: "create",
       eventNames: Object.keys(options.events ?? {}),
+      diagnostics,
       options: clonedOptions,
     }, transfers);
     try {
@@ -1865,6 +1872,7 @@ function cloneWorkerOptions(options) {
       ...(network ? { network } : {}),
       execution: { mode: "local" },
     },
+    diagnostics: globalThis.LISH_DIAGNOSTICS === true,
     transfers,
   };
 }

@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "LishDisk", targets: ["LishDisk"]),
         .library(name: "LishNetwork", targets: ["LishNetwork"]),
         .executable(name: "lish-network-host", targets: ["LishNetworkHost"]),
+        .executable(name: "lish-macos", targets: ["LishApp"]),
     ],
     targets: [
         .target(
@@ -36,6 +37,16 @@ let package = Package(
             name: "LishNetworkHost",
             dependencies: ["LishNetwork"]
         ),
+        .executableTarget(
+            name: "LishApp",
+            dependencies: ["LishDisk", "LishNetwork"],
+            path: "Sources/LishApp",
+            linkerSettings: [
+                .linkedFramework("AppKit", .when(platforms: [.macOS])),
+                .linkedFramework("WebKit", .when(platforms: [.macOS])),
+                .linkedFramework("Network", .when(platforms: [.macOS])),
+            ]
+        ),
         .testTarget(
             name: "LishDiskTests",
             dependencies: ["LishDisk"]
@@ -43,6 +54,10 @@ let package = Package(
         .testTarget(
             name: "LishNetworkTests",
             dependencies: ["LishNetwork"]
+        ),
+        .testTarget(
+            name: "LishAppTests",
+            dependencies: ["LishApp"]
         ),
     ]
 )

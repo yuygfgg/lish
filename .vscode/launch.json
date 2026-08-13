@@ -19,6 +19,26 @@
             "target": "lish-network-host",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release lish-network-host (native)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:lish}/native",
+            "name": "Debug lish-macos (native)",
+            "target": "lish-macos",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug lish-macos (native)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:lish}/native",
+            "name": "Release lish-macos (native)",
+            "target": "lish-macos",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release lish-macos (native)"
         }
     ]
 }

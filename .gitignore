@@ -8,3 +8,4 @@ tests/riscv-arch-test/
 native/.build/
 node_modules/
 web/vendor/
+web/rv64_wasm.wasm

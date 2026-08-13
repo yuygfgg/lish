@@ -14,8 +14,10 @@ try {
   await testFailedWriteInvalidatesUncertainData();
   await testRangeValidationAndDestroy();
   await testGuestReceivesDiskErrorsWithoutStoppingTheHostLoop();
+  await testDiagnosticsDescribeFailuresWithoutDumpingBodies();
 } finally {
   globalThis.fetch = RealFetch;
+  delete globalThis.LISH_DIAGNOSTICS;
 }
 
 console.log("PASS native disk client cache and ordering");
@@ -203,4 +205,37 @@ async function testGuestReceivesDiskErrorsWithoutStoppingTheHostLoop() {
     ),
     /rejected native disk completion/,
   );
+}
+
+async function testDiagnosticsDescribeFailuresWithoutDumpingBodies() {
+  const realError = console.error;
+  const messages = [];
+  globalThis.LISH_DIAGNOSTICS = true;
+  console.error = (...values) => messages.push(values);
+  try {
+    await serviceNativeDiskRequest(
+      { virtDiskComplete: (_data, ok) => !ok },
+      { write: async () => { throw new Error("transport failed"); } },
+      {
+        id: 6n,
+        kind: "write",
+        offset: 4096n,
+        length: 512n,
+        body: Uint8Array.of(0xde, 0xad, 0xbe, 0xef),
+      },
+    );
+  } finally {
+    console.error = realError;
+    delete globalThis.LISH_DIAGNOSTICS;
+  }
+  assert.deepEqual(messages, [[
+    "native disk request failed",
+    {
+      kind: "write",
+      offset: "4096",
+      length: "512",
+      error: "transport failed",
+    },
+  ]]);
+  assert.doesNotMatch(JSON.stringify(messages), /deadbeef/i);
 }
