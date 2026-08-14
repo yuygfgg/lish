@@ -27,10 +27,6 @@ The active runtime has one full-system machine:
 - raw Ethernet transport over an ordered WebSocket;
 - a Swift libslirp host for unprivileged guest networking.
 
-Lish does not include the old Linux user-mode emulator, TinyEMU source tree,
-HTTP translation proxy, WISP transport, 9P filesystem, WANIX integration, or
-independent Web library release pipeline.
-
 ## Local Browser Run
 
 Install the host tools, build the Alpine assets, and build Wasm:
