@@ -40,6 +40,14 @@ pub trait Bus {
             .map_err(|_| Exception::InstructionAccessFault { addr })
     }
 
+    /// Return a complete instruction word when four bytes can be read without
+    /// a fault or an observable device access. The CPU uses this only when the
+    /// virtual address does not end at a page boundary. `None` preserves the
+    /// architectural halfword fetch path.
+    fn fetch32_if_safe(&mut self, _addr: u64) -> Option<u32> {
+        None
+    }
+
     /// Hardware interrupt lines (MTIP/MSIP/MEIP/SEIP bit positions), sampled
     /// by the CPU before each instruction in full-system mode. Level-
     /// triggered: the device recomputes from its own state, so a cleared
@@ -64,11 +72,24 @@ impl<'a> FlatMemory<'a> {
     #[inline]
     fn offset(&self, addr: u64, len: u64) -> Option<usize> {
         let off = addr.checked_sub(self.base)?;
-        if off + len <= self.mem.len() as u64 {
+        if off.checked_add(len)? <= self.mem.len() as u64 {
             Some(off as usize)
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bus, FlatMemory};
+
+    #[test]
+    fn flat_memory_rejects_a_wrapping_range() {
+        let mut mem = [0u8; 4];
+        let mut bus = FlatMemory::new(0, &mut mem);
+
+        assert_eq!(bus.fetch32_if_safe(u64::MAX - 3), None);
     }
 }
 
@@ -96,4 +117,12 @@ impl Bus for FlatMemory<'_> {
     flat_rw!(read16, write16, u16, 2);
     flat_rw!(read32, write32, u32, 4);
     flat_rw!(read64, write64, u64, 8);
+
+    #[inline]
+    fn fetch32_if_safe(&mut self, addr: u64) -> Option<u32> {
+        let off = self.offset(addr, 4)?;
+        Some(u32::from_le_bytes(
+            self.mem[off..off + 4].try_into().unwrap(),
+        ))
+    }
 }

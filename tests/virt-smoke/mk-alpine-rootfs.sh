@@ -11,7 +11,17 @@ IMG="$OUT/alpine-riscv64.ext4"
 BENCH="$OUT/guest-benchmarks/rv64-jit-bench"
 TARBALL="$OUT/alpine-minirootfs-$VERSION-riscv64.tar.gz"
 URL="$MIRROR/$BRANCH/releases/riscv64/$(basename "$TARBALL")"
+APK_REPOSITORY="$MIRROR/$BRANCH/main/riscv64"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
+WGET_APK="$OUT/wget-1.25.0-r3.apk"
+WGET_SHA256="f9d7afcf4bc7f2fd61876a934613c3fb7cf1081984d8135eefeece784e1df0fd"
+LIBIDN2_APK="$OUT/libidn2-2.3.8-r0.apk"
+LIBIDN2_SHA256="f7969149f59dae73510cc721c50368e3841dab82593f8f79b05a532be27ea3c4"
+LIBUNISTRING_APK="$OUT/libunistring-1.4.2-r0.apk"
+LIBUNISTRING_SHA256="bdec9670c7e516493e23d0e7e145db1380cbce4dc46949b837961b25bc4cc81d"
+PCRE2_APK="$OUT/pcre2-10.47-r1.apk"
+PCRE2_SHA256="4a0d802e350db6a15b951371468ff1f7172dcee42928153b1e6367459467eb8c"
 
 require() {
     command -v "$1" >/dev/null 2>&1 || {
@@ -20,34 +30,78 @@ require() {
     }
 }
 
+fetch_checked() {
+    local destination="$1"
+    local url="$2"
+    local expected_sha256="$3"
+    local description="$4"
+    local actual_sha256
+
+    if [ ! -f "$destination" ]; then
+        curl --fail --location --retry 3 --output "$destination.part" "$url"
+        mv "$destination.part" "$destination"
+    fi
+
+    actual_sha256="$("$ROOT_DIR/tools/sha256.sh" "$destination" | cut -d ' ' -f 1)"
+    if [ "$actual_sha256" != "$expected_sha256" ]; then
+        echo "$description checksum mismatch" >&2
+        echo "expected: $expected_sha256" >&2
+        echo "actual:   $actual_sha256" >&2
+        exit 1
+    fi
+}
+
+extract_apk() {
+    local archive="$1"
+    local destination="$2"
+
+    mkdir -p "$destination"
+    gzip -dc "$archive" | tar --ignore-zeros -xf - -C "$destination"
+}
+
 require curl
 require cut
 require du
 require genext2fs
 require gzip
+require tar
 require wc
 
 mkdir -p "$OUT"
-if [ ! -f "$TARBALL" ]; then
-    curl --fail --location --retry 3 --output "$TARBALL" "$URL"
-fi
-actual_sha256="$("$ROOT_DIR/tools/sha256.sh" "$TARBALL" | cut -d ' ' -f 1)"
-if [ "$actual_sha256" != "$EXPECTED_SHA256" ]; then
-    echo "Alpine minirootfs checksum mismatch" >&2
-    echo "expected: $EXPECTED_SHA256" >&2
-    echo "actual:   $actual_sha256" >&2
-    exit 1
-fi
+fetch_checked "$TARBALL" "$URL" "$EXPECTED_SHA256" "Alpine minirootfs"
+fetch_checked \
+    "$WGET_APK" "$APK_REPOSITORY/$(basename "$WGET_APK")" \
+    "$WGET_SHA256" "GNU Wget APK"
+fetch_checked \
+    "$LIBIDN2_APK" "$APK_REPOSITORY/$(basename "$LIBIDN2_APK")" \
+    "$LIBIDN2_SHA256" "libidn2 APK"
+fetch_checked \
+    "$LIBUNISTRING_APK" "$APK_REPOSITORY/$(basename "$LIBUNISTRING_APK")" \
+    "$LIBUNISTRING_SHA256" "libunistring APK"
+fetch_checked \
+    "$PCRE2_APK" "$APK_REPOSITORY/$(basename "$PCRE2_APK")" \
+    "$PCRE2_SHA256" "PCRE2 APK"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/rv64-alpine.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 overlay="$work/overlay"
 base_tar="$work/alpine-minirootfs.tar"
+packages="$work/packages"
 
 "$ROOT_DIR/tools/build-guest-benchmarks.sh" "$OUT/guest-benchmarks"
 mkdir -p \
+    "$overlay/usr/lib" \
     "$overlay/usr/local/bin"
 install -m 0755 "$BENCH" "$overlay/usr/local/bin/rv64-jit-bench"
+
+extract_apk "$WGET_APK" "$packages/wget"
+extract_apk "$LIBIDN2_APK" "$packages/libidn2"
+extract_apk "$LIBUNISTRING_APK" "$packages/libunistring"
+extract_apk "$PCRE2_APK" "$packages/pcre2"
+install -m 0755 "$packages/wget/usr/bin/wget" "$overlay/usr/local/bin/wget"
+cp -a "$packages/libidn2/usr/lib/." "$overlay/usr/lib/"
+cp -a "$packages/libunistring/usr/lib/." "$overlay/usr/lib/"
+cp -a "$packages/pcre2/usr/lib/." "$overlay/usr/lib/"
 
 cat > "$overlay/rv64-init" <<'EOF'
 #!/bin/sh
@@ -118,5 +172,5 @@ genext2fs \
     -U -d "$overlay" \
     "$IMG"
 
-touch "$OUT/alpine-image-v6"
+touch "$OUT/alpine-image-v7"
 echo "assembled $IMG (${size_mb} MiB, Alpine $VERSION riscv64, ext2)"

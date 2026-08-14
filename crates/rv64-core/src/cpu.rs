@@ -626,19 +626,37 @@ impl Cpu {
     /// `Err` = exception. PC already points at the *next* instruction when
     /// Ecall/Break is returned, so the host can service and resume directly.
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> Result<Option<StopReason>, Exception> {
-        // Fetch 16 bits first: a compressed instruction may sit on the last
-        // halfword of a page/region, where a blind 32-bit fetch would fault.
+        if self.pc & 1 != 0 {
+            return Err(Exception::InstructionAddressMisaligned { addr: self.pc });
+        }
+
+        // Most instructions can be fetched with one bus range check. At a
+        // virtual page boundary, or when the bus cannot guarantee a complete
+        // side-effect-free word, fetch halfwords so a compressed instruction
+        // at the end of a page or memory region does not over-fetch.
         let pa = self.translate(bus, self.pc, Access::Fetch)?;
-        let lo = bus.fetch16(pa)? as u32;
+        let word = if self.pc & 0xfff != 0xffe {
+            bus.fetch32_if_safe(pa)
+        } else {
+            None
+        };
+        let lo = match word {
+            Some(insn) => insn & 0xffff,
+            None => bus.fetch16(pa)? as u32,
+        };
         let (insn, ilen) = if lo & 3 == 3 {
-            let pc2 = self.pc.wrapping_add(2);
-            let pa2 = if pc2 & 0xfff == 0 {
-                self.translate(bus, pc2, Access::Fetch)?
+            if let Some(insn) = word {
+                (insn, 4)
             } else {
-                pa + 2
-            };
-            let hi = bus.fetch16(pa2)? as u32;
-            (lo | (hi << 16), 4)
+                let pc2 = self.pc.wrapping_add(2);
+                let pa2 = if pc2 & 0xfff == 0 {
+                    self.translate(bus, pc2, Access::Fetch)?
+                } else {
+                    pa + 2
+                };
+                let hi = bus.fetch16(pa2)? as u32;
+                (lo | (hi << 16), 4)
+            }
         } else {
             let exp = crate::compressed::expand(lo as u16)
                 .ok_or(Exception::IllegalInstruction { insn: lo })?;
@@ -1772,6 +1790,57 @@ mod tests {
 
     const BASE: u64 = 0x1000;
 
+    #[derive(Default)]
+    struct CountingBus {
+        accesses: usize,
+    }
+
+    impl CountingBus {
+        fn access<T>(&mut self, value: T) -> Result<T, Exception> {
+            self.accesses += 1;
+            Ok(value)
+        }
+    }
+
+    impl Bus for CountingBus {
+        fn read8(&mut self, _addr: u64) -> Result<u8, Exception> {
+            self.access(0)
+        }
+
+        fn read16(&mut self, _addr: u64) -> Result<u16, Exception> {
+            self.access(0)
+        }
+
+        fn read32(&mut self, _addr: u64) -> Result<u32, Exception> {
+            self.access(0)
+        }
+
+        fn read64(&mut self, _addr: u64) -> Result<u64, Exception> {
+            self.access(0)
+        }
+
+        fn write8(&mut self, _addr: u64, _val: u8) -> Result<(), Exception> {
+            self.access(())
+        }
+
+        fn write16(&mut self, _addr: u64, _val: u16) -> Result<(), Exception> {
+            self.access(())
+        }
+
+        fn write32(&mut self, _addr: u64, _val: u32) -> Result<(), Exception> {
+            self.access(())
+        }
+
+        fn write64(&mut self, _addr: u64, _val: u64) -> Result<(), Exception> {
+            self.access(())
+        }
+
+        fn fetch32_if_safe(&mut self, _addr: u64) -> Option<u32> {
+            self.accesses += 1;
+            Some(0)
+        }
+    }
+
     fn run_program(words: &[u32]) -> (Cpu, Vec<u8>) {
         let mut mem = vec![0u8; 0x10000];
         for (i, w) in words.iter().enumerate() {
@@ -1982,6 +2051,78 @@ mod tests {
         assert_eq!(cpu.run(&mut bus, 100), StopReason::Ecall);
         assert_eq!(cpu.x[10], 42); // a0 = 21 + 21
         assert_eq!(cpu.x[11], 21); // a1
+    }
+
+    #[test]
+    fn compressed_instruction_at_memory_end_does_not_overfetch() {
+        let mut mem = 0x4505u16.to_le_bytes(); // c.li a0, 1
+        let mut cpu = Cpu::new();
+        cpu.pc = BASE;
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.x[10], 1);
+        assert_eq!(cpu.pc, BASE + 2);
+    }
+
+    #[test]
+    fn misaligned_pc_faults_before_address_translation_or_bus_access() {
+        let mut cpu = Cpu::new();
+        cpu.enable_system(0);
+        cpu.pc = BASE + 1;
+        {
+            let sys = cpu.sys.as_mut().unwrap();
+            sys.mode = Mode::Supervisor;
+            sys.satp = (8 << 60) | 1;
+        }
+        let mut bus = CountingBus::default();
+
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(Exception::InstructionAddressMisaligned { addr: BASE + 1 })
+        );
+        assert_eq!(bus.accesses, 0);
+        assert_eq!(cpu.pc, BASE + 1);
+    }
+
+    #[test]
+    fn truncated_full_instruction_faults_on_the_second_halfword() {
+        let mut mem = 0x0003u16.to_le_bytes();
+        let mut cpu = Cpu::new();
+        cpu.pc = BASE;
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+
+        assert_eq!(
+            cpu.step(&mut bus),
+            Err(Exception::InstructionAccessFault { addr: BASE + 2 })
+        );
+        assert_eq!(cpu.pc, BASE);
+    }
+
+    #[test]
+    fn compressed_instruction_at_page_end_does_not_overfetch() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[0xffe..].copy_from_slice(&0x4505u16.to_le_bytes()); // c.li a0, 1
+        let mut cpu = Cpu::new();
+        cpu.pc = BASE + 0xffe;
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.x[10], 1);
+        assert_eq!(cpu.pc, BASE + 0x1000);
+    }
+
+    #[test]
+    fn full_instruction_at_page_end_fetches_both_halves() {
+        let mut mem = vec![0u8; 0x1002];
+        mem[0xffe..0x1002].copy_from_slice(&0x0010_0513u32.to_le_bytes()); // addi a0, x0, 1
+        let mut cpu = Cpu::new();
+        cpu.pc = BASE + 0xffe;
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+
+        assert_eq!(cpu.step(&mut bus), Ok(None));
+        assert_eq!(cpu.x[10], 1);
+        assert_eq!(cpu.pc, BASE + 0x1002);
     }
 
     #[test]

@@ -58,6 +58,39 @@ WebSocket framing used by the browser network mode. The browser network path
 must carry Ethernet frames. HTTP, TLS, WISP, and 9P translation tests are not
 part of the Lish contract.
 
+Use `tests/https-benchmark.html` to measure cold TLS startup through the raw
+Ethernet path. Build the network host:
+
+```sh
+swift build -c release --product lish-network-host --package-path native
+```
+
+Start the asset server in one terminal:
+
+```sh
+python3 -m http.server 4173
+```
+
+Start the network host in another terminal:
+
+```sh
+native/.build/release/lish-network-host \
+  --origin http://127.0.0.1:4173 \
+  --port 4199 \
+  --capability 0123456789abcdef0123456789abcdef
+```
+
+Open this URL in WebKit:
+
+```text
+http://127.0.0.1:4173/tests/https-benchmark.html?execution=worker&trials=3&network=ws%3A%2F%2F127.0.0.1%3A4199%2F&capability=0123456789abcdef0123456789abcdef
+```
+
+Set `asyncCompilers=1..4` to compare compiler concurrency. Set `jit=off` for
+an interpreter-only run. Set `target` to test another HTTPS URL. The page
+records TCP SYN, ClientHello, peer close, command results, and JIT ownership
+metrics in `globalThis.__lishHttpsBenchmark`.
+
 ## Performance and memory records
 
 Performance results are development observations, not compatibility promises.

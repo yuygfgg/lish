@@ -13,7 +13,7 @@ mkdir -p "$out" "$bench"
 # asset directory so an absent OpenSBI file cannot select a different path.
 rm -f "$out/opensbi.bin"
 
-if [ ! -f "$bench/alpine-riscv64.ext4" ] || [ ! -f "$bench/alpine-image-v6" ]; then
+if [ ! -f "$bench/alpine-riscv64.ext4" ] || [ ! -f "$bench/alpine-image-v7" ]; then
     "$root/tests/virt-smoke/mk-alpine-rootfs.sh" "$bench"
 fi
 ln -sfn "../../../target/bench/alpine-riscv64.ext4" "$out/alpine.ext4"

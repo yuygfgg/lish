@@ -16,7 +16,7 @@ const DEFAULT_JIT_LIMITS = Object.freeze({
   growSlots: 4096,
 });
 
-const MAX_ASYNC_JIT_COMPILERS = 2;
+const MAX_ASYNC_JIT_COMPILERS = 4;
 const MAX_FULL_SYSTEM_PENDING_JIT = 4;
 
 function asyncJitCompilerCount(value) {
@@ -752,7 +752,10 @@ export class RV64Debug {
 
   /** Instantiate from wasm bytes (ArrayBuffer/TypedArray/Response). */
   static async create(wasmSource, jitOptions = {}) {
-    const { asyncCompilers, ...jitStoreOptions } = jitOptions;
+    const { asyncCompilers, enabled = true, ...jitStoreOptions } = jitOptions;
+    if (typeof enabled !== "boolean") {
+      throw new TypeError("jit.enabled must be a boolean");
+    }
     let vm;
     const imports = {
       env: {
@@ -820,6 +823,7 @@ export class RV64Debug {
       vm.#wasmExports.__indirect_function_table,
       jitStoreOptions,
     );
+    if (!enabled) vm.ex.jit_set_enabled?.(0);
     vm.#maxAsyncJitCompilers = asyncJitCompilerCount(asyncCompilers);
     // Hardware FMA: use f64x2.relaxed_madd for the guest's FMADD family iff
     // the engine validates it AND it is fused on this hardware (the spec

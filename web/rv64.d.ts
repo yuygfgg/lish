@@ -77,13 +77,15 @@ export type RV64EventListeners = {
 export interface RV64Options {
   wasm: ImageSource;
   memoryMB?: number;
-  /** Bounds for dynamically compiled WebAssembly code owned by this VM. */
+  /** Guest-code compilation settings and ownership bounds for this VM. */
   jit?: {
+    /** Set to false to use only the interpreter. Defaults to true. */
+    enabled?: boolean;
     maxModules?: number;
     maxSlots?: number;
     maxBytes?: number;
     growSlots?: number;
-    /** Maximum concurrent background WebAssembly.compile jobs. Defaults to 2. */
+    /** Maximum concurrent background WebAssembly.compile jobs. Defaults to 4. */
     asyncCompilers?: number;
   };
   boot: BootConfig;

@@ -496,6 +496,12 @@ impl Bus for VirtBus {
     virt_rw!(read32, write32, u32, 4);
     virt_rw!(read64, write64, u64, 8);
 
+    #[inline]
+    fn fetch32_if_safe(&mut self, addr: u64) -> Option<u32> {
+        let bytes: [u8; 4] = (&*self.ram_slice(addr, 4)?).try_into().unwrap();
+        Some(u32::from_le_bytes(bytes))
+    }
+
     fn irq_lines(&mut self) -> u64 {
         self.refresh_plic();
         let mut lines = 0u64;

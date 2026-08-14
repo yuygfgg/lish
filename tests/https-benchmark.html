@@ -1,0 +1,291 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lish HTTPS benchmark</title>
+<style>
+  body { background: #111; color: #ddd; font: 14px ui-monospace, monospace; }
+  pre { white-space: pre-wrap; }
+</style>
+<pre id="output">starting\n</pre>
+<script type="module">
+const output = document.querySelector("#output");
+const query = new URLSearchParams(location.search);
+const trials = Math.max(1, Number(query.get("trials") || 3));
+const warmRequests = Math.max(0, Number(query.get("warm") || 5));
+const timeoutMs = Math.max(30_000, Number(query.get("timeout") || 180_000));
+const commandTimeoutMs = Math.max(5_000, Number(query.get("commandTimeout") || 30_000));
+const executionMode = query.get("execution") === "worker" ? "worker" : "local";
+const asyncCompilers = query.has("asyncCompilers")
+  ? Math.max(1, Math.min(4, Number(query.get("asyncCompilers"))))
+  : null;
+const maxModules = query.has("maxModules")
+  ? Math.max(1, Number(query.get("maxModules")))
+  : null;
+const jitEnabled = query.get("jit") !== "off";
+const networkURL = query.get("network");
+const capability = query.get("capability");
+const targetURL = new URL(
+  query.get("target") ?? "https://dl-cdn.alpinelinux.org/alpine/",
+);
+const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+const state = { status: "starting", executionMode, targetURL: targetURL.href, trials: [], error: null };
+globalThis.__lishHttpsBenchmark = state;
+
+function print(value) {
+  output.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+async function bytes(path) {
+  const response = await fetch(path);
+  if (!response.ok) throw new Error(`${path}: ${response.status} ${response.statusText}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+function parseTCP(frame) {
+  if (!(frame instanceof Uint8Array) || frame.length < 54) return null;
+  const etherType = (frame[12] << 8) | frame[13];
+  if (etherType !== 0x0800) return null;
+  const ip = 14;
+  if ((frame[ip] >> 4) !== 4 || frame[ip + 9] !== 6) return null;
+  const ipLength = (frame[ip] & 0x0f) * 4;
+  const tcp = ip + ipLength;
+  if (tcp + 20 > frame.length) return null;
+  const sourcePort = (frame[tcp] << 8) | frame[tcp + 1];
+  const destinationPort = (frame[tcp + 2] << 8) | frame[tcp + 3];
+  const flags = frame[tcp + 13];
+  const tcpLength = (frame[tcp + 12] >> 4) * 4;
+  const payloadStart = tcp + tcpLength;
+  if (payloadStart > frame.length) return null;
+  return {
+    sourcePort,
+    destinationPort,
+    flags,
+    payload: frame.slice(payloadStart),
+  };
+}
+
+function isClientHello(payload) {
+  for (let i = 0; i + 5 <= payload.length; i++) {
+    if (payload[i] !== 0x16 || payload[i + 1] !== 0x03) continue;
+    const recordLength = (payload[i + 3] << 8) | payload[i + 4];
+    if (i + 6 <= payload.length && payload[i + 5] === 0x01) return recordLength > 0;
+  }
+  return false;
+}
+
+function frameObserver(trial, direction, frame, at) {
+  const tcp = parseTCP(frame);
+  if (!tcp) return;
+  const outbound = direction === "tx";
+  const port = outbound ? tcp.sourcePort : tcp.destinationPort;
+  const peerPort = outbound ? tcp.destinationPort : tcp.sourcePort;
+  if (peerPort !== 443 && port !== 443) return;
+  const key = outbound ? tcp.sourcePort : tcp.destinationPort;
+  let attempt = trial.httpsAttempts.find((item) => item.port === key);
+  if (!attempt && outbound && tcp.sourcePort !== 443) {
+    attempt = { port: key, synAt: null, synAckAt: null, helloAt: null, closeAt: null,
+      flags: [], payloadBytes: 0 };
+    trial.httpsAttempts.push(attempt);
+  }
+  if (!attempt) return;
+  attempt.flags.push({ direction, at, flags: tcp.flags });
+  attempt.payloadBytes += tcp.payload.length;
+  if (outbound && (tcp.flags & 0x02) !== 0 && (tcp.flags & 0x10) === 0 && attempt.synAt === null) {
+    attempt.synAt = at;
+  }
+  if (!outbound && (tcp.flags & 0x12) === 0x12 && attempt.synAckAt === null) {
+    attempt.synAckAt = at;
+  }
+  if (outbound && attempt.helloAt === null && isClientHello(tcp.payload)) {
+    attempt.helloAt = at;
+    attempt.metricsAtHello = trial.metrics
+      .filter((sample) => sample.at <= at)
+      .at(-1) ?? null;
+  }
+  if (!outbound && (tcp.flags & 0x05) !== 0 && attempt.closeAt === null) {
+    attempt.closeAt = at;
+  }
+}
+
+function classifyAttempt(attempt, readyAt) {
+  const helloAt = attempt.helloAt;
+  const closeAt = attempt.closeAt;
+  return {
+    ...attempt,
+    phase: readyAt !== null && attempt.synAt !== null && attempt.synAt <= readyAt ? "boot" : "warm",
+    helloDelayMs: attempt.synAt !== null && helloAt !== null ? helloAt - attempt.synAt : null,
+    helloAfterSynAckMs: attempt.synAckAt !== null && helloAt !== null ? helloAt - attempt.synAckAt : null,
+    serverClosedBeforeHello: closeAt !== null && (helloAt === null || closeAt < helloAt),
+    serverClosedBeforeHelloMs: closeAt !== null && (helloAt === null || closeAt < helloAt)
+      && attempt.synAt !== null
+      ? closeAt - attempt.synAt
+      : null,
+    frameCount: attempt.flags.length,
+  };
+}
+
+function markerTime(trial, at) {
+  if (trial.console.includes("ALPINE_READY") && trial.readyAt === null) trial.readyAt = at;
+  if (trial.console.includes("LISH_NETWORK_HTTPS=OK")) trial.networkHTTPS = "OK";
+  if (trial.console.includes("LISH_NETWORK_HTTPS=FAIL")) trial.networkHTTPS = "FAIL";
+  for (let i = 1; i <= warmRequests; i++) {
+    const match = trial.console.match(new RegExp(`LISH_BENCH_END_${i}_(\\d+)`));
+    if (match) trial.warmResults[i - 1] = match[1] === "0" ? "OK" : "FAIL";
+  }
+}
+
+function installFrameTap() {
+  const NativeWebSocket = globalThis.WebSocket;
+  class MeasuredWebSocket extends NativeWebSocket {
+    constructor(...args) {
+      super(...args);
+      this.addEventListener("message", (event) => {
+        const active = state.activeTrial;
+        if (!active) return;
+        if (event.data instanceof Blob) {
+          event.data.arrayBuffer().then((value) => frameObserver(
+            active, "rx", new Uint8Array(value), performance.now(),
+          ));
+        } else {
+          const frame = event.data instanceof ArrayBuffer
+            ? new Uint8Array(event.data)
+            : event.data;
+          frameObserver(active, "rx", frame, performance.now());
+        }
+      });
+    }
+
+    send(value) {
+      const active = state.activeTrial;
+      if (active) {
+        const frame = value instanceof ArrayBuffer
+          ? new Uint8Array(value)
+          : value instanceof Uint8Array ? value : null;
+        if (frame) frameObserver(active, "tx", frame, performance.now());
+      }
+      super.send(value);
+    }
+  }
+  globalThis.WebSocket = MeasuredWebSocket;
+}
+
+async function runTrial(index) {
+  const trial = {
+    index,
+    startedAt: performance.now(),
+    readyAt: null,
+    networkHTTPS: null,
+    warmResults: [],
+    console: "",
+    httpsAttempts: [],
+    metrics: [],
+    errors: [],
+  };
+  state.activeTrial = trial;
+  const [{ RV64 }, wasm, kernel, disk] = await Promise.all([
+    import("../web/rv64.js"),
+    bytes("../web/rv64_wasm.wasm"),
+    bytes("../web/images/alpine/Image"),
+    bytes("../web/images/alpine/alpine.ext4"),
+  ]);
+  const vm = await RV64.create({
+    wasm,
+    memoryMB: 512,
+    ...((maxModules === null && asyncCompilers === null && jitEnabled) ? {} : {
+      jit: {
+        enabled: jitEnabled,
+        ...(maxModules === null ? {} : { maxModules }),
+        ...(asyncCompilers === null ? {} : { asyncCompilers }),
+      },
+    }),
+    execution: executionMode === "worker"
+      ? { mode: "worker", statisticsIntervalMs: 100 }
+      : { mode: "local" },
+    boot: {
+      mode: "linux-direct",
+      kernel,
+      disk,
+      cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
+    },
+    network: { mode: "wsproxy", url: networkURL, protocols: ["lish.raw-ethernet.v1", capability] },
+    events: {
+      console(value) {
+        const text = decoder.decode(value, { stream: true });
+        const at = performance.now();
+        trial.console += text;
+        markerTime(trial, at);
+      },
+      networkTransmit(value) {
+        if (executionMode === "worker") {
+          frameObserver(trial, "tx", value, performance.now());
+        }
+      },
+      error(error) { trial.errors.push(String(error?.message ?? error)); },
+    },
+  });
+  const sampling = setInterval(() => {
+    const metrics = vm.jitMetrics();
+    if (metrics) trial.metrics.push({ at: performance.now(), instructions: String(vm.instructions), ...metrics });
+  }, 100);
+  try {
+    await vm.start();
+    const deadline = performance.now() + timeoutMs;
+    while (vm.running && trial.readyAt === null && performance.now() < deadline) await wait(20);
+    if (trial.readyAt !== null && warmRequests > 0) {
+      await wait(250);
+      for (let i = 1; i <= warmRequests; i++) {
+        const command = [
+          `printf 'LISH_BENCH_BEGIN_${i}\\n'`,
+          `wget -q -T 3 -t 1 -O /dev/null ${shellQuote(targetURL.href)}`,
+          "rc=$?",
+          `printf 'LISH_BENCH_END_${i}_%s\\n' \"$rc\"`,
+        ].join(";") + "\n";
+        vm.console.send(encoder.encode(command));
+        const commandDeadline = performance.now() + commandTimeoutMs;
+        while (trial.warmResults[i - 1] === undefined && performance.now() < commandDeadline) {
+          await wait(20);
+        }
+        if (trial.warmResults[i - 1] === undefined) trial.warmResults[i - 1] = "TIMEOUT";
+      }
+    }
+  } finally {
+    trial.finishedAt = performance.now();
+    trial.durationMs = trial.finishedAt - trial.startedAt;
+    trial.ready = trial.readyAt !== null;
+    trial.https = trial.httpsAttempts.map((attempt) => classifyAttempt(attempt, trial.readyAt));
+    clearInterval(sampling);
+    await vm.stop().catch(() => {});
+    await vm.destroy().catch(() => {});
+    state.activeTrial = null;
+  }
+  return trial;
+}
+
+async function main() {
+  if (!networkURL || !capability) throw new Error("network and capability query parameters are required");
+  if (targetURL.protocol !== "https:") throw new Error("target must use HTTPS");
+  if (executionMode === "local") installFrameTap();
+  state.status = "running";
+  for (let index = 1; index <= trials; index++) {
+    state.trials.push(await runTrial(index));
+    print(state);
+  }
+  state.status = "complete";
+  delete state.activeTrial;
+  print(state);
+}
+
+main().catch((error) => {
+  state.status = "error";
+  state.error = String(error?.stack ?? error);
+  print(state);
+});
+</script>

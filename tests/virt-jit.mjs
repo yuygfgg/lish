@@ -339,8 +339,8 @@ function outputThenStopKernel(stopInstruction) {
   return b.finish();
 }
 
-async function runKernel(kernel, configure = () => {}) {
-  const vm = await RV64Debug.create(wasm);
+async function runKernel(kernel, { configure = () => {}, jitOptions = {} } = {}) {
+  const vm = await RV64Debug.create(wasm, jitOptions);
   configure(vm);
   vm.bootVirtLinuxDirect({ kernel, ramMB: 32 });
   let poweredOff = false;
@@ -371,8 +371,10 @@ let hotJit;
 
 let tlbJit;
 {
-  const { vm, poweredOff } = await runKernel(tlbRefillKernel(), (machine) => {
-    machine.ex.jit_set_tlb_fill(1);
+  const { vm, poweredOff } = await runKernel(tlbRefillKernel(), {
+    configure(machine) {
+      machine.ex.jit_set_tlb_fill(1);
+    },
   });
   const sbi = vm.virtSbiCallCounts();
   assert.equal(poweredOff, true, "TLB kernel produced a wrong result or did not exit");
@@ -395,6 +397,19 @@ assert.ok(
 );
 
 console.log("PASS VirtMachine JIT dispatch, direct SBI, and context-aware TLB refill");
+
+{
+  const { vm, poweredOff } = await runKernel(hotLoopKernel(), {
+    jitOptions: { enabled: false },
+  });
+  assert.equal(poweredOff, true, "interpreter-only kernel did not reach SBI SRST");
+  assert.equal(vm.ex.jit_stat(0), 0n, "disabled JIT executed compiled instructions");
+  assert.equal(vm.ex.jit_stat(3), 0n, "disabled JIT populated the code cache");
+  assert.equal(vm.jitBlocks ?? 0, 0, "disabled JIT registered a host module");
+  vm.destroyJit();
+}
+
+console.log("PASS disabled JIT stays on the interpreter path");
 
 {
   const vm = await RV64Debug.create(wasm);
