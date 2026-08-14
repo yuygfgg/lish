@@ -5,9 +5,12 @@ set -euo pipefail
 OUT="${1:-$PWD}"
 VERSION="${ALPINE_VERSION:-3.24.1}"
 EXPECTED_SHA256="${ALPINE_SHA256:-7201513262d851f39105102cf95519410100259bd7996fca13bade517838d7b7}"
+NATIVE_IMAGE_SIZE_MIB=2048
 BRANCH="v${VERSION%.*}"
 MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
-IMG="$OUT/alpine-riscv64.ext4"
+WEB_IMG="$OUT/alpine-riscv64.ext4"
+NATIVE_IMG="$OUT/alpine-riscv64-native.ext4"
+IMAGE_STAMP="$OUT/alpine-image-v8"
 BENCH="$OUT/guest-benchmarks/rv64-jit-bench"
 TARBALL="$OUT/alpine-minirootfs-$VERSION-riscv64.tar.gz"
 URL="$MIRROR/$BRANCH/releases/riscv64/$(basename "$TARBALL")"
@@ -67,7 +70,28 @@ require gzip
 require tar
 require wc
 
+assemble_image() {
+    local image="$1"
+    local size_mib="$2"
+    local blocks=$(( size_mib * 256 ))
+
+    # Keep the historical ext4 suffix because it is part of the asset protocol.
+    # The image uses ext2 so an unprivileged, cross-platform tool can build it.
+    genext2fs \
+        -B 4096 \
+        -b "$blocks" \
+        -i 16384 \
+        -m 0 \
+        -L rv64-alpine \
+        -a "$base_tar" \
+        -U -d "$overlay" \
+        "$image"
+
+    echo "assembled $image (${size_mib} MiB, Alpine $VERSION riscv64, ext2)"
+}
+
 mkdir -p "$OUT"
+rm -f "$IMAGE_STAMP"
 fetch_checked "$TARBALL" "$URL" "$EXPECTED_SHA256" "Alpine minirootfs"
 fetch_checked \
     "$WGET_APK" "$APK_REPOSITORY/$(basename "$WGET_APK")" \
@@ -157,20 +181,9 @@ chmod 0755 "$overlay/rv64-init"
 # It applies the overlay as a second layer and maps host ownership to root.
 gzip -dc "$TARBALL" > "$base_tar"
 payload_bytes=$(( $(wc -c < "$base_tar") + $(du -sk "$overlay" | cut -f 1) * 1024 ))
-size_mb=$(( (payload_bytes + 1048575) / 1048576 + 64 ))
-blocks=$(( size_mb * 256 ))
+web_image_size_mib=$(( (payload_bytes + 1048575) / 1048576 + 64 ))
 
-# Keep the historical file name because it is part of the demo asset protocol.
-# The image uses ext2 so that an unprivileged, cross-platform tool can build it.
-genext2fs \
-    -B 4096 \
-    -b "$blocks" \
-    -i 16384 \
-    -m 0 \
-    -L rv64-alpine \
-    -a "$base_tar" \
-    -U -d "$overlay" \
-    "$IMG"
+assemble_image "$WEB_IMG" "$web_image_size_mib"
+assemble_image "$NATIVE_IMG" "$NATIVE_IMAGE_SIZE_MIB"
 
-touch "$OUT/alpine-image-v7"
-echo "assembled $IMG (${size_mb} MiB, Alpine $VERSION riscv64, ext2)"
+touch "$IMAGE_STAMP"

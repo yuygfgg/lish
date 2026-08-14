@@ -79,9 +79,15 @@ impl JitPageState {
     }
 
     #[inline]
-    pub fn mark_address(&mut self, pa: u64) {
+    pub fn mark_address(&mut self, pa: u64) -> bool {
         if let Some(page) = self.page_for_address(pa) {
-            self.flags[page / 64].marked |= 1 << (page % 64);
+            let mask = 1 << (page % 64);
+            let flags = &mut self.flags[page / 64];
+            let newly_marked = flags.marked & mask == 0;
+            flags.marked |= mask;
+            newly_marked
+        } else {
+            false
         }
     }
 
@@ -191,6 +197,16 @@ pub struct RunSliceOutcome {
     pub idle: bool,
 }
 
+/// JIT routing queried by the decoded interpreter at basic-block boundaries.
+///
+/// `contains` is a side-effect-free lookahead used to stop a cached natural
+/// block before a compiled successor. `observe` is called only for a PC that
+/// execution actually reaches and may request a return to the tier-up dispatcher.
+pub trait CodeDispatch {
+    fn contains(&self, pc: u64) -> bool;
+    fn observe(&mut self, pc: u64) -> bool;
+}
+
 /// Execute an interpreter slice, or stop after the first instruction whose
 /// successor PC satisfies `compiled`.
 #[inline]
@@ -252,7 +268,8 @@ mod tests {
     fn jit_pages_deduplicate_writes_until_drain() {
         let mut state = JitPageState::new(3 * JIT_PAGE_SIZE);
         let code = RAM_BASE + JIT_PAGE_SIZE as u64;
-        state.mark_address(code);
+        assert!(state.mark_address(code));
+        assert!(!state.mark_address(code + 8));
         state.note_store(code + 4);
         state.note_store(code + 8);
 

@@ -112,6 +112,19 @@ class KernelBuilder {
     this.emit(encodeR(op.op, 0, 0, rd, rs1, rs2));
   }
 
+  xor(rd, rs1, rs2) {
+    this.emit(encodeR(op.op, 4, 0, rd, rs1, rs2));
+  }
+
+  or(rd, rs1, rs2) {
+    this.emit(encodeR(op.op, 6, 0, rd, rs1, rs2));
+  }
+
+  mulHigh(funct3, rd, rs1, rs2) {
+    assert.ok(funct3 >= 1 && funct3 <= 3);
+    this.emit(encodeR(op.op, funct3, 1, rd, rs1, rs2));
+  }
+
   addi(rd, rs1, immediate) {
     this.emit(encodeI(op.addi, 0, rd, rs1, immediate));
   }
@@ -239,6 +252,66 @@ function hotLoopKernel() {
   b.li(7, iterations);
   b.bne(6, 7, "fail");
   return finishWithFailureLoop(b);
+}
+
+const U64_BITS = 64n;
+const U64_MODULUS = 1n << U64_BITS;
+const U64_SIGN = 1n << (U64_BITS - 1n);
+const U64_MASK = U64_MODULUS - 1n;
+
+function signed64(value) {
+  const bits = value & U64_MASK;
+  return (bits & U64_SIGN) === 0n ? bits : bits - U64_MODULUS;
+}
+
+function multiplyHighReference(funct3, lhs, rhs) {
+  const a = funct3 === 3 ? lhs & U64_MASK : signed64(lhs);
+  const b = funct3 === 1 ? signed64(rhs) : rhs & U64_MASK;
+  return ((a * b) >> U64_BITS) & U64_MASK;
+}
+
+function multiplyHighKernel() {
+  const iterations = 200_000;
+  const literalOffset = 0x800;
+  const cases = [
+    [0n, U64_MASK],
+    [U64_MASK, U64_MASK],
+    [U64_SIGN, U64_MASK],
+    [0x0123_4567_89ab_cdefn, 0xfedc_ba98_7654_3210n],
+  ];
+  const records = cases.map(([lhs, rhs]) => [
+    lhs,
+    rhs,
+    multiplyHighReference(1, lhs, rhs),
+    multiplyHighReference(2, lhs, rhs),
+    multiplyHighReference(3, lhs, rhs),
+  ]);
+
+  const b = new KernelBuilder();
+  b.li(5, iterations);
+  b.addi(17, 0, 0);
+  b.label("loop");
+  for (let caseIndex = 0; caseIndex < records.length; caseIndex++) {
+    const address = KERNEL_BASE + literalOffset + caseIndex * 5 * 8;
+    for (let valueIndex = 0; valueIndex < 5; valueIndex++) {
+      b.loadLiteral64(11 + valueIndex, address + valueIndex * 8);
+    }
+    for (let funct3 = 1; funct3 <= 3; funct3++) {
+      b.mulHigh(funct3, 10, 11, 12);
+      b.xor(16, 10, 12 + funct3);
+      b.or(17, 17, 16);
+    }
+  }
+  b.addi(5, 5, -1);
+  b.bne(5, 0, "loop");
+  b.bne(17, 0, "fail");
+
+  const image = finishWithFailureLoop(b);
+  const view = new DataView(image.buffer);
+  records.flat().forEach((value, index) => {
+    view.setBigUint64(literalOffset + index * 8, value, true);
+  });
+  return image;
 }
 
 function tlbRefillKernel() {
@@ -386,6 +459,19 @@ let tlbJit;
   vm.destroyJit();
 }
 
+let multiplyHighJit;
+{
+  const { vm, poweredOff } = await runKernel(multiplyHighKernel());
+  const sbi = vm.virtSbiCallCounts();
+  assert.equal(poweredOff, true, "multiply-high JIT produced a wrong result or did not exit");
+  assert.equal(sbi.srst, 1n, "multiply-high kernel did not exit through direct SBI");
+  multiplyHighJit = {
+    retired: vm.ex.jit_stat(0),
+    cacheEntries: vm.ex.jit_stat(3),
+  };
+  vm.destroyJit();
+}
+
 assert.ok(hotJit.retired > 0n, "virt_run retired no JIT instructions");
 assert.ok(hotJit.dispatches > 0n, "virt_run dispatched no JIT blocks");
 assert.ok(hotJit.cacheEntries > 0n, "VirtMachine populated no system JIT cache entries");
@@ -395,8 +481,12 @@ assert.ok(
   tlbJit.refills > 0n,
   "compiled VirtMachine memory operations never used the TLB refill ABI",
 );
+assert.ok(multiplyHighJit.retired > 0n, "multiply-high kernel never entered compiled code");
+assert.ok(multiplyHighJit.cacheEntries > 0n, "multiply-high kernel populated no JIT entries");
 
-console.log("PASS VirtMachine JIT dispatch, direct SBI, and context-aware TLB refill");
+console.log(
+  "PASS VirtMachine JIT dispatch, multiply-high execution, direct SBI, and context-aware TLB refill",
+);
 
 {
   const { vm, poweredOff } = await runKernel(hotLoopKernel(), {
@@ -452,7 +542,9 @@ for (const [stopInstruction, expectedPowerOff] of [
 console.log("PASS final host I/O flush preserves power-off and realtime WFI state");
 
 {
-  const vm = await RV64Debug.create(wasm, { asyncCompilers: 1 });
+  // One compiler is intentionally held below. Keep spare workers available
+  // so the assertion can distinguish that region from unrelated async work.
+  const vm = await RV64Debug.create(wasm, { asyncCompilers: 4 });
   const originalCompile = WebAssembly.compile;
   let releaseCompile;
   const compileGate = new Promise((resolve) => {
@@ -475,6 +567,7 @@ console.log("PASS final host I/O flush preserves power-off and realtime WFI stat
     vm.ex.sys_set_superblock(1);
     vm.ex.jit_set_sb_spacing(0);
     vm.ex.jit_set_batch(0);
+    vm.ex.jit_set_page_modules(0);
     vm.bootVirtLinuxDirect({ kernel: asyncStaleKernel(), ramMB: 32 });
 
     const issuedBefore = vm.ex.jit_stat(12);

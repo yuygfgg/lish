@@ -65,6 +65,8 @@ const BASE: u32 = 8;
 /// i64 scratch for the chain stub (holds the next pc while it checks the line).
 #[allow(dead_code)] // scratch slot used by the retained chain-exit experiment
 const CPC: u32 = 9;
+/// Permission-context tag loaded once per compiled function invocation.
+const TLB_CONTEXT: u32 = 10;
 
 /// Host-filled TLB misses inside compiled code (see tlb_idx_tag_fill).
 /// DEFAULT OFF, measured: it removes 1.2M bails from an in-guest `tcc -c` for
@@ -135,15 +137,39 @@ pub fn trace_level() -> u32 {
 /// Emitted chain transfers must mask it off before call_indirect; the host
 /// masks it before its own table call.
 pub const SB_IDX_BIT: i32 = 1 << 30;
+/// Dispatch-line marker for page-module entries. This keeps module-kind tests
+/// out of the per-dispatch owner maps. It is metadata, never part of a table
+/// index, and must be stripped together with `SB_IDX_BIT` before a call.
+pub const PAGE_IDX_BIT: i32 = 1 << 29;
+pub const IDX_TAG_MASK: i32 = SB_IDX_BIT | PAGE_IDX_BIT;
 
-/// When set, translate_block_link skips the copy/loop detectors and returns
-/// Block.wasm as the RAW body stream (no module wrapper, no trailing END)
-/// with Block.locals filled — the shape translate_batch assembles into one
-/// multi-function module. Single-threaded wasm host; contained to
-/// translate_batch's scope.
-static RAW_BODY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-fn raw_body() -> bool {
-    RAW_BODY.load(std::sync::atomic::Ordering::Relaxed)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyOutput {
+    Module,
+    Raw,
+}
+
+#[derive(Clone, Copy)]
+enum ExitFallback {
+    Host,
+    Router(u32),
+}
+
+/// Translation behavior that used to be hidden behind `RAW_BODY`. Keeping it
+/// explicit makes raw-body emission reentrant and gives each multi-function
+/// module an unambiguous internal routing ABI.
+#[derive(Clone, Copy)]
+struct TranslationConfig<'a> {
+    link: &'a dyn Fn(u64) -> Option<u32>,
+    direct_func_base: u32,
+    validate_direct_link: bool,
+    fallback: ExitFallback,
+    output: BodyOutput,
+    detect_regions: bool,
+    trace_level: u32,
+    follow_direct_jumps: bool,
+    direct_conditional_edges: bool,
+    stop_at_linked_entry: bool,
 }
 
 /// Linear-trace register value facts (see translate_block). `Proven` values
@@ -262,7 +288,9 @@ fn tlb_fill_enabled() -> bool {
 }
 /// Total i64 scratch locals to declare (register locals follow next; the
 /// i32 IDXB local follows all i64 locals, so its index is dynamic).
-const N_I64_LOCALS: u32 = 9;
+const N_I64_LOCALS: u32 = 10;
+const TLB_VPN_MASK: u64 = (1 << 52) - 1;
+const TLB_EXEC_MODE_MASK: u64 = 3 << 52;
 
 /// Full-system memory access layout: emitted loads/stores probe the
 /// interpreter's own Load/Store TLBs inline; on a hit within guest RAM
@@ -278,6 +306,23 @@ pub struct SysMem {
     pub ftlb_store_off: u32,
     /// Index mask: jit_ftlb_size() - 1.
     pub tlb_mask: u32,
+    /// Effective privilege + SUM/MXR bits above the Sv48 virtual page number.
+    /// This is the context at translation time; generated entry guards use its
+    /// execution-mode bits while memory probes use the live context below.
+    pub context_tag: u64,
+    /// Address of Cpu's packed live translation state. Generated functions
+    /// mask it down to the permission-context bits before TLB probes.
+    pub context_addr: u32,
+}
+
+fn emit_tlb_page_key(m: &mut WasmModule) {
+    m.local_get(VA)
+        .i64_const(12)
+        .op(I64_SHR_U)
+        .i64_const(TLB_VPN_MASK as i64)
+        .op(I64_AND);
+    m.local_get(TLB_CONTEXT).op(I64_OR);
+    m.local_set(PAGE);
 }
 
 /// Where the emitted code finds emulator state in linear memory, and
@@ -409,6 +454,10 @@ pub struct Block {
     pub trace_control: [u16; 3],
     /// Simple arithmetic/logical, shifts, compares, multiply, divide/rem.
     pub trace_alu: [u16; 5],
+    /// Exact guest PCs on the translated hot path. A host that delays module
+    /// packaging can suppress duplicate tier-up until this block lands without
+    /// hiding side exits or unrelated nearby code.
+    pub trace_pcs: Vec<u64>,
     /// Exit-target pcs of a trace (side-exited branch arms, unfollowed jump
     /// targets, the fall-out continuation): demonstrably-on-the-hot-path
     /// block leaders the host should seed superblock discovery with. Trace
@@ -553,6 +602,74 @@ impl Ctx {
             m.local_set(self.reg_local[rd]);
         } else {
             m.i64_store(self.lay.x_base as u64 + rd as u64 * 8);
+        }
+    }
+
+    /// Push the high 64 bits of rs1 * rs2. WebAssembly has no widening i64
+    /// multiply, so form the unsigned product from 32-bit limbs, then apply
+    /// the two's-complement corrections required by MULH and MULHSU.
+    fn push_mul_high(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize) {
+        const LO_MASK: i64 = 0xffff_ffff;
+        let (a_lo, b_lo, mid, carry) = (SCR, PAGE, PA, VAL);
+
+        self.push_reg(m, s1);
+        m.i64_const(LO_MASK).op(I64_AND).local_set(a_lo);
+        self.push_reg(m, s2);
+        m.i64_const(LO_MASK).op(I64_AND).local_set(b_lo);
+
+        // mid = high32(a_lo * b_lo) + high32(a) * b_lo
+        m.local_get(a_lo)
+            .local_get(b_lo)
+            .op(I64_MUL)
+            .i64_const(32)
+            .op(I64_SHR_U);
+        self.push_reg(m, s1);
+        m.i64_const(32)
+            .op(I64_SHR_U)
+            .local_get(b_lo)
+            .op(I64_MUL)
+            .op(I64_ADD)
+            .local_set(mid);
+        m.local_get(mid)
+            .i64_const(32)
+            .op(I64_SHR_U)
+            .local_set(carry);
+
+        // Add the other cross product. Its high half plus carry completes
+        // the unsigned high product.
+        m.local_get(mid).i64_const(LO_MASK).op(I64_AND);
+        m.local_get(a_lo);
+        self.push_reg(m, s2);
+        m.i64_const(32)
+            .op(I64_SHR_U)
+            .op(I64_MUL)
+            .op(I64_ADD)
+            .local_set(mid);
+        self.push_reg(m, s1);
+        m.i64_const(32).op(I64_SHR_U);
+        self.push_reg(m, s2);
+        m.i64_const(32)
+            .op(I64_SHR_U)
+            .op(I64_MUL)
+            .local_get(carry)
+            .op(I64_ADD)
+            .local_get(mid)
+            .i64_const(32)
+            .op(I64_SHR_U)
+            .op(I64_ADD);
+
+        // high_signed(a*b) = high_unsigned(a*b) - sign(a)*b - sign(b)*a.
+        if matches!(f3, 1 | 2) {
+            self.push_reg(m, s1);
+            m.i64_const(63).op(I64_SHR_S);
+            self.push_reg(m, s2);
+            m.op(I64_AND).op(I64_SUB);
+        }
+        if f3 == 1 {
+            self.push_reg(m, s2);
+            m.i64_const(63).op(I64_SHR_S);
+            self.push_reg(m, s1);
+            m.op(I64_AND).op(I64_SUB);
         }
     }
 
@@ -1616,8 +1733,8 @@ impl Ctx {
             self.bail(m, pc, n);
             m.op(END);
         }
-        // PAGE = va >> 12
-        m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
+        // PAGE = permission-context tag | canonical virtual page number.
+        emit_tlb_page_key(m);
         // Page coalescing (memory-dense blocks, scratch allocated): the last
         // successfully probed (page -> linear offset) per access class is
         // cached in block locals — repeat accesses to the same page skip the
@@ -1743,6 +1860,10 @@ fn scan_regs(
     lay: &JitLayout,
     hot: &dyn Fn(u64) -> bool,
     next: &dyn Fn(u64) -> Option<u64>,
+    trace_level: u32,
+    follow_direct_jumps: bool,
+    link: &dyn Fn(u64) -> Option<u32>,
+    stop_at_linked_entry: bool,
 ) -> (u32, u32, u32, u32, u32) {
     let (mut read, mut write) = (0u32, 0u32);
     // Uses per register: hoisting one into a wasm local costs a load in the
@@ -1767,9 +1888,12 @@ fn scan_regs(
     // follow calls and (guarded) returns along the same path the emitter
     // will take.
     let mut tf = TraceFacts::new();
-    let tl = trace_level();
+    let tl = trace_level;
     let mut seg_entry = start_pc;
     while n < MAX_TRACE as u32 {
+        if n != 0 && stop_at_linked_entry && link(pc).is_some() {
+            break;
+        }
         let Some((insn, ilen)) = fetch(code, base, pc) else {
             break;
         };
@@ -1857,7 +1981,7 @@ fn scan_regs(
                 // back-edges — the loop machinery owns those. Must mirror
                 // translate_block exactly.
                 let follow = if d == 0 {
-                    target > pc && bounded
+                    follow_direct_jumps && target > pc && bounded
                 } else {
                     tl >= 2 && target != pc && bounded
                 };
@@ -2113,8 +2237,6 @@ fn fma_handled(op: u32, insn: u32) -> bool {
 /// (scan_regs, loop_region, scan_regs_super) and emit_simple must consult
 /// this — if a scanner and the emitter ever disagree on where a block ends,
 /// register allocation desyncs from emission (historically a boot hang).
-/// Missing from the M extension: MULH/MULHSU/MULHU (0x33, 0x01, 1..=3) —
-/// wasm has no 64x64->high-64 multiply; emulating it costs ~20 ops.
 fn alu_handled(op: u32, f7: u32, f3: u32) -> bool {
     match op {
         0x37 | 0x17 => true,
@@ -2127,10 +2249,7 @@ fn alu_handled(op: u32, f7: u32, f3: u32) -> bool {
             5 => matches!(f7, 0x00 | 0x01 | 0x20 | 0x21),
             _ => true,
         },
-        0x33 => matches!(
-            (f7, f3),
-            (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0) | (0x01, 4..=7)
-        ),
+        0x33 => matches!((f7, f3), (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0..=7)),
         // OP-IMM-32 shifts: shamt is 5 bits — imm[5] (f7 bit 0) is reserved.
         0x1b => match f3 {
             0 => true,
@@ -2621,6 +2740,29 @@ fn build_ctx_load(
     // Two i32 locals: IDXB (TLB/dispatch index math) and IDXB+1 (the chain
     // stub's function-table index).
     let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags, 2);
+    if let Some(sys) = lay.sys {
+        if sys.context_addr == 0 {
+            m.i64_const(sys.context_tag as i64).local_set(TLB_CONTEXT);
+        } else {
+            m.i32_const(0)
+                .i64_load(sys.context_addr as u64)
+                // Cpu packs the dispatch generation into the low 32 bits of
+                // this cell. Only permission context belongs in a TLB tag;
+                // leaking generation bits into the VPN can alias another
+                // resident page and select its linear-memory offset.
+                .i64_const(!TLB_VPN_MASK as i64)
+                .op(I64_AND)
+                .local_set(TLB_CONTEXT);
+            // Code fetched in one privilege mode must not execute from a
+            // dispatch line retained across a trap into another mode.
+            m.local_get(TLB_CONTEXT)
+                .i64_const(TLB_EXEC_MODE_MASK as i64)
+                .op(I64_AND)
+                .i64_const((sys.context_tag & TLB_EXEC_MODE_MASK) as i64)
+                .op(I64_NE);
+            m.op(IF).op(VOID).op(RETURN).op(END);
+        }
+    }
     let (load_g, load_f) = match load {
         Some((g, f)) => (g & touched & !1, f & fp_touched),
         None => (touched, fp_touched),
@@ -2761,7 +2903,7 @@ fn emit_chain_next(c: &Ctx, m: &mut WasmModule, guard_progress: bool) {
 /// Build the shared chain-check helper body for `lay` (WasmModule::set_helper):
 /// kill-cell, dispatch-line probe (pc match, blacklist, map generation),
 /// fuel — the host fast path's exact conditions — returning the verified,
-/// SB_IDX_BIT-stripped table index, or -1 to fall back to the host. One copy
+/// metadata-stripped table index, or -1 to fall back to the host. One copy
 /// per MODULE instead of ~80 bytes inlined at every trace side exit, which
 /// bloated large block populations past V8's tiering appetite (tcc: 2.4x
 /// slower with the inline form emitted, even unexecuted).
@@ -2791,7 +2933,7 @@ fn build_chain_helper(lay: &JitLayout) -> Vec<u8> {
     h.local_get(2).i32_const(0).op(I32_LT_S);
     h.op(IF).op(VOID).i32_const(-1).op(RETURN).op(END);
     h.local_get(2)
-        .i32_const(!SB_IDX_BIT)
+        .i32_const(!IDX_TAG_MASK)
         .op(I32_AND)
         .local_set(2);
     h.local_get(1).i32_load(lay.dispatch_base as u64 + 12);
@@ -2883,9 +3025,9 @@ fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
         .local_set_i32(idx2);
     m.local_get_i32(idx2).i32_const(0).op(I32_LT_S);
     m.op(IF).op(VOID).op(RETURN).op(END);
-    // Strip the host's region marker before using the index as a table slot.
+    // Strip the host's dispatch metadata before using the index as a table slot.
     m.local_get_i32(idx2)
-        .i32_const(!SB_IDX_BIT)
+        .i32_const(!IDX_TAG_MASK)
         .op(I32_AND)
         .local_set_i32(idx2);
     // line verified under the current address-space generation?
@@ -3105,7 +3247,7 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 c.store_post(m, d);
             }
         }
-        // OP (I, M mul + div/rem; MULH* falls back)
+        // OP (I and M extensions)
         0x33 => {
             let f7 = funct7(insn);
             let f3 = funct3(insn);
@@ -3113,7 +3255,10 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 return false;
             }
             if c.store_pre(m, d) {
-                c.push_reg(m, s1);
+                let is_mul_high = f7 == 0x01 && matches!(f3, 1..=3);
+                if !is_mul_high {
+                    c.push_reg(m, s1);
+                }
                 match (f7, f3) {
                     (0x00, 0) => {
                         c.push_reg(m, s2);
@@ -3126,6 +3271,9 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                     (0x01, 0) => {
                         c.push_reg(m, s2);
                         m.op(I64_MUL);
+                    }
+                    (0x01, 1..=3) => {
+                        c.push_mul_high(m, f3, s1, s2);
                     }
                     (0x00, 1) => {
                         c.push_reg(m, s2);
@@ -3997,7 +4145,7 @@ fn translate_copy_loop(
             m.local_get(kb).op(I64_SUB);
         }
         m.local_set(VA);
-        m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
+        emit_tlb_page_key(&mut m);
         m.local_get(PAGE)
             .op(I32_WRAP_I64)
             .i32_const(sys.tlb_mask as i32)
@@ -4021,7 +4169,7 @@ fn translate_copy_loop(
             m.local_get(kb).op(I64_SUB);
         }
         m.local_set(VA);
-        m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
+        emit_tlb_page_key(&mut m);
         m.local_get(PAGE)
             .op(I32_WRAP_I64)
             .i32_const(sys.tlb_mask as i32)
@@ -4099,6 +4247,7 @@ fn translate_copy_loop(
         wasm: m.finish(),
         span: (0, 0),
         seeds: Vec::new(),
+        trace_pcs: Vec::new(),
         uses_fp: false,
         trace_mix: [0; 5],
         trace_mem: [0; 10],
@@ -4199,23 +4348,19 @@ pub fn translate_block_hot(
     translate_block_link(code, base, start_pc, lay, hot, &|_| None)
 }
 
-/// Emit the intra-batch link at a fixed-target exit: verify the dispatch
-/// line still names OUR co-member (pc, generation, and idx == base + j),
-/// verify fuel, then DIRECT tail call. The target pc is a compile-time
-/// constant, so its dispatch slot is too — every load here is at a constant
-/// address and the whole sequence needs no scratch locals. Falls through to
-/// the ordinary host return when any check fails.
-/// Finish a trace body: full module normally, raw stream in batch mode.
-fn seal(m: WasmModule) -> (Vec<u8>, (u32, u32)) {
+/// Finish a trace body as either a complete standalone module or a raw stream
+/// for a caller-owned multi-function module.
+fn seal(m: WasmModule, output: BodyOutput) -> (Vec<u8>, (u32, u32)) {
     let locals = m.locals();
-    if raw_body() {
-        (m.into_code(), locals)
-    } else {
-        (m.finish(), locals)
+    match output {
+        BodyOutput::Module => (m.finish(), locals),
+        BodyOutput::Raw => (m.into_code(), locals),
     }
 }
 
-fn emit_batch_link(m: &mut WasmModule, lay: &JitLayout, target: u64, j: u32) {
+/// Emit a direct fixed-target link. The dispatch line and fuel checks are the
+/// same for batches and page modules; only the target function index differs.
+fn emit_direct_link(m: &mut WasmModule, lay: &JitLayout, target: u64, func_idx: u32) {
     let off = ((target >> 1) & lay.dispatch_mask as u64) << 4;
     let line = lay.dispatch_base as u64 + off;
     // line.pc == target?
@@ -4239,7 +4384,50 @@ fn emit_batch_link(m: &mut WasmModule, lay: &JitLayout, target: u64, j: u32) {
     m.op(I64_GE_U);
     m.op(IF).op(VOID).op(RETURN).op(END);
     m.local_get(0);
-    m.return_call(1 + j); // func index space: tlb_fill(0), bodies 1..=N
+    m.return_call(func_idx);
+}
+
+/// The host verifies a page module's physical code page before entering it.
+/// Compiled code cannot change SATP, execute SFENCE, or write that marked page
+/// without returning to the dispatcher. A page-local transfer therefore needs
+/// only a fuel check; a target dispatch-line check would strand private bodies.
+fn emit_page_link(m: &mut WasmModule, lay: &JitLayout, func_idx: u32) {
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.fuel_addr as u64);
+    m.op(I64_GE_U);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    m.local_get(0).return_call(func_idx);
+}
+
+fn emit_routed_exit(
+    c: &Ctx,
+    m: &mut WasmModule,
+    config: &TranslationConfig<'_>,
+    guard_progress: bool,
+) {
+    match config.fallback {
+        ExitFallback::Host => emit_chain_next(c, m, guard_progress),
+        ExitFallback::Router(router_idx) => {
+            if guard_progress {
+                m.local_get(ITER).op(I64_EQZ);
+                m.op(IF).op(VOID).op(RETURN).op(END);
+            }
+            m.local_get(0).return_call(router_idx);
+        }
+    }
+}
+
+fn emit_fixed_exit(c: &Ctx, m: &mut WasmModule, config: &TranslationConfig<'_>, target: u64) {
+    if let Some(member_idx) = (config.link)(target) {
+        let func_idx = config.direct_func_base + member_idx;
+        if config.validate_direct_link {
+            emit_direct_link(m, &c.lay, target, func_idx);
+        } else {
+            emit_page_link(m, &c.lay, func_idx);
+        }
+    } else {
+        emit_routed_exit(c, m, config, false);
+    }
 }
 
 /// translate_block_hot plus an intra-batch LINK oracle: link(target_pc) =
@@ -4275,7 +4463,31 @@ pub fn translate_block_ic(
     link: &dyn Fn(u64) -> Option<u32>,
     next: &dyn Fn(u64) -> Option<u64>,
 ) -> Option<Block> {
-    let skip_detectors = raw_body();
+    let config = TranslationConfig {
+        link,
+        direct_func_base: 1,
+        validate_direct_link: true,
+        fallback: ExitFallback::Host,
+        output: BodyOutput::Module,
+        detect_regions: true,
+        trace_level: trace_level(),
+        follow_direct_jumps: true,
+        direct_conditional_edges: false,
+        stop_at_linked_entry: false,
+    };
+    translate_block_configured(code, base, start_pc, lay, hot, next, &config)
+}
+
+fn translate_block_configured(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    next: &dyn Fn(u64) -> Option<u64>,
+    config: &TranslationConfig<'_>,
+) -> Option<Block> {
+    let skip_detectors = !config.detect_regions;
     // The loop/copy detectors see the complete translation window supplied by
     // the host. In diagnostic wide-window mode, a loop that straddles a page
     // boundary can close into a loop region and span registration handles the
@@ -4318,8 +4530,18 @@ pub fn translate_block_ic(
     // conditional branches and followed direct jumps/calls, to the first
     // indirect transfer or unhandled op. Registers the trace touches live in
     // wasm locals for its lifetime.
-    let (read_mask, write_mask, fp_read, fp_write, scan_n) =
-        scan_regs(code, base, start_pc, &lay, hot, next);
+    let (read_mask, write_mask, fp_read, fp_write, scan_n) = scan_regs(
+        code,
+        base,
+        start_pc,
+        &lay,
+        hot,
+        next,
+        config.trace_level,
+        config.follow_direct_jumps,
+        config.link,
+        config.stop_at_linked_entry,
+    );
     // Trace prologue loads only what the trace READS; write-only registers
     // start undefined and each exit flushes only what has been written by
     // that point (Ctx::defined). A linear trace makes this exact — unlike a
@@ -4357,7 +4579,7 @@ pub fn translate_block_ic(
     // A `jalr` whose base register carries a known constant is a followable
     // jump — which is how a leaf callee's `ret` continues the caller's trace.
     let mut tf = TraceFacts::new();
-    let tl = trace_level();
+    let tl = config.trace_level;
     // Entry pc of the current observation segment (see the inline cache).
     let mut seg_entry = start_pc;
     // Actual va range consumed (a trace can run backward through a followed
@@ -4365,6 +4587,7 @@ pub fn translate_block_ic(
     let (mut lo, mut hi) = (start_pc, start_pc);
     // Exit targets = hot-path block leaders (see Block::seeds).
     let mut seeds: Vec<u64> = Vec::new();
+    let mut trace_pcs = Vec::with_capacity(scan_n as usize);
     let mut trace_mix = [0u16; 5];
     let mut trace_mem = [0u16; 10];
     let mut trace_control = [0u16; 3];
@@ -4375,9 +4598,13 @@ pub fn translate_block_ic(
         }
     };
     while n < MAX_TRACE as u32 {
+        if n != 0 && config.stop_at_linked_entry && (config.link)(pc).is_some() {
+            break;
+        }
         let Some((insn, ilen)) = fetch(code, base, pc) else {
             break;
         };
+        trace_pcs.push(pc);
         let next_pc = pc.wrapping_add(ilen);
         lo = lo.min(pc);
         hi = hi.max(next_pc);
@@ -4462,7 +4689,7 @@ pub fn translate_block_ic(
                 }
                 let bounded = target >= base && target < base + code.len() as u64;
                 let follow = if d == 0 {
-                    target > pc && bounded
+                    config.follow_direct_jumps && target > pc && bounded
                 } else {
                     tl >= 2 && target != pc && bounded
                 };
@@ -4479,17 +4706,14 @@ pub fn translate_block_ic(
                 c.flush_writes(&mut m);
                 c.set_pc_const(&mut m, target);
                 c.set_retired(&mut m, n + 1);
-                if let Some(lj) = link(target) {
-                    emit_batch_link(&mut m, &lay, target, lj);
-                } else {
-                    emit_chain_next(&c, &mut m, false);
-                }
-                let (wasm, locals) = seal(m);
+                emit_fixed_exit(&c, &mut m, config, target);
+                let (wasm, locals) = seal(m, config.output);
                 return Some(Block {
                     wasm,
                     locals,
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
+                    trace_pcs: core::mem::take(&mut trace_pcs),
                     uses_fp: (fp_read | fp_write) != 0,
                     trace_mix,
                     trace_mem,
@@ -4538,7 +4762,7 @@ pub fn translate_block_ic(
                                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                                 c.flush_writes(&mut m);
                                 c.set_retired(&mut m, n + 1);
-                                emit_chain_next(&c, &mut m, false);
+                                emit_routed_exit(&c, &mut m, config, false);
                                 m.op(RETURN);
                                 m.op(END);
                             }
@@ -4587,7 +4811,7 @@ pub fn translate_block_ic(
                     m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                     c.flush_writes(&mut m);
                     c.set_retired(&mut m, n + 1);
-                    emit_chain_next(&c, &mut m, false);
+                    emit_routed_exit(&c, &mut m, config, false);
                     m.op(RETURN);
                     m.op(END);
                     seed(&mut seeds, t);
@@ -4604,15 +4828,16 @@ pub fn translate_block_ic(
                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_next(&c, &mut m, false);
+                emit_routed_exit(&c, &mut m, config, false);
                 // Dynamic target (return/indirect): the chain call site
                 // would be megamorphic — dispatch through the host.
-                let (wasm, locals) = seal(m);
+                let (wasm, locals) = seal(m, config.output);
                 return Some(Block {
                     wasm,
                     locals,
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
+                    trace_pcs: core::mem::take(&mut trace_pcs),
                     uses_fp: (fp_read | fp_write) != 0,
                     trace_mix,
                     trace_mem,
@@ -4640,6 +4865,37 @@ pub fn translate_block_ic(
                 };
                 trace_mix[3] = trace_mix[3].saturating_add(1);
                 trace_control[0] = trace_control[0].saturating_add(1);
+                if config.direct_conditional_edges {
+                    seed(&mut seeds, target);
+                    seed(&mut seeds, next_pc);
+                    c.push_reg(&mut m, s1);
+                    c.push_reg(&mut m, s2);
+                    m.op(cmp);
+                    c.flush_writes(&mut m);
+                    c.set_retired(&mut m, n + 1);
+                    m.op(IF).op(VOID);
+                    c.set_pc_const(&mut m, target);
+                    emit_fixed_exit(&c, &mut m, config, target);
+                    m.op(ELSE);
+                    c.set_pc_const(&mut m, next_pc);
+                    emit_fixed_exit(&c, &mut m, config, next_pc);
+                    m.op(END);
+                    let (wasm, locals) = seal(m, config.output);
+                    return Some(Block {
+                        wasm,
+                        locals,
+                        span: (lo, hi),
+                        seeds: core::mem::take(&mut seeds),
+                        trace_pcs: core::mem::take(&mut trace_pcs),
+                        uses_fp: (fp_read | fp_write) != 0,
+                        trace_mix,
+                        trace_mem,
+                        trace_control,
+                        trace_alu,
+                        len: next_pc.saturating_sub(start_pc),
+                        n_insns: n + 1,
+                    });
+                }
                 if tl >= 1 {
                     // Hot-biased direction (must mirror scan_regs): follow
                     // the taken arm when the cache proves it hot and the
@@ -4662,11 +4918,7 @@ pub fn translate_block_ic(
                     c.set_pc_const(&mut m, exit_pc);
                     c.flush_writes(&mut m);
                     c.set_retired(&mut m, n + 1);
-                    if let Some(lj) = link(exit_pc) {
-                        emit_batch_link(&mut m, &lay, exit_pc, lj);
-                    } else {
-                        emit_chain_next(&c, &mut m, false);
-                    }
+                    emit_fixed_exit(&c, &mut m, config, exit_pc);
                     m.op(RETURN);
                     m.op(END);
                     pc = follow_pc;
@@ -4683,13 +4935,14 @@ pub fn translate_block_ic(
                 m.op(END);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_next(&c, &mut m, false);
-                let (wasm, locals) = seal(m);
+                emit_routed_exit(&c, &mut m, config, false);
+                let (wasm, locals) = seal(m, config.output);
                 return Some(Block {
                     wasm,
                     locals,
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
+                    trace_pcs: core::mem::take(&mut trace_pcs),
                     uses_fp: (fp_read | fp_write) != 0,
                     trace_mix,
                     trace_mem,
@@ -4710,17 +4963,14 @@ pub fn translate_block_ic(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, pc);
     c.set_retired(&mut m, n);
-    if let Some(lj) = link(pc) {
-        emit_batch_link(&mut m, &lay, pc, lj);
-    } else {
-        emit_chain_next(&c, &mut m, false);
-    }
-    let (wasm, locals) = seal(m);
+    emit_fixed_exit(&c, &mut m, config, pc);
+    let (wasm, locals) = seal(m, config.output);
     Some(Block {
         wasm,
         locals,
         span: (lo, hi),
         seeds: core::mem::take(&mut seeds),
+        trace_pcs,
         uses_fp: (fp_read | fp_write) != 0,
         trace_mix,
         trace_mem,
@@ -4938,6 +5188,7 @@ fn translate_loop(
         wasm: m.finish(),
         span: (0, 0),
         seeds: Vec::new(),
+        trace_pcs: Vec::new(),
         uses_fp: false,
         trace_mix: [0; 5],
         trace_mem: [0; 10],
@@ -5698,6 +5949,7 @@ pub fn translate_superblock_sparse(
         wasm: m.finish(),
         span: (0, 0),
         seeds: Vec::new(),
+        trace_pcs: Vec::new(),
         uses_fp: false,
         trace_mix: [0; 5],
         trace_mem: [0; 10],
@@ -5720,7 +5972,315 @@ pub struct BatchMember {
     pub trace_mem: [u16; 10],
     pub trace_control: [u16; 3],
     pub trace_alu: [u16; 5],
+    pub trace_pcs: Vec<u64>,
     pub seeds: Vec<u64>,
+}
+
+/// One translated trace body before module packaging. Hosts can stage bodies
+/// from unrelated hot entries, then package a bounded group without changing
+/// trace discovery or waiting for same-page peers.
+pub struct RawBatchBody {
+    wasm: Vec<u8>,
+    locals: (u32, u32),
+}
+
+pub fn translate_confirmed_body(
+    code: &[u8],
+    base: u64,
+    pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    next: &dyn Fn(u64) -> Option<u64>,
+) -> Option<(RawBatchBody, BatchMember)> {
+    let no_link = |_: u64| None;
+    let config = TranslationConfig {
+        link: &no_link,
+        direct_func_base: 1,
+        validate_direct_link: true,
+        fallback: ExitFallback::Host,
+        output: BodyOutput::Raw,
+        detect_regions: false,
+        trace_level: trace_level(),
+        follow_direct_jumps: true,
+        direct_conditional_edges: false,
+        stop_at_linked_entry: false,
+    };
+    let block = translate_block_configured(code, base, pc, lay, hot, next, &config)?;
+    let (body, member) = batch_body(pc, block);
+    Some((
+        RawBatchBody {
+            wasm: body.0,
+            locals: (body.1, body.2),
+        },
+        member,
+    ))
+}
+
+pub fn finish_confirmed_body_batch(bodies: Vec<RawBatchBody>) -> Vec<u8> {
+    wasm_emit::finish_batch(
+        bodies
+            .into_iter()
+            .map(|body| (body.wasm, body.locals.0, body.locals.1))
+            .collect(),
+    )
+}
+
+fn batch_body(pc: u64, block: Block) -> ((Vec<u8>, u32, u32), BatchMember) {
+    let Block {
+        wasm,
+        n_insns,
+        span,
+        locals,
+        uses_fp,
+        trace_mix,
+        trace_mem,
+        trace_control,
+        trace_alu,
+        trace_pcs,
+        seeds,
+        ..
+    } = block;
+    (
+        (wasm, locals.0, locals.1),
+        BatchMember {
+            pc,
+            n_insns,
+            span,
+            uses_fp,
+            trace_mix,
+            trace_mem,
+            trace_control,
+            trace_alu,
+            trace_pcs,
+            seeds,
+        },
+    )
+}
+
+fn emit_batch_entries(
+    code: &[u8],
+    base: u64,
+    entries: &[u64],
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    next: &dyn Fn(u64) -> Option<u64>,
+    stop_at_member: bool,
+) -> Option<(Vec<u8>, Vec<BatchMember>)> {
+    let code_len = u64::try_from(code.len()).ok()?;
+    let end = base.checked_add(code_len)?;
+    if entries.is_empty()
+        || entries.len() > u32::MAX as usize
+        || entries.iter().enumerate().any(|(index, &pc)| {
+            pc < base || pc >= end || pc & 1 != 0 || entries[..index].contains(&pc)
+        })
+    {
+        return None;
+    }
+
+    let index_of = |target: u64| {
+        entries
+            .iter()
+            .position(|&entry| entry == target)
+            .map(|index| index as u32)
+    };
+    let config = TranslationConfig {
+        link: &index_of,
+        direct_func_base: 1,
+        validate_direct_link: true,
+        fallback: ExitFallback::Host,
+        output: BodyOutput::Raw,
+        detect_regions: false,
+        trace_level: trace_level(),
+        follow_direct_jumps: true,
+        direct_conditional_edges: false,
+        stop_at_linked_entry: stop_at_member,
+    };
+    let mut bodies = Vec::with_capacity(entries.len());
+    let mut members = Vec::with_capacity(entries.len());
+    for &pc in entries {
+        let block = translate_block_configured(code, base, pc, lay, hot, next, &config)?;
+        let (body, member) = batch_body(pc, block);
+        bodies.push(body);
+        members.push(member);
+    }
+    Some((wasm_emit::finish_batch(bodies), members))
+}
+
+/// Emit the private page router. The router accepts the standard execution
+/// context parameter, reads the successor pc published by the calling body,
+/// and tail-calls a matching page body. The host already verified this module's
+/// page before entry, and compilable code cannot invalidate that proof inside
+/// the chain. Every range, alignment, or fuel miss returns to the host.
+fn build_page_router(page_base: u64, entries: &[u64], lay: &JitLayout) -> (Vec<u8>, u32, u32) {
+    const ROUTER_PC: u32 = 1;
+
+    let mut m = WasmModule::with_locals(1, 0);
+
+    // A routed transfer is another dispatch within the current fuel grant.
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.fuel_addr as u64);
+    m.op(I64_GE_U);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+
+    m.i32_const(0)
+        .i64_load(lay.pc_addr as u64)
+        .local_set(ROUTER_PC);
+
+    // Reject addresses outside this page before truncating the halfword index
+    // to i32. The alignment guard keeps malformed odd pcs in the interpreter.
+    m.local_get(ROUTER_PC)
+        .i64_const(page_base as i64)
+        .op(I64_SUB)
+        .i64_const(0x1000)
+        .op(I64_LT_U)
+        .op(I32_EQZ);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    m.local_get(ROUTER_PC)
+        .i64_const(1)
+        .op(I64_AND)
+        .op(I64_EQZ)
+        .op(I32_EQZ);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+
+    // Halfword slot -> body index. The nested blocks turn each br_table depth
+    // into an unconditional direct tail call without importing a table.
+    let n = entries.len();
+    let mut slot_depth = vec![n as u32; 0x800];
+    for (i, &pc) in entries.iter().enumerate() {
+        slot_depth[((pc - page_base) >> 1) as usize] = i as u32;
+    }
+    m.op(BLOCK).op(VOID); // default
+    for _ in entries {
+        m.op(BLOCK).op(VOID);
+    }
+    m.local_get(ROUTER_PC)
+        .i64_const(page_base as i64)
+        .op(I64_SUB)
+        .i64_const(1)
+        .op(I64_SHR_U)
+        .op(I32_WRAP_I64);
+    m.br_table(&slot_depth, n as u32);
+    for i in 0..n {
+        m.op(END);
+        m.local_get(0).return_call(2 + i as u32);
+    }
+    m.op(END); // default: return to the host
+
+    let locals = m.locals();
+    (m.into_code(), locals.0, locals.1)
+}
+
+/// Compile one 4 KiB code page as a multi-function module. Each supplied
+/// leader becomes one private trace body. The module exports one router which
+/// reads the architectural PC and selects a body. Fixed edges to another
+/// supplied leader use a direct tail call. Dynamic and otherwise unresolved
+/// exits tail-call the router, which validates fuel before routing by page
+/// halfword.
+///
+/// `page_base` must be page-aligned. Every entry must be a distinct,
+/// halfword-aligned address in that page. The returned members describe every
+/// router target; the host maps all of them to the router's one table slot.
+/// The leading `trace_entries` are observed-hot roots and use the normal trace
+/// policy. Remaining statically discovered leaders use one-basic-block bodies.
+pub fn translate_page_module(
+    page: &[u8],
+    page_base: u64,
+    entries: &[u64],
+    trace_entries: usize,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    next: &dyn Fn(u64) -> Option<u64>,
+) -> Option<(Vec<u8>, Vec<BatchMember>)> {
+    if page.len() != 0x1000
+        || page_base & 0xfff != 0
+        || entries.is_empty()
+        || trace_entries > entries.len()
+        || lay.dispatch_base == 0
+        || lay.map_gen_addr == 0
+        || lay.fuel_addr == 0
+        || lay.retired_addr == 0
+    {
+        return None;
+    }
+    let mut entry_index = vec![None; 0x800];
+    for (i, &pc) in entries.iter().enumerate() {
+        let offset = pc.wrapping_sub(page_base);
+        if offset >= 0x1000 || pc & 1 != 0 {
+            return None;
+        }
+        let slot = (offset >> 1) as usize;
+        if entry_index[slot].replace(i as u32).is_some() {
+            return None;
+        }
+    }
+
+    let index_of = |target: u64| {
+        let offset = target.wrapping_sub(page_base);
+        (offset < 0x1000 && target & 1 == 0)
+            .then(|| entry_index[(offset >> 1) as usize])
+            .flatten()
+    };
+    let trace_config = TranslationConfig {
+        link: &index_of,
+        direct_func_base: 2, // tlb_fill = 0, private router = 1
+        validate_direct_link: false,
+        fallback: ExitFallback::Router(1),
+        output: BodyOutput::Raw,
+        detect_regions: false,
+        trace_level: trace_level(),
+        follow_direct_jumps: true,
+        direct_conditional_edges: false,
+        stop_at_linked_entry: false,
+    };
+    let block_config = TranslationConfig {
+        link: &index_of,
+        direct_func_base: 2, // tlb_fill = 0, private router = 1
+        validate_direct_link: false,
+        fallback: ExitFallback::Router(1),
+        output: BodyOutput::Raw,
+        detect_regions: false,
+        trace_level: 0,
+        follow_direct_jumps: false,
+        direct_conditional_edges: true,
+        stop_at_linked_entry: true,
+    };
+
+    let mut bodies = Vec::with_capacity(entries.len());
+    let mut members = Vec::with_capacity(entries.len());
+    for (index, &pc) in entries.iter().enumerate() {
+        let config = if index < trace_entries {
+            &trace_config
+        } else {
+            &block_config
+        };
+        let b = translate_block_configured(page, page_base, pc, lay, hot, next, config)?;
+        let (body, member) = batch_body(pc, b);
+        bodies.push(body);
+        members.push(member);
+    }
+
+    let router = build_page_router(page_base, entries, &lay);
+    Some((wasm_emit::finish_page_module(router, bodies), members))
+}
+
+/// Compile an explicit set of confirmed-hot entries as one multi-export
+/// module. Entry `entries[j]` is exported as `r{j}` and described by
+/// `members[j]`. The emitter does not discover or append successors. A fixed
+/// exit to another supplied entry uses a direct intra-module tail call; every
+/// other exit returns to the host dispatcher.
+///
+/// Every entry must be distinct, halfword-aligned, and inside `[base,
+/// base + code.len())`. Each member is emitted as an independent raw trace.
+/// Reaching another supplied entry ends the current trace at that boundary.
+pub fn translate_confirmed_batch(
+    code: &[u8],
+    base: u64,
+    entries: &[u64],
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    next: &dyn Fn(u64) -> Option<u64>,
+) -> Option<(Vec<u8>, Vec<BatchMember>)> {
+    emit_batch_entries(code, base, entries, lay, hot, next, true)
 }
 
 /// Compile a hot pc AND its fixed-target successors as ONE module whose
@@ -5764,8 +6324,20 @@ pub fn translate_batch_obs(
     // Pass 1 (no links): discover the member set breadth-first from the
     // seed pc's exits. Bodies are re-emitted in pass 2 once every member's
     // index is known, so a link can name a member discovered after it.
-    RAW_BODY.store(true, std::sync::atomic::Ordering::Relaxed);
     let no_link = |_: u64| None;
+    let batch_trace_level = trace_level();
+    let discover_config = TranslationConfig {
+        link: &no_link,
+        direct_func_base: 1,
+        validate_direct_link: true,
+        fallback: ExitFallback::Host,
+        output: BodyOutput::Raw,
+        detect_regions: false,
+        trace_level: batch_trace_level,
+        follow_direct_jumps: true,
+        direct_conditional_edges: false,
+        stop_at_linked_entry: false,
+    };
     let mut pcs: Vec<u64> = vec![start_pc];
     let mut probed = 0usize;
     // A loop header keeps its structured region: never pull one into a
@@ -5778,7 +6350,8 @@ pub fn translate_batch_obs(
         // that still ended at every indirect jump would defeat the point —
         // the two mechanisms compose (IC extends a member through an edge,
         // links carry the exits that remain to co-members).
-        let Some(b) = translate_block_ic(code, base, p, lay, hot, &no_link, next) else {
+        let Some(b) = translate_block_configured(code, base, p, lay, hot, next, &discover_config)
+        else {
             continue;
         };
         // Observed successor first: it is where execution goes, so the link
@@ -5798,37 +6371,9 @@ pub fn translate_batch_obs(
         }
     }
     // Pass 2: emit every member with links resolved against the final set.
-    let index_of = |t: u64| pcs.iter().position(|&q| q == t).map(|k| k as u32);
-    let mut bodies: Vec<(Vec<u8>, u32, u32)> = Vec::new();
-    let mut members: Vec<BatchMember> = Vec::new();
-    let mut ok = true;
-    for &p in &pcs {
-        match translate_block_ic(code, base, p, lay, hot, &index_of, next) {
-            Some(b) => {
-                bodies.push((b.wasm, b.locals.0, b.locals.1));
-                members.push(BatchMember {
-                    pc: p,
-                    n_insns: b.n_insns,
-                    span: b.span,
-                    uses_fp: b.uses_fp,
-                    trace_mix: b.trace_mix,
-                    trace_mem: b.trace_mem,
-                    trace_control: b.trace_control,
-                    trace_alu: b.trace_alu,
-                    seeds: b.seeds,
-                });
-            }
-            None => {
-                ok = false;
-                break;
-            }
-        }
-    }
-    RAW_BODY.store(false, std::sync::atomic::Ordering::Relaxed);
-    if !ok || bodies.is_empty() {
-        return None;
-    }
-    Some((wasm_emit::finish_batch(bodies), members))
+    // Keep the legacy overlap policy: discovery chose these trace roots, so a
+    // trace may still run through a later member before reaching an exit.
+    emit_batch_entries(code, base, &pcs, lay, hot, next, false)
 }
 
 #[cfg(test)]
@@ -6081,6 +6626,165 @@ mod tests {
             | (((imm >> 20) & 1) << 31)
     }
 
+    fn uleb(bytes: &[u8], pos: &mut usize) -> usize {
+        let mut value = 0usize;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[*pos];
+            *pos += 1;
+            value |= ((byte & 0x7f) as usize) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    fn section(module: &[u8], wanted: u8) -> &[u8] {
+        let mut pos = 8;
+        while pos < module.len() {
+            let id = module[pos];
+            pos += 1;
+            let len = uleb(module, &mut pos);
+            let end = pos + len;
+            if id == wanted {
+                return &module[pos..end];
+            }
+            pos = end;
+        }
+        panic!("missing wasm section {wanted}");
+    }
+
+    fn function_bodies(module: &[u8]) -> Vec<&[u8]> {
+        let code = section(module, 10);
+        let mut pos = 0;
+        let n = uleb(code, &mut pos);
+        let mut bodies = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len = uleb(code, &mut pos);
+            bodies.push(&code[pos..pos + len]);
+            pos += len;
+        }
+        assert_eq!(pos, code.len());
+        bodies
+    }
+
+    fn function_exports(module: &[u8]) -> Vec<(String, usize)> {
+        let exports = section(module, 7);
+        let mut pos = 0;
+        let n = uleb(exports, &mut pos);
+        let mut functions = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name_len = uleb(exports, &mut pos);
+            let name = std::str::from_utf8(&exports[pos..pos + name_len])
+                .expect("UTF-8 export name")
+                .to_owned();
+            pos += name_len;
+            assert_eq!(exports[pos], 0, "expected a function export");
+            pos += 1;
+            functions.push((name, uleb(exports, &mut pos)));
+        }
+        assert_eq!(pos, exports.len());
+        functions
+    }
+
+    #[test]
+    fn confirmed_batch_exports_exactly_the_supplied_entries() {
+        let base = 0x4000u64;
+        let words = [
+            branch(0, 0, 0, 8), // cold side exit at base + 8
+            0x0000_0073,        // ecall
+            0x0011_8193,        // addi x3,x3,1 (not an entry)
+            0x0000_0073,        // ecall
+            jal(0, -16),        // fixed exit to entry zero
+            0x0000_0073,        // ecall
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let entries = [base, base + 16];
+
+        let (module, members) = translate_confirmed_batch(
+            &code,
+            base,
+            &entries,
+            JitLayout::bare(),
+            &|_| false,
+            &|_| None,
+        )
+        .expect("confirmed batch");
+
+        assert_eq!(
+            members.iter().map(|member| member.pc).collect::<Vec<_>>(),
+            entries
+        );
+        assert!(members[0].seeds.contains(&(base + 8)));
+        assert_eq!(
+            function_exports(&module),
+            vec![("r0".to_owned(), 1), ("r1".to_owned(), 2)]
+        );
+        let bodies = function_bodies(&module);
+        assert_eq!(bodies.len(), entries.len());
+        assert!(bodies[1].windows(2).any(|op| op == [0x12, 1]));
+    }
+
+    #[test]
+    fn page_module_has_private_router_and_independent_bodies() {
+        let page_base = 0x4000u64;
+        let entries = [page_base, page_base + 4, page_base + 8];
+        let mut page = vec![0u8; 0x1000];
+        page[0..4].copy_from_slice(&branch(0, 0, 0, 8).to_le_bytes());
+        page[4..8].copy_from_slice(&0x0010_8093u32.to_le_bytes()); // addi x1,x1,1
+        page[8..12].copy_from_slice(&0x0011_0113u32.to_le_bytes()); // addi x2,x2,1
+        page[12..16].copy_from_slice(&0x0000_0073u32.to_le_bytes()); // ecall
+
+        let mut lay = JitLayout::bare();
+        lay.dispatch_base = 0x1000;
+        lay.dispatch_mask = 0xff;
+        lay.map_gen_addr = 0x3000;
+        lay.fuel_addr = 0x3008;
+        let (module, members) =
+            translate_page_module(&page, page_base, &entries, 0, lay, &|_| false, &|_| None)
+                .expect("page module");
+
+        // Entry 1 stops when it reaches entry 2 instead of swallowing it into
+        // an overlapping trace. All three leaders therefore have one-insn
+        // bodies in this fixture.
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.n_insns)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+
+        // The router is the only public function. Every cached entry shares
+        // that table slot and the router selects a private body from cpu.pc.
+        let exports = section(&module, 7);
+        let mut pos = 0;
+        assert_eq!(uleb(exports, &mut pos), 1);
+        let name_len = uleb(exports, &mut pos);
+        assert_eq!(&exports[pos..pos + name_len], b"run");
+        pos += name_len;
+        assert_eq!(exports[pos], 0); // function export
+        pos += 1;
+        assert_eq!(uleb(exports, &mut pos), 1); // private-router body
+        assert_eq!(pos, exports.len());
+
+        let bodies = function_bodies(&module);
+        assert_eq!(bodies.len(), 4); // router + three private targets
+        assert!(bodies[0].contains(&BR_TABLE));
+        for target in [2u8, 3, 4] {
+            assert!(bodies[0].windows(2).any(|op| op == [0x12, target]));
+        }
+        // The conditional body directly links both fixed arms. The final body
+        // reaches an unresolved ecall and tail-calls router function 1.
+        assert!(bodies[1].windows(2).any(|op| op == [0x12, 3]));
+        assert!(bodies[1].windows(2).any(|op| op == [0x12, 4]));
+        assert!(bodies[3].windows(2).any(|op| op == [0x12, 1]));
+        assert!(!module
+            .windows(b"chain_next".len())
+            .any(|bytes| bytes == b"chain_next"));
+    }
+
     #[test]
     fn multi_latch_falls_back_to_ordinary_loop() {
         let code = code_bytes();
@@ -6163,6 +6867,18 @@ mod tests {
         let b = translate_block(&code, 0, 0, JitLayout::bare()).unwrap();
         assert_eq!(b.n_insns, 3);
         assert_eq!(b.len, 6);
+    }
+
+    #[test]
+    fn translates_multiply_high_family() {
+        // mulh x3,x1,x2; mulhsu x4,x1,x2; mulhu x5,x1,x2; ecall
+        let words = [0x0220_91b3u32, 0x0220_a233, 0x0220_b2b3, 0x0000_0073];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let b = translate_block(&code, 0, 0, JitLayout::bare()).unwrap();
+
+        assert_eq!(b.n_insns, 3);
+        assert_eq!(b.len, 12);
+        assert_eq!(b.trace_alu, [0, 0, 0, 3, 0]);
     }
 
     #[test]

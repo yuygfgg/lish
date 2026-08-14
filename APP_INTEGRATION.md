@@ -365,6 +365,9 @@ and a normal copy otherwise. It publishes the file only after image creation
 succeeds. A future multi-VM catalog must apply the same operation when the
 user creates a VM.
 
+The packaged native base image has a 2 GiB ext2 filesystem. The browser demo
+uses a separate compact image because the browser loads that image into memory.
+
 Require a regular, non-empty raw image whose size is a multiple of 512 bytes.
 The file size defines the virtual disk size. The protocol needs no database or
 disk metadata file.

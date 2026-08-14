@@ -112,7 +112,7 @@ if [ ! -s "$web_source/vendor/xterm/xterm.js" ] || \
 fi
 
 require_file "$web_source/images/alpine/Image"
-require_file "$web_source/images/alpine/alpine.ext4"
+require_file "$web_source/images/alpine/alpine-native.ext4"
 
 echo "building WebAssembly runtime"
 (cd "$root" && "$root/tools/cargo" build -p rv64-wasm --target wasm32-unknown-unknown --release)
@@ -170,7 +170,7 @@ for relative in \
     vendor/xterm/xterm.css \
     vendor/xterm/addon-fit.js \
     images/alpine/Image \
-    images/alpine/alpine.ext4; do
+    images/alpine/alpine-native.ext4; do
     copy_web_file "$relative"
 done
 install -m 0644 "$wasm_source" "$resources/web/rv64_wasm.wasm"

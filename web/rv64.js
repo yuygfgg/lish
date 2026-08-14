@@ -16,11 +16,30 @@ const DEFAULT_JIT_LIMITS = Object.freeze({
   growSlots: 4096,
 });
 
-const MAX_ASYNC_JIT_COMPILERS = 4;
+const DEFAULT_ASYNC_JIT_COMPILERS = 1;
 const MAX_FULL_SYSTEM_PENDING_JIT = 4;
 
+let wasmTailCallsSupported;
+
+function supportsWasmTailCalls() {
+  if (wasmTailCallsSupported !== undefined) return wasmTailCallsSupported;
+  try {
+    new WebAssembly.Module(new Uint8Array([
+      0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+      1, 5, 1, 0x60, 1, 0x7f, 0,
+      2, 11, 1, 1, 0x65, 3, 0x74, 0x61, 0x62, 0x01, 0x70, 0, 0,
+      3, 2, 1, 0,
+      10, 11, 1, 9, 0, 0x20, 0, 0x41, 0, 0x13, 0, 0, 0x0b,
+    ]));
+    wasmTailCallsSupported = true;
+  } catch {
+    wasmTailCallsSupported = false;
+  }
+  return wasmTailCallsSupported;
+}
+
 function asyncJitCompilerCount(value) {
-  if (value === undefined) return MAX_ASYNC_JIT_COMPILERS;
+  if (value === undefined) return DEFAULT_ASYNC_JIT_COMPILERS;
   if (!Number.isSafeInteger(value) || value < 1 || value > MAX_FULL_SYSTEM_PENDING_JIT) {
     throw new RangeError(
       `jit.asyncCompilers must be an integer from 1 to ${MAX_FULL_SYSTEM_PENDING_JIT}`,
@@ -451,7 +470,7 @@ export class RV64Debug {
   #jitCompileCount = 0;
   #jitCompileMs = 0;
   #maxJitCompileMs = 0;
-  #maxAsyncJitCompilers = MAX_ASYNC_JIT_COMPILERS;
+  #maxAsyncJitCompilers = DEFAULT_ASYNC_JIT_COMPILERS;
 
   /** @param {WebAssembly.Instance} instance */
   constructor(instance) {
@@ -752,7 +771,15 @@ export class RV64Debug {
 
   /** Instantiate from wasm bytes (ArrayBuffer/TypedArray/Response). */
   static async create(wasmSource, jitOptions = {}) {
-    const { asyncCompilers, enabled = true, ...jitStoreOptions } = jitOptions;
+    const {
+      asyncCompilers,
+      confirmedBatch,
+      confirmedBatchTarget,
+      enabled = true,
+      pageModules,
+      threshold,
+      ...jitStoreOptions
+    } = jitOptions;
     if (typeof enabled !== "boolean") {
       throw new TypeError("jit.enabled must be a boolean");
     }
@@ -824,6 +851,29 @@ export class RV64Debug {
       jitStoreOptions,
     );
     if (!enabled) vm.ex.jit_set_enabled?.(0);
+    if (confirmedBatchTarget !== undefined) {
+      if (!Number.isSafeInteger(confirmedBatchTarget) || confirmedBatchTarget < 2) {
+        throw new RangeError("jit.confirmedBatchTarget must be an integer of at least 2");
+      }
+      vm.ex.jit_set_confirmed_batch_target?.(confirmedBatchTarget);
+    }
+    if (confirmedBatch !== undefined) {
+      if (typeof confirmedBatch !== "boolean") {
+        throw new TypeError("jit.confirmedBatch must be a boolean");
+      }
+      vm.ex.jit_set_confirmed_batch?.(confirmedBatch ? 1 : 0);
+    }
+    if (pageModules !== undefined && typeof pageModules !== "boolean") {
+      throw new TypeError("jit.pageModules must be a boolean");
+    }
+    const usePageModules = (pageModules ?? true) && supportsWasmTailCalls();
+    vm.ex.jit_set_page_modules?.(usePageModules ? 1 : 0);
+    if (threshold !== undefined) {
+      if (!Number.isSafeInteger(threshold) || threshold < 1) {
+        throw new RangeError("jit.threshold must be a positive integer");
+      }
+      vm.ex.jit_set_threshold?.(threshold);
+    }
     vm.#maxAsyncJitCompilers = asyncJitCompilerCount(asyncCompilers);
     // Hardware FMA: use f64x2.relaxed_madd for the guest's FMADD family iff
     // the engine validates it AND it is fused on this hardware (the spec
@@ -853,14 +903,7 @@ export class RV64Debug {
     // Direct block chaining needs wasm tail calls (return_call_indirect,
     // shipped by default in V8 11.2+). Feature-detect with a 1-function probe
     // so older engines just keep the plain dispatch loop.
-    try {
-      new WebAssembly.Module(new Uint8Array([
-        0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
-        1, 5, 1, 0x60, 1, 0x7f, 0,
-        2, 11, 1, 1, 0x65, 3, 0x74, 0x61, 0x62, 0x01, 0x70, 0, 0,
-        3, 2, 1, 0,
-        10, 11, 1, 9, 0, 0x20, 0, 0x41, 0, 0x13, 0, 0, 0x0b,
-      ]));
+    if (supportsWasmTailCalls()) {
       // Chaining is DEFAULT OFF after three measured architectures:
       // (1) emitted return_call_indirect — ~2ns/hop on node 20.18.1, but
       // any module importing the shared table makes table.set O(importing
@@ -877,8 +920,6 @@ export class RV64Debug {
       if (globalThis.process?.env?.RV_TAILCALL === "1") {
         vm.ex.jit_set_tailcall?.(1);
       }
-    } catch {
-      /* no tail calls: chaining stays off */
     }
     return vm;
   }
@@ -897,6 +938,11 @@ export class RV64Debug {
   jitMetrics() {
     return Object.freeze({
       ...this.jitCodeStore.snapshot(),
+      rustRetiredInstructions: Number(this.ex.jit_stat(0)),
+      rustDispatches: Number(this.ex.jit_stat(1)),
+      rustCacheEntries: Number(this.ex.jit_stat(3)),
+      rustInterpreterCalls: Number(this.ex.jit_stat(4)),
+      rustInterpreterInstructions: Number(this.ex.jit_stat(5)),
       rustLiveSlots: Number(this.ex.jit_stat(73)),
       rustPeakSlots: Number(this.ex.jit_stat(74)),
       rustRetiredSlots: Number(this.ex.jit_stat(75)),
@@ -907,6 +953,16 @@ export class RV64Debug {
       pendingBlocks: Number(this.ex.jit_stat(79)),
       pendingBatches: Number(this.ex.jit_stat(80)),
       pendingRegions: Number(this.ex.jit_stat(81)),
+      rustTrackedCodePages: Number(this.ex.jit_stat(82)),
+      rustHotEntries: Number(this.ex.jit_stat(84)),
+      rustTlbBails: Number(this.ex.jit_stat(85)),
+      rustTlbAutoEnabled: this.ex.jit_stat(86) !== 0n,
+      pageModulesIssued: Number(this.ex.jit_stat(87)),
+      pageModulesLanded: Number(this.ex.jit_stat(88)),
+      pageModuleMembers: Number(this.ex.jit_stat(89)),
+      confirmedStaged: Number(this.ex.jit_stat(90)),
+      confirmedCoverage: Number(this.ex.jit_stat(91)),
+      evictionCooledEntries: Number(this.ex.jit_stat(92)),
       asyncCompileActive: this.#jitCompileActive,
       asyncCompileQueued: this.#jitCompileQueued,
       peakAsyncCompileQueued: this.#peakJitCompileQueued,
@@ -1117,6 +1173,15 @@ async function imageBytes(source, name, emit) {
 
 const hostYieldQueue = [];
 let hostYieldChannel;
+
+const FULL_SYSTEM_SLICE_INSNS = 2_000_000n;
+const PENDING_JIT_SLICE_INSNS = 262_144n;
+
+function fullSystemSliceBudget(core) {
+  return core.pendingJitBuilds() === 0
+    ? FULL_SYSTEM_SLICE_INSNS
+    : PENDING_JIT_SLICE_INSNS;
+}
 
 function hostYield(callback) {
   if (typeof setImmediate === "function") return setImmediate(callback);
@@ -1379,6 +1444,11 @@ export class RV64 {
     return this.#instructions();
   }
 
+  get instructionsPerSecond() {
+    this.#assertLive();
+    return null;
+  }
+
   jitMetrics() {
     this.#assertLive();
     return this.#core.jitMetrics();
@@ -1459,7 +1529,8 @@ export class RV64 {
         ramMB: memoryMB ?? 512,
         ...networkOptions,
       });
-      this.#runSlice = () => this.#core.virtRunSystemOutcome(2_000_000n);
+      this.#runSlice = () =>
+        this.#core.virtRunSystemOutcome(fullSystemSliceBudget(this.#core));
       this.#input = (bytes) => this.#core.virtConsoleInput(bytes);
       this.#networkInput = (frame) => this.#core.virtNetInput(frame);
       this.#instructions = () => this.#core.virtInsnCount();
@@ -1477,7 +1548,9 @@ export class RV64 {
         ...networkOptions,
       });
       this.#runSlice = () => {
-        const poweredOff = this.#core.virtRunSystemOutcome(2_000_000n);
+        const poweredOff = this.#core.virtRunSystemOutcome(
+          fullSystemSliceBudget(this.#core),
+        );
         const ext = this.#core.ex.virt_unsupported_sbi_ext();
         if (ext !== 0n) {
           const fn = this.#core.ex.virt_unsupported_sbi_function();
@@ -1600,6 +1673,7 @@ class RV64WorkerProxy {
   #nextRequest = 1;
   #running = false;
   #instructions = 0n;
+  #instructionsPerSecond = null;
   #jitMetrics = null;
   #statisticsIntervalMs = 500;
   #statisticsRequestPending = false;
@@ -1687,6 +1761,11 @@ class RV64WorkerProxy {
     return this.#instructions;
   }
 
+  get instructionsPerSecond() {
+    this.#assertLive();
+    return this.#instructionsPerSecond;
+  }
+
   jitMetrics() {
     this.#assertLive();
     return this.#jitMetrics;
@@ -1770,6 +1849,9 @@ class RV64WorkerProxy {
     if (!state) return;
     this.#running = state.running;
     this.#instructions = BigInt(state.instructions);
+    this.#instructionsPerSecond = Number.isFinite(state.instructionsPerSecond)
+      ? Math.max(0, state.instructionsPerSecond)
+      : null;
     this.#jitMetrics = state.jitMetrics ?? null;
   }
 

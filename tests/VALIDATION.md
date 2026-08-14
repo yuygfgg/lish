@@ -17,6 +17,7 @@ tools/cargo test -p rv64-wasm --lib --release
 tools/cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
 node tests/boot-profile-selftest.mjs
 node tests/jit-code-store.mjs
+node tests/jit-page-modules-policy.mjs
 node tests/host-callback-boundary.mjs
 node tests/public-api.mjs
 node tests/virt-jit.mjs

@@ -1,3 +1,5 @@
+use alloc::{boxed::Box, vec};
+
 use crate::bus::Bus;
 use crate::csr::*;
 use crate::decode::*;
@@ -19,6 +21,80 @@ pub enum StopReason {
     Wfi,
 }
 
+/// Result from a decoded block. `Trapped` means a synchronous exception was
+/// delivered to the configured system trap handler; the caller must route the
+/// new PC before it executes another cached instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodedRunOutcome {
+    Stop(StopReason),
+    Trapped,
+}
+
+/// One instruction after variable-length fetch and RVC expansion.
+///
+/// The full-system interpreter caches this representation by code page. The
+/// architecture semantics remain in [`Cpu::execute_decoded`], so cached and
+/// uncached execution cannot drift into separate decoders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedInsn {
+    bits: u32,
+    len: u8,
+    valid: bool,
+}
+
+impl DecodedInsn {
+    pub const INVALID: Self = Self {
+        bits: 0,
+        len: 0,
+        valid: false,
+    };
+
+    /// Decode an instruction from the four bytes beginning at its PC.
+    /// Only the low halfword is consumed for a compressed instruction.
+    #[inline]
+    pub fn from_word(word: u32) -> Self {
+        let lo = word & 0xffff;
+        if lo & 3 == 3 {
+            Self {
+                bits: word,
+                len: 4,
+                valid: true,
+            }
+        } else {
+            match crate::compressed::expand(lo as u16) {
+                Some(bits) => Self {
+                    bits,
+                    len: 2,
+                    valid: true,
+                },
+                None => Self {
+                    bits: lo,
+                    len: 2,
+                    valid: false,
+                },
+            }
+        }
+    }
+
+    #[inline]
+    pub fn bits(self) -> u32 {
+        self.bits
+    }
+
+    #[inline]
+    pub fn byte_len(self) -> u64 {
+        u64::from(self.len)
+    }
+
+    /// Boundaries at which the page-cache dispatcher must reconsider the next
+    /// execution route. Memory faults and illegal instructions are detected at
+    /// runtime and also leave the cached straight-line path immediately.
+    #[inline]
+    pub fn ends_basic_block(self) -> bool {
+        !self.valid || matches!(opcode(self.bits), 0x0f | 0x63 | 0x67 | 0x6f | 0x73)
+    }
+}
+
 /// Memory access type, for translation and fault selection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Access {
@@ -35,8 +111,60 @@ enum Access {
 const TLB_BITS: u32 = 12;
 const TLB_SIZE: usize = 1 << TLB_BITS;
 const TLB_INVALID: u64 = !0;
+// RV64 leaves 12 bits above the complete 52-bit virtual page number.
+// Permission context occupies those bits, so translations from U/S/M and
+// SUM/MXR states can stay resident across traps without becoming interchangeable.
+const TLB_VPN_BITS: u32 = 52;
+const TLB_VPN_MASK: u64 = (1 << TLB_VPN_BITS) - 1;
+const TLB_CONTEXT_SHIFT: u32 = TLB_VPN_BITS;
+const MAP_GENERATION_MASK: u64 = u32::MAX as u64;
 /// Instructions between interrupt polls in the interpreter (see irq_poll_cd).
 const IRQ_POLL_INTERVAL: u32 = 32;
+
+/// Heap-backed fixed-width TLB rows.
+///
+/// Keeping the rows contiguous preserves the generated-code pointer ABI. The
+/// heap allocation also keeps the roughly 160 KiB translation cache out of
+/// `Cpu` value copies and Wasm stack frames.
+struct TlbRows<T, const ROWS: usize> {
+    entries: Box<[T]>,
+}
+
+impl<T: Clone, const ROWS: usize> TlbRows<T, ROWS> {
+    fn new(value: T) -> Self {
+        Self {
+            entries: vec![value; ROWS * TLB_SIZE].into_boxed_slice(),
+        }
+    }
+
+    fn fill(&mut self, value: T) {
+        self.entries.fill(value);
+    }
+}
+
+impl<T, const ROWS: usize> TlbRows<T, ROWS> {
+    const fn len(&self) -> usize {
+        ROWS
+    }
+}
+
+impl<T, const ROWS: usize> core::ops::Index<usize> for TlbRows<T, ROWS> {
+    type Output = [T];
+
+    #[inline]
+    fn index(&self, row: usize) -> &Self::Output {
+        let start = row * TLB_SIZE;
+        &self.entries[start..start + TLB_SIZE]
+    }
+}
+
+impl<T, const ROWS: usize> core::ops::IndexMut<usize> for TlbRows<T, ROWS> {
+    #[inline]
+    fn index_mut(&mut self, row: usize) -> &mut Self::Output {
+        let start = row * TLB_SIZE;
+        &mut self.entries[start..start + TLB_SIZE]
+    }
+}
 
 /// RV64I hart state + interpreter.
 ///
@@ -72,6 +200,10 @@ pub struct Cpu {
     /// dispatch. Privilege changes do NOT bump it (they flush the data TLB
     /// but leave va→pa identity for a given satp intact).
     pub jit_flush_gen: u64,
+    /// Instruction-cache synchronization generation. A page decoder may retain
+    /// old instruction bytes until FENCE.I, then must discard them before the
+    /// next basic block.
+    pub icache_gen: u64,
     /// Instructions still to run before the next interrupt poll. Sampling the
     /// bus's interrupt lines is a virtual call plus a CLINT/PLIC evaluation; at
     /// one poll per instruction it was most of the interpreter's cost. Between
@@ -79,15 +211,16 @@ pub struct Cpu {
     /// sync_devices) — a guest write that could make an interrupt deliverable
     /// resets this to zero, so enabling interrupts still takes effect at once.
     irq_poll_cd: u32,
-    /// Bumped on every event after which a cached va→pa translation may be
-    /// stale (SFENCE.VMA, satp write). Cheaper sibling of jit_flush_gen: the
-    /// JIT dispatcher re-verifies a block's code mapping only when this moved,
-    /// instead of a fetch-TLB probe on every single dispatch.
+    /// Packed JIT translation state. The low 32 bits are bumped after an event
+    /// that can stale a cached va→pa code mapping (SFENCE.VMA, satp write).
+    /// Permission-context bits occupy the otherwise unused high bits and are
+    /// read live by compiled memory operations. Keeping both in one cell gives
+    /// generated code one stable address without growing [`Cpu`].
     pub map_gen: u64,
     // Direct-mapped TLBs (virtual page tag -> pa-va diff), one per access
     // type so permission bits never need re-checking on a hit.
-    tlb_tag: [[u64; TLB_SIZE]; 3],
-    tlb_diff: [[u64; TLB_SIZE]; 3],
+    tlb_tag: TlbRows<u64, 3>,
+    tlb_diff: TlbRows<u64, 3>,
     // Fused JIT-TLB ([0]=load, [1]=store): stores a *linear memory offset*
     // (`linear_index = va + off`) instead of a pa-va diff, and is filled ONLY
     // for pages the JIT can access directly — in guest RAM (and, for stores,
@@ -95,8 +228,8 @@ pub struct Cpu {
     // the RAM range-check and store-to-compiled-page check entirely; the whole
     // inline memory op becomes tag-match + one add. Filled lazily by the
     // interpreter's own loads/stores (i.e. on JIT bail); flushed with the TLB.
-    jtlb_tag: [[u64; TLB_SIZE]; 2],
-    jtlb_off: [[i64; TLB_SIZE]; 2],
+    jtlb_tag: TlbRows<u64, 2>,
+    jtlb_off: TlbRows<i64, 2>,
 }
 
 /// NaN-box an f32 into a 64-bit F register (high 32 bits all-ones).
@@ -127,12 +260,13 @@ impl Cpu {
             exc_counts: [0; 16],
             irq_counts: [0; 16],
             jit_flush_gen: 0,
+            icache_gen: 0,
             irq_poll_cd: 0,
             map_gen: 0,
-            tlb_tag: [[TLB_INVALID; TLB_SIZE]; 3],
-            tlb_diff: [[0; TLB_SIZE]; 3],
-            jtlb_tag: [[TLB_INVALID; TLB_SIZE]; 2],
-            jtlb_off: [[0; TLB_SIZE]; 2],
+            tlb_tag: TlbRows::new(TLB_INVALID),
+            tlb_diff: TlbRows::new(0),
+            jtlb_tag: TlbRows::new(TLB_INVALID),
+            jtlb_off: TlbRows::new(0),
         }
     }
 
@@ -142,6 +276,7 @@ impl Cpu {
         let mut sys = SysCsrs::new();
         sys.mhartid = hartid;
         self.sys = Some(sys);
+        self.refresh_jit_tlb_context();
     }
 
     /// Route supervisor-mode ECALLs to the host as [`StopReason::Ecall`].
@@ -150,14 +285,53 @@ impl Cpu {
     }
 
     pub fn flush_tlb(&mut self) {
-        self.tlb_tag = [[TLB_INVALID; TLB_SIZE]; 3];
-        self.jtlb_tag = [[TLB_INVALID; TLB_SIZE]; 2];
+        self.tlb_tag.fill(TLB_INVALID);
+        self.jtlb_tag.fill(TLB_INVALID);
     }
 
-    /// Drop all fused store-TLB entries — called when a new block is compiled
-    /// (a page may now hold code, so stores to it must bail to invalidate).
-    pub fn clear_store_jtlb(&mut self) {
-        self.jtlb_tag[1] = [TLB_INVALID; TLB_SIZE];
+    /// Invalidate every cached access class for one virtual page. Context is
+    /// deliberately ignored: SFENCE.VMA without ASID support must remove all
+    /// permission-context variants of the current address space.
+    pub fn flush_tlb_page(&mut self, va: u64) {
+        let vpn = (va >> 12) & TLB_VPN_MASK;
+        let index = vpn as usize & (TLB_SIZE - 1);
+        for access in 0..self.tlb_tag.len() {
+            let tag = self.tlb_tag[access][index];
+            if tag != TLB_INVALID && tag & TLB_VPN_MASK == vpn {
+                self.tlb_tag[access][index] = TLB_INVALID;
+            }
+        }
+        for access in 0..self.jtlb_tag.len() {
+            let tag = self.jtlb_tag[access][index];
+            if tag != TLB_INVALID && tag & TLB_VPN_MASK == vpn {
+                self.jtlb_tag[access][index] = TLB_INVALID;
+            }
+        }
+    }
+
+    /// Invalidate fused store translations that map one physical code page.
+    ///
+    pub fn invalidate_store_jtlb_page(&mut self, pa: u64) -> usize {
+        let physical_page = pa & !0xfff;
+        let store = Access::Store as usize;
+        let mut invalidated = 0;
+        for index in 0..TLB_SIZE {
+            let tag = self.jtlb_tag[1][index];
+            if tag == TLB_INVALID {
+                continue;
+            }
+            if self.tlb_tag[store][index] != tag {
+                self.jtlb_tag[1][index] = TLB_INVALID;
+                continue;
+            }
+            let virtual_page = (tag & TLB_VPN_MASK) << 12;
+            let mapped_page = virtual_page.wrapping_add(self.tlb_diff[store][index]) & !0xfff;
+            if mapped_page == physical_page {
+                self.jtlb_tag[1][index] = TLB_INVALID;
+                invalidated += 1;
+            }
+        }
+        invalidated
     }
 
     /// Fused JIT-TLB rows (load tag, load off, store tag, store off), for JIT
@@ -171,6 +345,18 @@ impl Cpu {
     /// dispatch line's generation stamp before tail-calling the next block).
     pub fn jit_map_gen_ptr(&self) -> usize {
         &self.map_gen as *const u64 as usize
+    }
+
+    /// Generation used by host dispatch lines and virtual-code windows.
+    #[inline]
+    pub fn map_generation(&self) -> u32 {
+        self.map_gen as u32
+    }
+
+    #[inline]
+    fn bump_map_generation(&mut self) {
+        let next = self.map_generation().wrapping_add(1);
+        self.map_gen = (self.map_gen & !MAP_GENERATION_MASK) | u64::from(next);
     }
 
     pub fn jit_mstatus_ptr(&self) -> usize {
@@ -195,7 +381,7 @@ impl Cpu {
     fn fill_jtlb<B: Bus>(&mut self, bus: &B, va: u64, pa: u64, store: bool) {
         if let Some(off) = bus.jit_fast_off(va, pa, store) {
             let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
-            self.jtlb_tag[store as usize][idx] = va >> 12;
+            self.jtlb_tag[store as usize][idx] = self.translation_tag(va);
             self.jtlb_off[store as usize][idx] = off;
         }
     }
@@ -211,7 +397,7 @@ impl Cpu {
         let pa = self.translate(bus, va, access).ok()?;
         let off = bus.jit_fast_off(va, pa, store)?;
         let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
-        self.jtlb_tag[store as usize][idx] = va >> 12;
+        self.jtlb_tag[store as usize][idx] = self.translation_tag(va);
         self.jtlb_off[store as usize][idx] = off;
         Some(off)
     }
@@ -292,6 +478,46 @@ impl Cpu {
         }
     }
 
+    #[inline]
+    fn translation_context(&self) -> u64 {
+        let Some(sys) = self.sys.as_ref() else {
+            return 0;
+        };
+        let execution_mode = sys.mode as u64;
+        let data_mode = if sys.mstatus & MSTATUS_MPRV != 0 {
+            Mode::from_bits((sys.mstatus & MSTATUS_MPP) >> 11)
+        } else {
+            sys.mode
+        } as u64;
+        let sum = u64::from(sys.mstatus & MSTATUS_SUM != 0);
+        let mxr = u64::from(sys.mstatus & MSTATUS_MXR != 0);
+        execution_mode | (data_mode << 2) | (sum << 4) | (mxr << 5)
+    }
+
+    #[inline]
+    fn translation_tag(&self, va: u64) -> u64 {
+        ((va >> 12) & TLB_VPN_MASK) | (self.translation_context() << TLB_CONTEXT_SHIFT)
+    }
+
+    /// Refresh the context consumed by compiled data accesses after direct
+    /// machine setup changes privileged state outside the CSR executor.
+    pub fn refresh_jit_tlb_context(&mut self) {
+        let context = self.translation_context() << TLB_CONTEXT_SHIFT;
+        self.map_gen = (self.map_gen & MAP_GENERATION_MASK) | context;
+    }
+
+    /// Current permission-context bits for a compiled block.
+    pub fn jit_tlb_context_tag(&self) -> u64 {
+        self.map_gen & !TLB_VPN_MASK
+    }
+
+    /// Address of the packed live translation state used by generated code.
+    /// Consumers must mask away the low generation bits before forming a TLB
+    /// tag.
+    pub fn jit_tlb_context_ptr(&self) -> usize {
+        &self.map_gen as *const u64 as usize
+    }
+
     /// Translate a virtual address (full-system mode). Hot path: TLB hit.
     #[inline]
     fn translate<B: Bus>(
@@ -304,7 +530,7 @@ impl Cpu {
             return Ok(va);
         }
         let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
-        let tag = va >> 12;
+        let tag = self.translation_tag(va);
         let a = access as usize;
         if self.tlb_tag[a][idx] == tag {
             return Ok(va.wrapping_add(self.tlb_diff[a][idx]));
@@ -404,7 +630,11 @@ impl Cpu {
             // Don't cache Load entries whose D bit isn't set for stores etc.
             let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
             let a = access as usize;
-            self.tlb_tag[a][idx] = va >> 12;
+            let tag = self.translation_tag(va);
+            if access == Access::Store && self.jtlb_tag[1][idx] != tag {
+                self.jtlb_tag[1][idx] = TLB_INVALID;
+            }
+            self.tlb_tag[a][idx] = tag;
             self.tlb_diff[a][idx] = pa.wrapping_sub(va);
             return Ok(pa);
         }
@@ -531,7 +761,9 @@ impl Cpu {
                 base
             };
         }
-        self.flush_tlb(); // privilege changed
+        // Translation tags include effective privilege and SUM/MXR. Keep both
+        // user and supervisor working sets resident across the trap.
+        self.refresh_jit_tlb_context();
     }
 
     fn exception_to_trap(&mut self, e: Exception) {
@@ -622,6 +854,49 @@ impl Cpu {
         StopReason::Budget
     }
 
+    /// Execute a cached straight-line sequence of decoded instructions.
+    ///
+    /// The sequence must start at the current PC and must not contain a taken
+    /// control transfer before its final instruction. The method checks that
+    /// invariant at runtime, so traps, interrupts, and exceptional memory
+    /// accesses leave the sequence before a stale decoded instruction runs.
+    pub fn run_decoded<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        instructions: &[DecodedInsn],
+    ) -> DecodedRunOutcome {
+        let system = self.sys.is_some();
+        for &decoded in instructions {
+            if system {
+                if self.irq_poll_cd == 0 {
+                    self.irq_poll_cd = IRQ_POLL_INTERVAL;
+                    if self.check_interrupts(bus) {
+                        return DecodedRunOutcome::Stop(StopReason::Budget);
+                    }
+                } else {
+                    self.irq_poll_cd -= 1;
+                }
+            }
+            let sequential_pc = self.pc.wrapping_add(decoded.byte_len());
+            match self.execute_decoded(bus, decoded) {
+                Ok(None) => {}
+                Ok(Some(stop)) => return DecodedRunOutcome::Stop(stop),
+                Err(e) => {
+                    if system {
+                        self.exception_to_trap(e);
+                        return DecodedRunOutcome::Trapped;
+                    } else {
+                        return DecodedRunOutcome::Stop(StopReason::Trap(e));
+                    }
+                }
+            }
+            if self.pc != sequential_pc {
+                return DecodedRunOutcome::Stop(StopReason::Budget);
+            }
+        }
+        DecodedRunOutcome::Stop(StopReason::Budget)
+    }
+
     /// Execute one instruction. `Ok(Some(_))` = clean stop (ecall/ebreak),
     /// `Err` = exception. PC already points at the *next* instruction when
     /// Ecall/Break is returned, so the host can service and resume directly.
@@ -644,9 +919,9 @@ impl Cpu {
             Some(insn) => insn & 0xffff,
             None => bus.fetch16(pa)? as u32,
         };
-        let (insn, ilen) = if lo & 3 == 3 {
+        let word = if lo & 3 == 3 {
             if let Some(insn) = word {
-                (insn, 4)
+                insn
             } else {
                 let pc2 = self.pc.wrapping_add(2);
                 let pa2 = if pc2 & 0xfff == 0 {
@@ -655,13 +930,26 @@ impl Cpu {
                     pa + 2
                 };
                 let hi = bus.fetch16(pa2)? as u32;
-                (lo | (hi << 16), 4)
+                lo | (hi << 16)
             }
         } else {
-            let exp = crate::compressed::expand(lo as u16)
-                .ok_or(Exception::IllegalInstruction { insn: lo })?;
-            (exp, 2)
+            lo
         };
+        self.execute_decoded(bus, DecodedInsn::from_word(word))
+    }
+
+    /// Execute one instruction that has already been fetched and RVC-expanded.
+    /// All interpreter frontends use this method as their only semantic path.
+    pub fn execute_decoded<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        decoded: DecodedInsn,
+    ) -> Result<Option<StopReason>, Exception> {
+        if !decoded.valid {
+            return Err(Exception::IllegalInstruction { insn: decoded.bits });
+        }
+        let insn = decoded.bits;
+        let ilen = decoded.byte_len();
         let mut next_pc = self.pc.wrapping_add(ilen);
         let mut stop = None;
 
@@ -1046,8 +1334,13 @@ impl Cpu {
                 self.fp_dirty();
                 self.op_fp(insn)?
             }
-            // MISC-MEM: FENCE/FENCE.I — no-ops for a single in-order hart
-            0x0f => {}
+            // MISC-MEM: FENCE is a no-op for one in-order hart. FENCE.I makes
+            // instruction stores visible to the decoded page cache.
+            0x0f => {
+                if funct3(insn) == 1 {
+                    self.icache_gen = self.icache_gen.wrapping_add(1);
+                }
+            }
             // SYSTEM
             0x73 => match (insn, funct3(insn)) {
                 (0x0000_0073, _) => {
@@ -1095,7 +1388,7 @@ impl Cpu {
                     }
                     sys.mode = mpp;
                     next_pc = sys.mepc;
-                    self.flush_tlb();
+                    self.refresh_jit_tlb_context();
                 }
                 // SRET
                 (0x1020_0073, _) => {
@@ -1123,7 +1416,7 @@ impl Cpu {
                     }
                     sys.mode = spp;
                     next_pc = sys.sepc;
-                    self.flush_tlb();
+                    self.refresh_jit_tlb_context();
                 }
                 // WFI: report to host if nothing pending (host may idle).
                 (0x1050_0073, _) => {
@@ -1149,15 +1442,19 @@ impl Cpu {
                             return Err(Exception::IllegalInstruction { insn });
                         }
                     }
-                    self.flush_tlb();
-                    self.map_gen += 1; // cached translations must re-verify
-                                       // NOTE: do NOT bump jit_flush_gen here. SFENCE.VMA is
-                                       // issued on every page-table change — including the
-                                       // frequent data mmaps of a malloc-heavy process (a
-                                       // compiler!) — which would flush the whole JIT block
-                                       // cache and keep coverage at ~0% on realistic workloads.
-                                       // Stale *code* mappings are instead caught cheaply by
-                                       // the dispatcher's per-block pa re-verification.
+                    if rs1(insn) == 0 {
+                        self.flush_tlb();
+                    } else {
+                        self.flush_tlb_page(self.x[rs1(insn)]);
+                    }
+                    self.bump_map_generation(); // cached translations must re-verify
+                                                // NOTE: do NOT bump jit_flush_gen here. SFENCE.VMA is
+                                                // issued on every page-table change — including the
+                                                // frequent data mmaps of a malloc-heavy process (a
+                                                // compiler!) — which would flush the whole JIT block
+                                                // cache and keep coverage at ~0% on realistic workloads.
+                                                // Stale *code* mappings are instead caught cheaply by
+                                                // the dispatcher's per-block pa re-verification.
                 }
                 // Zicsr
                 (_, f3 @ 1..=3) | (_, f3 @ 5..=7) => {
@@ -1620,7 +1917,8 @@ impl Cpu {
                     return false;
                 };
                 sys.mstatus = (sys.mstatus & !W) | (v & W);
-                self.flush_tlb(); // SUM/MXR affect translation
+                // Permission context is part of each TLB tag.
+                self.refresh_jit_tlb_context();
             }
             SIE => {
                 let Some(sys) = self.sys.as_mut() else {
@@ -1688,7 +1986,7 @@ impl Cpu {
                     self.flush_tlb();
                     if changed {
                         self.jit_flush_gen += 1; // address space switched
-                        self.map_gen += 1;
+                        self.bump_map_generation();
                     }
                 }
             }
@@ -1712,7 +2010,8 @@ impl Cpu {
                     return false;
                 };
                 sys.mstatus = (sys.mstatus & !W) | (v & W);
-                self.flush_tlb();
+                // Permission context is part of each TLB tag.
+                self.refresh_jit_tlb_context();
             }
             MISA => {}
             MEDELEG => {
@@ -1800,6 +2099,62 @@ mod tests {
             self.accesses += 1;
             Ok(value)
         }
+    }
+
+    #[test]
+    fn code_page_invalidation_preserves_unrelated_store_jtlb_entries() {
+        let mut cpu = Cpu::new();
+        let store = Access::Store as usize;
+        let mappings = [(3u64, 0x80003u64), (5u64, 0x80004u64)];
+        for &(virtual_page, physical_page) in &mappings {
+            let index = virtual_page as usize & (TLB_SIZE - 1);
+            cpu.tlb_tag[store][index] = virtual_page;
+            cpu.tlb_diff[store][index] = (physical_page << 12).wrapping_sub(virtual_page << 12);
+            cpu.jtlb_tag[1][index] = virtual_page;
+        }
+
+        assert_eq!(cpu.invalidate_store_jtlb_page(0x80003_000), 1);
+        assert_eq!(cpu.jtlb_tag[1][3], TLB_INVALID);
+        assert_eq!(cpu.jtlb_tag[1][5], 5);
+        assert_eq!(cpu.invalidate_store_jtlb_page(0x80003_800), 0);
+    }
+
+    #[test]
+    fn tlb_tags_keep_privilege_contexts_distinct() {
+        let mut cpu = Cpu::new();
+        cpu.enable_system(0);
+        let va = 0xffff_ffc0_1234_5000;
+
+        cpu.sys.as_mut().unwrap().mode = Mode::User;
+        cpu.refresh_jit_tlb_context();
+        let user = cpu.translation_tag(va);
+        cpu.sys.as_mut().unwrap().mode = Mode::Supervisor;
+        cpu.refresh_jit_tlb_context();
+        let supervisor = cpu.translation_tag(va);
+
+        assert_eq!(user & TLB_VPN_MASK, va >> 12);
+        assert_eq!(supervisor & TLB_VPN_MASK, va >> 12);
+        assert_ne!(user, supervisor);
+        assert_eq!(cpu.jit_tlb_context_tag(), supervisor & !TLB_VPN_MASK);
+    }
+
+    #[test]
+    fn page_flush_invalidates_all_permission_contexts_only_at_that_vpn() {
+        let mut cpu = Cpu::new();
+        let va = 0x1234_5000;
+        let index = (va >> 12) as usize & (TLB_SIZE - 1);
+        let other_index = index ^ 1;
+        cpu.tlb_tag[Access::Fetch as usize][index] = (va >> 12) | (1 << TLB_CONTEXT_SHIFT);
+        cpu.tlb_tag[Access::Load as usize][index] = (va >> 12) | (5 << TLB_CONTEXT_SHIFT);
+        cpu.jtlb_tag[0][index] = (va >> 12) | (9 << TLB_CONTEXT_SHIFT);
+        cpu.jtlb_tag[0][other_index] = ((va >> 12) ^ 1) | (9 << TLB_CONTEXT_SHIFT);
+
+        cpu.flush_tlb_page(va + 8);
+
+        assert_eq!(cpu.tlb_tag[Access::Fetch as usize][index], TLB_INVALID);
+        assert_eq!(cpu.tlb_tag[Access::Load as usize][index], TLB_INVALID);
+        assert_eq!(cpu.jtlb_tag[0][index], TLB_INVALID);
+        assert_ne!(cpu.jtlb_tag[0][other_index], TLB_INVALID);
     }
 
     impl Bus for CountingBus {

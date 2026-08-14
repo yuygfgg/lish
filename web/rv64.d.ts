@@ -81,11 +81,22 @@ export interface RV64Options {
   jit?: {
     /** Set to false to use only the interpreter. Defaults to true. */
     enabled?: boolean;
+    /** Coalesce independently hot traces into shared modules. */
+    confirmedBatch?: boolean;
+    /** Number of confirmed traces per shared module. Must be at least 2. */
+    confirmedBatchTarget?: number;
+    /**
+     * Compile one shared module per hot guest code page.
+     * Defaults to true when Wasm tail calls are available.
+     */
+    pageModules?: boolean;
+    /** Executions required before an entry is eligible for compilation. */
+    threshold?: number;
     maxModules?: number;
     maxSlots?: number;
     maxBytes?: number;
     growSlots?: number;
-    /** Maximum concurrent background WebAssembly.compile jobs. Defaults to 4. */
+    /** Maximum concurrent background WebAssembly.compile jobs. Defaults to 1. */
     asyncCompilers?: number;
   };
   boot: BootConfig;
@@ -103,10 +114,25 @@ export interface JitMetrics {
   pendingModules: number;
   pendingSlots: number;
   pendingBytes: number;
+  rustRetiredInstructions: number;
+  rustDispatches: number;
+  rustCacheEntries: number;
+  rustInterpreterCalls: number;
+  rustInterpreterInstructions: number;
   rustPendingBuilds: number;
   pendingBlocks: number;
   pendingBatches: number;
   pendingRegions: number;
+  rustTrackedCodePages: number;
+  rustHotEntries: number;
+  rustTlbBails: number;
+  rustTlbAutoEnabled: boolean;
+  pageModulesIssued: number;
+  pageModulesLanded: number;
+  pageModuleMembers: number;
+  confirmedStaged: number;
+  confirmedCoverage: number;
+  evictionCooledEntries: number;
   asyncCompileActive: number;
   asyncCompileQueued: number;
   peakAsyncCompileQueued: number;
@@ -118,6 +144,8 @@ export class RV64 {
   readonly running: boolean;
   /** Exact in local mode; periodically sampled in Worker mode. */
   readonly instructions: bigint;
+  /** Worker-clock rate sample. Local execution returns null. */
+  readonly instructionsPerSecond: number | null;
   /** JIT ownership and asynchronous compiler queue state. */
   jitMetrics(): JitMetrics | null;
   readonly console: { send(data: string | Uint8Array): void };

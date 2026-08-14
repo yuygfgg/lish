@@ -403,16 +403,22 @@ class Session {
 
   #reportTelemetry() {
     if (!this.#vm || this.#state !== "running") return;
-    const sample = sampleInstructionRate(
-      this.#telemetrySample,
-      this.#vm.instructions,
-      performance.now(),
-    );
-    this.#telemetrySample = sample.next;
+    let instructionsPerSecond = this.#vm.instructionsPerSecond;
+    if (instructionsPerSecond === null) {
+      const sample = sampleInstructionRate(
+        this.#telemetrySample,
+        this.#vm.instructions,
+        performance.now(),
+      );
+      this.#telemetrySample = sample.next;
+      if (sample.instructionsPerSecond === null) return;
+      instructionsPerSecond = sample.instructionsPerSecond;
+    }
     const jit = this.#vm.jitMetrics?.();
     this.#bridge.event("telemetry", {
-      instructionsPerSecond: sample.instructionsPerSecond,
+      instructionsPerSecond,
       jitPending: Number(jit?.rustPendingBuilds ?? 0),
+      ...(globalThis.LISH_DIAGNOSTICS === true ? { jitMetrics: jit ?? null } : {}),
     });
   }
 
@@ -508,6 +514,7 @@ function buildVMOptions(config, events) {
   return {
     wasm: config.wasm,
     memoryMB: config.memoryMB,
+    jit: config.jit,
     boot: config.boot,
     network,
     execution,

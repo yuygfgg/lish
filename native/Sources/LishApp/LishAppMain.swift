@@ -478,6 +478,7 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
             instructionsPerSecond = (payload["instructionsPerSecond"] as? NSNumber)?.doubleValue
             jitPending = (payload["jitPending"] as? NSNumber)?.intValue
             updateStatusField()
+            diagnosticTelemetry(payload)
         case "selection-change":
             guard let payload = body["payload"] as? [String: Any],
                   let hasSelection = payload["hasSelection"] as? Bool else { return }
@@ -537,6 +538,7 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
             "networkProtocols": configuration.networkProtocols,
             "inputMode": "native",
             "diagnostics": ProcessInfo.processInfo.environment["LISH_DIAGNOSTICS"] != nil,
+            "jit": bootstrapJITConfiguration(),
         ]
         webView.callAsyncJavaScript(
             """
@@ -575,6 +577,120 @@ final class LishApplicationDelegate: NSObject, NSApplicationDelegate, WKNavigati
             }
             self.showStartupError(LishApplicationError.pageBootstrapFailed)
         }
+    }
+
+    private func bootstrapJITConfiguration() -> [String: Any] {
+        let environment = ProcessInfo.processInfo.environment
+        var configuration: [String: Any] = [:]
+
+        if let value = environmentBoolean(named: "LISH_JIT_CONFIRMED_BATCH", environment: environment) {
+            configuration["confirmedBatch"] = value
+        }
+        if let value = environmentBoolean(named: "LISH_JIT_PAGE_MODULES", environment: environment) {
+            configuration["pageModules"] = value
+        }
+        if let value = environmentInteger(
+            named: "LISH_JIT_CONFIRMED_BATCH_TARGET",
+            minimum: 2,
+            environment: environment
+        ) {
+            configuration["confirmedBatchTarget"] = value
+        }
+        if let value = environmentInteger(
+            named: "LISH_JIT_THRESHOLD",
+            minimum: 1,
+            environment: environment
+        ) {
+            configuration["threshold"] = value
+        }
+        if let value = environmentInteger(
+            named: "LISH_JIT_ASYNC_COMPILERS",
+            minimum: 1,
+            maximum: 4,
+            environment: environment
+        ) {
+            configuration["asyncCompilers"] = value
+        }
+        return configuration
+    }
+
+    private func environmentBoolean(named name: String, environment: [String: String]) -> Bool? {
+        guard let value = environment[name] else { return nil }
+        switch value {
+        case "0": return false
+        case "1": return true
+        default:
+            diagnostic("ignored invalid \(name)=\(String(reflecting: value)); expected 0 or 1")
+            return nil
+        }
+    }
+
+    private func environmentInteger(
+        named name: String,
+        minimum: Int,
+        maximum: Int = Int(UInt32.max),
+        environment: [String: String]
+    ) -> Int? {
+        guard let rawValue = environment[name] else { return nil }
+        guard let value = Int(rawValue), value >= minimum, value <= maximum else {
+            diagnostic(
+                "ignored invalid \(name)=\(String(reflecting: rawValue)); " +
+                    "expected an integer from \(minimum) through \(maximum)"
+            )
+            return nil
+        }
+        return value
+    }
+
+    private func diagnosticTelemetry(_ payload: [String: Any]) {
+        guard ProcessInfo.processInfo.environment["LISH_DIAGNOSTICS"] != nil else { return }
+        let metrics = payload["jitMetrics"] as? [String: Any]
+        let instructionsPerSecond = (payload["instructionsPerSecond"] as? NSNumber)?.doubleValue
+        diagnostic(
+            "telemetry mips=\(Self.formatTelemetryRate(instructionsPerSecond)) " +
+                "cacheEntries=\(Self.formatTelemetryInteger(metrics?["rustCacheEntries"])) " +
+                "liveModules=\(Self.formatTelemetryInteger(metrics?["liveModules"])) " +
+                "registeredModules=\(Self.formatTelemetryInteger(metrics?["registeredModules"])) " +
+                "retiredModules=\(Self.formatTelemetryInteger(metrics?["retiredModules"])) " +
+                "evictedModules=\(Self.formatTelemetryInteger(metrics?["evictedModules"])) " +
+                "liveBytesMiB=\(Self.formatTelemetryMiB(metrics?["liveBytes"])) " +
+                "emittedBytesMiB=\(Self.formatTelemetryMiB(metrics?["emittedBytes"])) " +
+                "dispatches=\(Self.formatTelemetryInteger(metrics?["rustDispatches"])) " +
+                "interpInsns=\(Self.formatTelemetryInteger(metrics?["rustInterpreterInstructions"])) " +
+                "asyncCompileMs=\(Self.formatTelemetryDecimal(metrics?["asyncCompileMs"])) " +
+                "asyncCompileCount=\(Self.formatTelemetryInteger(metrics?["asyncCompileCount"])) " +
+                "maxAsyncCompileMs=\(Self.formatTelemetryDecimal(metrics?["maxAsyncCompileMs"])) " +
+                "asyncActive=\(Self.formatTelemetryInteger(metrics?["asyncCompileActive"])) " +
+                "asyncQueued=\(Self.formatTelemetryInteger(metrics?["asyncCompileQueued"])) " +
+                "pageModules=\(Self.formatTelemetryInteger(metrics?["pageModulesLanded"])) " +
+                "pageMembers=\(Self.formatTelemetryInteger(metrics?["pageModuleMembers"])) " +
+                "confirmedStaged=\(Self.formatTelemetryInteger(metrics?["confirmedStaged"])) " +
+                "capacityRejects=\(Self.formatTelemetryInteger(metrics?["capacityRejects"])) " +
+                "rustCapacityRejects=\(Self.formatTelemetryInteger(metrics?["rustCapacityRejects"])) " +
+                "rustEvictedOwners=\(Self.formatTelemetryInteger(metrics?["rustEvictedOwners"])) " +
+                "cooledEntries=\(Self.formatTelemetryInteger(metrics?["evictionCooledEntries"])) " +
+                "pending=\(Self.formatTelemetryInteger(payload["jitPending"]))"
+        )
+    }
+
+    private static func formatTelemetryRate(_ instructionsPerSecond: Double?) -> String {
+        guard let instructionsPerSecond, instructionsPerSecond.isFinite else { return "--" }
+        return String(format: "%.2f", max(0, instructionsPerSecond) / 1_000_000)
+    }
+
+    private static func formatTelemetryInteger(_ value: Any?) -> String {
+        guard let number = value as? NSNumber else { return "--" }
+        return String(number.int64Value)
+    }
+
+    private static func formatTelemetryDecimal(_ value: Any?) -> String {
+        guard let number = value as? NSNumber, number.doubleValue.isFinite else { return "--" }
+        return String(format: "%.2f", number.doubleValue)
+    }
+
+    private static func formatTelemetryMiB(_ value: Any?) -> String {
+        guard let number = value as? NSNumber, number.doubleValue.isFinite else { return "--" }
+        return String(format: "%.2f", number.doubleValue / (1024 * 1024))
     }
 
     private func showStartupError(_ error: Error) {

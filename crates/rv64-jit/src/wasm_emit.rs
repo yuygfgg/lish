@@ -531,16 +531,29 @@ fn section(m: &mut Vec<u8>, id: u8, payload: &[u8]) {
     m.extend_from_slice(payload);
 }
 
-/// Assemble a BATCH module: N trace bodies (each with its own locals) in one
-/// module, exported "r0".."rN-1". Direct tail calls between bodies transfer
-/// in ~2ns with no table import — the design that finally reconciles cheap
-/// block chaining with O(1) registration (a shared-table import made every
-/// table.set O(importing instances); see the 2026-07-26 chain saga).
-/// Function index space: tlb_fill (import 0) then bodies 1..=N — emit links
-/// with `return_call(1 + target_member_index)`. The tlb import is always
-/// declared so indices are stable whether or not any body uses it.
-pub fn finish_batch(bodies: Vec<(Vec<u8>, u32, u32)>) -> Vec<u8> {
-    let n = bodies.len();
+type RawBody = (Vec<u8>, u32, u32);
+
+enum FunctionExports {
+    Run { body: usize },
+    Numbered { first_body: usize, count: usize },
+}
+
+/// Assemble functions that share the generated-block ABI. Function zero is
+/// always the `tlb_fill` import. Defined functions not selected by `exports`
+/// remain private to the module.
+fn finish_multi_function(bodies: Vec<RawBody>, exports: FunctionExports) -> Vec<u8> {
+    let n_functions = bodies.len();
+    let export_count = match exports {
+        FunctionExports::Run { body } => {
+            debug_assert!(body < n_functions);
+            1
+        }
+        FunctionExports::Numbered { first_body, count } => {
+            debug_assert!(first_body <= n_functions);
+            debug_assert!(first_body + count <= n_functions);
+            count
+        }
+    };
     let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
 
     // types: 0 = (i32 context) -> (),
@@ -564,27 +577,38 @@ pub fn finish_batch(bodies: Vec<(Vec<u8>, u32, u32)>) -> Vec<u8> {
     sec.extend_from_slice(&[0x02, 0x00, 0x01]);
     section(&mut m, 2, &sec);
 
-    // functions: n bodies of type 0
+    // Every defined function has the generated-block type.
     let mut sec = Vec::new();
-    uleb(&mut sec, n as u64);
-    sec.resize(sec.len() + n, 0);
+    uleb(&mut sec, n_functions as u64);
+    sec.resize(sec.len() + n_functions, 0);
     section(&mut m, 3, &sec);
 
-    // exports: "r<i>" -> func 1 + i
+    // Function zero is the imported tlb_fill function, so defined body N has
+    // function index N + 1.
     let mut sec = Vec::new();
-    uleb(&mut sec, n as u64);
-    for i in 0..n {
-        let name = format!("r{i}");
-        uleb(&mut sec, name.len() as u64);
-        sec.extend_from_slice(name.as_bytes());
-        sec.push(0x00);
-        uleb(&mut sec, (1 + i) as u64);
+    uleb(&mut sec, export_count as u64);
+    match exports {
+        FunctionExports::Run { body } => {
+            uleb(&mut sec, 3);
+            sec.extend_from_slice(b"run");
+            sec.push(0x00);
+            uleb(&mut sec, (1 + body) as u64);
+        }
+        FunctionExports::Numbered { first_body, count } => {
+            for i in 0..count {
+                let name = format!("r{i}");
+                uleb(&mut sec, name.len() as u64);
+                sec.extend_from_slice(name.as_bytes());
+                sec.push(0x00);
+                uleb(&mut sec, (1 + first_body + i) as u64);
+            }
+        }
     }
     section(&mut m, 7, &sec);
 
     // code: each body with its own locals (i64 group then i32 group)
     let mut sec = Vec::new();
-    uleb(&mut sec, n as u64);
+    uleb(&mut sec, n_functions as u64);
     for (code, n64, n32) in &bodies {
         let mut body = Vec::new();
         let mut groups: Vec<(u32, u8)> = Vec::new();
@@ -607,4 +631,29 @@ pub fn finish_batch(bodies: Vec<(Vec<u8>, u32, u32)>) -> Vec<u8> {
     section(&mut m, 10, &sec);
 
     m
+}
+
+/// Assemble a BATCH module: N trace bodies (each with its own locals) in one
+/// module, exported "r0".."rN-1". Direct tail calls between bodies transfer
+/// in ~2ns with no table import. Function index space is `tlb_fill` at zero,
+/// then bodies at 1..=N. The tlb import is always declared so indices are
+/// stable whether or not any body uses it.
+pub fn finish_batch(bodies: Vec<RawBody>) -> Vec<u8> {
+    let export_count = bodies.len();
+    finish_multi_function(
+        bodies,
+        FunctionExports::Numbered {
+            first_body: 0,
+            count: export_count,
+        },
+    )
+}
+
+/// Assemble one page module. The router is the module's only public function;
+/// every page body remains private and is selected from the architectural PC.
+pub fn finish_page_module(router: RawBody, bodies: Vec<RawBody>) -> Vec<u8> {
+    let mut functions = Vec::with_capacity(1 + bodies.len());
+    functions.push(router);
+    functions.extend(bodies);
+    finish_multi_function(functions, FunctionExports::Run { body: 0 })
 }

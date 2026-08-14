@@ -16,9 +16,10 @@ use crate::dtb::Fdt;
 use crate::rtc::GoldfishRtc;
 use crate::virtio::{Backend, VirtioDev};
 use crate::{
-    checked_ram_range, run_cpu_until, InterpreterStop, JitPageState, RunSliceOutcome,
+    checked_ram_range, run_cpu_until, CodeDispatch, InterpreterStop, JitPageState, RunSliceOutcome,
     INTERPRETER_SYNC_INTERVAL,
 };
+use rv64_core::cpu::{DecodedInsn, DecodedRunOutcome};
 use rv64_core::csr::{Mode, IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP, IRQ_SSIP, IRQ_STIP};
 use rv64_core::{Bus, Cpu, Exception, StopReason};
 
@@ -48,6 +49,310 @@ pub const RTC_FREQ: u64 = 10_000_000;
 const KERNEL_OFFSET: u64 = 0x20_0000; // kernel Image at RAM_BASE + 2 MiB
 const TOP_LAYOUT_MARGIN: u64 = 0x20_0000;
 const FW_DYNAMIC_INFO_SIZE: u64 = 0x1000;
+
+const CODE_CACHE_PAGES: usize = 256;
+const CODE_PAGE_HALFWORDS: usize = 0x1000 / 2;
+const DECODED_BLOCK_MAX: usize = 64;
+const DECODED_PAGE_ARENA_MAX: usize = CODE_PAGE_HALFWORDS * 4;
+
+#[derive(Clone, Copy, Default)]
+struct CachedBlock {
+    offset_plus_one: u32,
+    len: u8,
+}
+
+impl CachedBlock {
+    fn range(self) -> Option<core::ops::Range<usize>> {
+        let start = usize::try_from(self.offset_plus_one).ok()?.checked_sub(1)?;
+        Some(start..start + usize::from(self.len))
+    }
+}
+
+struct DecodedCodePage {
+    physical_page: u64,
+    icache_gen: u64,
+    blocks: Box<[CachedBlock]>,
+    instructions: Vec<DecodedInsn>,
+}
+
+impl DecodedCodePage {
+    fn new(physical_page: u64, icache_gen: u64) -> Self {
+        Self {
+            physical_page,
+            icache_gen,
+            blocks: vec![CachedBlock::default(); CODE_PAGE_HALFWORDS].into_boxed_slice(),
+            instructions: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self, physical_page: u64, icache_gen: u64) {
+        self.physical_page = physical_page;
+        self.icache_gen = icache_gen;
+        self.blocks.fill(CachedBlock::default());
+        self.instructions.clear();
+    }
+
+    fn block<'a>(&'a mut self, ram: &[u8], page_offset: usize) -> Option<&'a [DecodedInsn]> {
+        let block_slot = page_offset / 2;
+        if let Some(range) = self.blocks[block_slot].range() {
+            return self.instructions.get(range);
+        }
+
+        if self.instructions.len() + DECODED_BLOCK_MAX > DECODED_PAGE_ARENA_MAX {
+            self.blocks.fill(CachedBlock::default());
+            self.instructions.clear();
+        }
+        self.instructions.reserve(DECODED_BLOCK_MAX);
+
+        let page_range = checked_ram_range(ram.len(), RAM_BASE, self.physical_page, 0x1000)?;
+        let page = &ram[page_range];
+        let arena_start = self.instructions.len();
+        let mut instruction_slots = [0usize; DECODED_BLOCK_MAX];
+        let mut offset = page_offset;
+
+        while self.instructions.len() - arena_start < DECODED_BLOCK_MAX {
+            let lo = u16::from_le_bytes(page.get(offset..offset + 2)?.try_into().ok()?);
+            let word = if lo & 3 == 3 {
+                let Some(bytes) = page.get(offset..offset + 4) else {
+                    break;
+                };
+                u32::from_le_bytes(bytes.try_into().ok()?)
+            } else {
+                u32::from(lo)
+            };
+            let decoded = DecodedInsn::from_word(word);
+            instruction_slots[self.instructions.len() - arena_start] = offset / 2;
+            self.instructions.push(decoded);
+            offset += decoded.byte_len() as usize;
+            if decoded.ends_basic_block() || offset == 0x1000 {
+                break;
+            }
+        }
+
+        let block_len = self.instructions.len() - arena_start;
+        if block_len == 0 {
+            return None;
+        }
+        let offset_plus_one = u32::try_from(arena_start + 1).ok()?;
+        for (index, &slot) in instruction_slots[..block_len].iter().enumerate() {
+            self.blocks[slot] = CachedBlock {
+                offset_plus_one: offset_plus_one + index as u32,
+                len: (block_len - index) as u8,
+            };
+        }
+        self.instructions.get(arena_start..arena_start + block_len)
+    }
+}
+
+/// Fixed-size L1 for the interpreter's decoded instruction pages. Each page
+/// owns compact natural basic blocks, so a cache hit lends the CPU a persistent
+/// decoded slice without rebuilding a temporary block.
+struct CodePageCache {
+    pages: Vec<Option<DecodedCodePage>>,
+}
+
+impl CodePageCache {
+    fn new() -> Self {
+        let mut pages = Vec::with_capacity(CODE_CACHE_PAGES);
+        pages.resize_with(CODE_CACHE_PAGES, || None);
+        Self { pages }
+    }
+
+    #[inline]
+    fn slot(physical_page: u64) -> usize {
+        let page = physical_page >> 12;
+        (page ^ (page >> 9)) as usize & (CODE_CACHE_PAGES - 1)
+    }
+
+    fn block<'a>(
+        &'a mut self,
+        ram: &[u8],
+        physical: u64,
+        icache_gen: u64,
+    ) -> Option<&'a [DecodedInsn]> {
+        let physical_page = physical & !0xfff;
+        let page_offset = usize::try_from(physical & 0xfff).ok()?;
+        if page_offset & 1 != 0 || page_offset > 0xffe {
+            return None;
+        }
+        let slot = Self::slot(physical_page);
+        let replace = self.pages[slot].as_ref().is_none_or(|page| {
+            page.physical_page != physical_page || page.icache_gen != icache_gen
+        });
+        if replace {
+            if let Some(page) = self.pages[slot].as_mut() {
+                page.reset(physical_page, icache_gen);
+            } else {
+                self.pages[slot] = Some(DecodedCodePage::new(physical_page, icache_gen));
+            }
+        }
+        let page = self.pages[slot]
+            .as_mut()
+            .expect("decoded page was installed");
+        page.block(ram, page_offset)
+    }
+}
+
+trait InterpreterBackend {
+    fn run(
+        &mut self,
+        cpu: &mut Cpu,
+        bus: &mut VirtBus,
+        cache: &mut CodePageCache,
+        max_insns: u64,
+    ) -> InterpreterStop;
+    fn should_stop(&mut self, pc: u64) -> bool;
+    fn needs_periodic_sync(&self) -> bool;
+}
+
+struct LegacyInterpreter<F> {
+    compiled: Option<F>,
+}
+
+impl<F> InterpreterBackend for LegacyInterpreter<F>
+where
+    F: FnMut(u64) -> bool,
+{
+    #[inline]
+    fn run(
+        &mut self,
+        cpu: &mut Cpu,
+        bus: &mut VirtBus,
+        _cache: &mut CodePageCache,
+        max_insns: u64,
+    ) -> InterpreterStop {
+        run_cpu_until(cpu, bus, max_insns, &mut self.compiled)
+    }
+
+    #[inline]
+    fn should_stop(&mut self, pc: u64) -> bool {
+        self.compiled.as_mut().is_some_and(|compiled| compiled(pc))
+    }
+
+    #[inline]
+    fn needs_periodic_sync(&self) -> bool {
+        self.compiled.is_some()
+    }
+}
+
+struct CachedInterpreter<'a, D> {
+    dispatch: &'a mut D,
+    stop_capable: bool,
+}
+
+impl<D: CodeDispatch> InterpreterBackend for CachedInterpreter<'_, D> {
+    #[inline]
+    fn run(
+        &mut self,
+        cpu: &mut Cpu,
+        bus: &mut VirtBus,
+        cache: &mut CodePageCache,
+        max_insns: u64,
+    ) -> InterpreterStop {
+        run_cached_cpu(cpu, bus, cache, max_insns, self.dispatch, self.stop_capable)
+    }
+
+    #[inline]
+    fn should_stop(&mut self, pc: u64) -> bool {
+        self.dispatch.observe(pc)
+    }
+
+    #[inline]
+    fn needs_periodic_sync(&self) -> bool {
+        self.stop_capable
+    }
+}
+
+fn run_cached_cpu<D: CodeDispatch>(
+    cpu: &mut Cpu,
+    bus: &mut VirtBus,
+    cache: &mut CodePageCache,
+    max_insns: u64,
+    dispatch: &mut D,
+    stop_capable: bool,
+) -> InterpreterStop {
+    let start = cpu.insn_count;
+    let mut stalled_traps = 0u64;
+    let mut first_block = true;
+    loop {
+        if !first_block && dispatch.observe(cpu.pc) {
+            return InterpreterStop::Compiled;
+        }
+        first_block = false;
+
+        let retired = cpu.insn_count - start;
+        if retired >= max_insns || stalled_traps >= max_insns {
+            return InterpreterStop::Cpu(StopReason::Budget);
+        }
+
+        let remaining = max_insns - retired;
+        let pc = cpu.pc;
+        let Some(physical) = cpu.jit_probe_fetch(bus, pc) else {
+            if let Some(stop) = run_uncached_one(cpu, bus, &mut stalled_traps) {
+                return stop;
+            }
+            continue;
+        };
+        if physical & 0xfff != pc & 0xfff
+            || checked_ram_range(bus.ram.len(), RAM_BASE, physical & !0xfff, 0x1000).is_none()
+        {
+            if let Some(stop) = run_uncached_one(cpu, bus, &mut stalled_traps) {
+                return stop;
+            }
+            continue;
+        }
+
+        let Some(block) = cache.block(&bus.ram, physical, cpu.icache_gen) else {
+            if let Some(stop) = run_uncached_one(cpu, bus, &mut stalled_traps) {
+                return stop;
+            }
+            continue;
+        };
+        let mut count = block
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        if stop_capable {
+            let mut next_pc = pc;
+            for (index, decoded) in block[..count].iter().enumerate() {
+                next_pc = next_pc.wrapping_add(decoded.byte_len());
+                if dispatch.contains(next_pc) {
+                    count = index + 1;
+                    break;
+                }
+            }
+        }
+        let before = cpu.insn_count;
+        match cpu.run_decoded(bus, &block[..count]) {
+            DecodedRunOutcome::Stop(StopReason::Budget) => {
+                stalled_traps = 0;
+            }
+            DecodedRunOutcome::Stop(stop) => return InterpreterStop::Cpu(stop),
+            DecodedRunOutcome::Trapped => {
+                if cpu.insn_count == before {
+                    stalled_traps = stalled_traps.saturating_add(1);
+                } else {
+                    stalled_traps = 0;
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn run_uncached_one(
+    cpu: &mut Cpu,
+    bus: &mut VirtBus,
+    stalled_traps: &mut u64,
+) -> Option<InterpreterStop> {
+    let before = cpu.insn_count;
+    let stop = cpu.run(bus, 1);
+    if cpu.insn_count == before {
+        *stalled_traps = stalled_traps.saturating_add(1);
+    } else {
+        *stalled_traps = 0;
+    }
+    (stop != StopReason::Budget).then_some(InterpreterStop::Cpu(stop))
+}
 
 // Interrupt source numbers (PLIC). Source 0 = "no interrupt".
 const UART_IRQ: u32 = 10;
@@ -547,6 +852,7 @@ pub struct VirtImages<'a> {
 pub struct VirtMachine {
     pub cpu: Cpu,
     pub bus: VirtBus,
+    code_cache: CodePageCache,
     pub insns_per_tick: u64,
     /// Guest timer ticks accrued while the hart was halted in WFI. Kept
     /// separate from `insn_count` so idle time advances the guest clock
@@ -679,6 +985,7 @@ impl VirtMachine {
             sys.mideleg = IRQ_SSIP | IRQ_STIP | IRQ_SEIP;
             sys.mcounteren = 0x7;
             sys.satp = 0;
+            cpu.refresh_jit_tlb_context();
             cpu.enable_host_sbi();
         }
 
@@ -697,6 +1004,7 @@ impl VirtMachine {
                 direct_sbi,
                 jit: JitPageState::new(ram_size as usize),
             },
+            code_cache: CodePageCache::new(),
             insns_per_tick: 100,
             idle_ticks: 0,
             realtime_ticks: None,
@@ -894,7 +1202,10 @@ impl VirtMachine {
                     error = INVALID_PARAM;
                 }
             }
-            (RFENCE, 0..=6) => {}
+            (RFENCE, 0) => {
+                self.cpu.icache_gen = self.cpu.icache_gen.wrapping_add(1);
+            }
+            (RFENCE, 1..=6) => {}
             (HSM, 0) => error = ALREADY_STARTED,
             (HSM, 1) => error = INVALID_PARAM,
             (HSM, 2) if arg0 == 0 => value = 0, // STARTED
@@ -918,7 +1229,10 @@ impl VirtMachine {
             }
             (1, _) => self.bus.uart.write(0, arg0 as u8),
             (2, _) => value = u64::MAX,
-            (3..=7, _) => {}
+            (5, _) => {
+                self.cpu.icache_gen = self.cpu.icache_gen.wrapping_add(1);
+            }
+            (3..=4 | 6..=7, _) => {}
             (8, _) => {
                 self.bus.power_off = true;
                 self.power_off = true;
@@ -989,6 +1303,22 @@ impl VirtMachine {
         self.run_slice_inner::<fn(u64) -> bool>(max_insns, None)
     }
 
+    /// Run through the shared decoded-page cache. `dispatch` overlays compiled
+    /// entries on the same PC stream and observes only successors that execution
+    /// actually reaches.
+    pub fn run_cached_slice_outcome<D: CodeDispatch>(
+        &mut self,
+        max_insns: u64,
+        dispatch: &mut D,
+        stop_capable: bool,
+    ) -> RunSliceOutcome {
+        let mut backend = CachedInterpreter {
+            dispatch,
+            stop_capable,
+        };
+        self.run_slice_backend(max_insns, &mut backend)
+    }
+
     /// Interpret up to `max_insns`, but return as soon as an executed
     /// instruction reaches a successor PC for which `compiled` returns true.
     /// Direct SBI calls remain host-serviced and do not escape this method.
@@ -1005,10 +1335,20 @@ impl VirtMachine {
     }
 
     #[inline]
-    fn run_slice_inner<F>(&mut self, max_insns: u64, mut compiled: Option<F>) -> RunSliceOutcome
+    fn run_slice_inner<F>(&mut self, max_insns: u64, compiled: Option<F>) -> RunSliceOutcome
     where
         F: FnMut(u64) -> bool,
     {
+        let mut backend = LegacyInterpreter { compiled };
+        self.run_slice_backend(max_insns, &mut backend)
+    }
+
+    #[inline]
+    fn run_slice_backend(
+        &mut self,
+        max_insns: u64,
+        backend: &mut impl InterpreterBackend,
+    ) -> RunSliceOutcome {
         let start = self.cpu.insn_count;
         self.bus.poll_virtio();
         self.sync_devices();
@@ -1021,14 +1361,15 @@ impl VirtMachine {
         let mut remaining = max_insns;
         let mut stop = InterpreterStop::Cpu(StopReason::Budget);
         while remaining != 0 && !self.power_off {
-            let chunk = if compiled.is_some() || self.has_external_disk() {
+            let chunk = if backend.needs_periodic_sync() || self.has_external_disk() {
                 remaining.min(INTERPRETER_SYNC_INTERVAL)
             } else {
                 remaining
             };
             let before = self.cpu.insn_count;
-            stop = run_cpu_until(&mut self.cpu, &mut self.bus, chunk, &mut compiled);
-            remaining = remaining.saturating_sub(self.cpu.insn_count - before);
+            stop = backend.run(&mut self.cpu, &mut self.bus, &mut self.code_cache, chunk);
+            let retired = self.cpu.insn_count - before;
+            remaining = remaining.saturating_sub(retired);
 
             match stop {
                 InterpreterStop::Cpu(StopReason::Ecall) if self.bus.direct_sbi => {
@@ -1040,10 +1381,7 @@ impl VirtMachine {
                     if self.power_off {
                         break;
                     }
-                    if compiled
-                        .as_mut()
-                        .is_some_and(|compiled| compiled(self.cpu.pc))
-                    {
+                    if backend.should_stop(self.cpu.pc) {
                         stop = InterpreterStop::Compiled;
                         break;
                     }
@@ -1054,7 +1392,10 @@ impl VirtMachine {
                     if self.pending_block_request().is_some() {
                         break;
                     }
-                    if compiled.is_none() && !self.has_external_disk() {
+                    if retired == 0 {
+                        break;
+                    }
+                    if !backend.needs_periodic_sync() && !self.has_external_disk() {
                         break;
                     }
                     continue;
@@ -1281,12 +1622,193 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestDispatch {
+        compiled: Option<u64>,
+        observed: Vec<u64>,
+    }
+
+    impl CodeDispatch for TestDispatch {
+        fn contains(&self, pc: u64) -> bool {
+            self.compiled == Some(pc)
+        }
+
+        fn observe(&mut self, pc: u64) -> bool {
+            self.observed.push(pc);
+            self.contains(pc)
+        }
+    }
+
+    #[test]
+    fn decoded_cache_stops_at_a_compiled_basic_block_entry() {
+        let mut machine = direct_machine();
+        let start = machine.cpu.pc;
+        write_program(&mut machine, &[0x0012_8293, 0x0012_8293, 0x0012_8293]);
+        let mut dispatch = TestDispatch {
+            compiled: Some(start + 8),
+            observed: Vec::new(),
+        };
+
+        let outcome = machine.run_cached_slice_outcome(10, &mut dispatch, true);
+
+        assert_eq!(outcome.retired, 2);
+        assert_eq!(machine.cpu.pc, start + 8);
+        assert_eq!(machine.cpu.x[5], 2);
+        assert_eq!(dispatch.observed, vec![start + 8]);
+    }
+
+    #[test]
+    fn fence_i_invalidates_decoded_instruction_pages() {
+        let mut machine = direct_machine();
+        let start = machine.cpu.pc;
+        write_program(&mut machine, &[0x0010_0293, 0x0000_100f]);
+        let mut dispatch = TestDispatch::default();
+
+        machine.run_cached_slice_outcome(1, &mut dispatch, false);
+        assert_eq!(machine.cpu.x[5], 1);
+
+        write_program(&mut machine, &[0x0020_0293, 0x0000_100f]);
+        machine.cpu.pc = start;
+        machine.cpu.x[5] = 0;
+        machine.run_cached_slice_outcome(1, &mut dispatch, false);
+        assert_eq!(
+            machine.cpu.x[5], 1,
+            "cached bytes remain valid before FENCE.I"
+        );
+
+        machine.cpu.pc = start + 4;
+        machine.run_cached_slice_outcome(1, &mut dispatch, false);
+        machine.cpu.pc = start;
+        machine.cpu.x[5] = 0;
+        machine.run_cached_slice_outcome(1, &mut dispatch, false);
+        assert_eq!(machine.cpu.x[5], 2);
+    }
+
+    #[test]
+    fn plain_fence_does_not_invalidate_decoded_instruction_pages() {
+        let mut machine = direct_machine();
+        write_program(&mut machine, &[0x0000_000f]);
+        let generation = machine.cpu.icache_gen;
+        let mut dispatch = TestDispatch::default();
+
+        machine.run_cached_slice_outcome(1, &mut dispatch, false);
+
+        assert_eq!(machine.cpu.icache_gen, generation);
+    }
+
+    #[test]
+    fn cached_execution_leaves_on_taken_branches() {
+        let mut machine = direct_machine();
+        // addi x5,x0,1; beq x5,x5,+8; addi x6,x0,99; addi x7,x0,7
+        write_program(
+            &mut machine,
+            &[0x0010_0293, 0x0052_8463, 0x0630_0313, 0x0070_0393],
+        );
+        let mut dispatch = TestDispatch::default();
+
+        machine.run_cached_slice_outcome(3, &mut dispatch, false);
+
+        assert_eq!(machine.cpu.x[6], 0);
+        assert_eq!(machine.cpu.x[7], 7);
+    }
+
+    #[test]
+    fn trap_at_the_sequential_pc_rechecks_jit_dispatch() {
+        let mut machine = direct_machine();
+        let start = machine.cpu.pc;
+        // ld x5,0(x1); addi x6,x0,99. x1=0 causes a load access fault.
+        write_program(&mut machine, &[0x0000_b283, 0x0630_0313]);
+        let sys = machine.cpu.sys.as_mut().unwrap();
+        sys.medeleg |= 1 << 5;
+        sys.stvec = start + 4;
+        let mut dispatch = TestDispatch {
+            compiled: Some(start + 4),
+            observed: Vec::new(),
+        };
+
+        machine.run_cached_slice_outcome(1, &mut dispatch, false);
+
+        assert_eq!(machine.cpu.insn_count, 0);
+        assert_eq!(machine.cpu.x[6], 0);
+        assert_eq!(machine.cpu.pc, start + 4);
+        assert_eq!(dispatch.observed, vec![start + 4]);
+    }
+
+    #[test]
+    fn cached_execution_leaves_on_interrupts() {
+        let mut machine = direct_machine();
+        let start = machine.cpu.pc;
+        write_program(&mut machine, &[0x0630_0293]); // addi x5,x0,99
+        let handler = start + 0x100;
+        let offset = (KERNEL_OFFSET + 0x100) as usize;
+        machine.bus.ram[offset..offset + 4].copy_from_slice(&0x0070_0313u32.to_le_bytes());
+        let sys = machine.cpu.sys.as_mut().unwrap();
+        sys.stvec = handler;
+        sys.mideleg |= IRQ_SSIP;
+        sys.mie |= IRQ_SSIP;
+        sys.mip |= IRQ_SSIP;
+        sys.mstatus |= 1 << 1; // SIE
+        let mut dispatch = TestDispatch::default();
+
+        machine.run_cached_slice_outcome(1, &mut dispatch, false);
+
+        assert_eq!(machine.cpu.x[5], 0);
+        assert_eq!(machine.cpu.x[6], 7);
+        assert_eq!(machine.cpu.pc, handler + 4);
+    }
+
+    #[test]
+    fn full_instruction_at_page_end_uses_precise_fetch_fallback() {
+        let mut machine = direct_machine();
+        let page_end = machine.cpu.pc + 0xffe;
+        let offset = (KERNEL_OFFSET + 0xffe) as usize;
+        machine.bus.ram[offset..offset + 4].copy_from_slice(&0x0070_0293u32.to_le_bytes());
+        machine.cpu.pc = page_end;
+        let mut dispatch = TestDispatch::default();
+
+        let outcome = machine.run_cached_slice_outcome(1, &mut dispatch, false);
+
+        assert_eq!(outcome.retired, 1);
+        assert_eq!(machine.cpu.x[5], 7);
+        assert_eq!(machine.cpu.pc, page_end + 4);
+    }
+
+    #[test]
+    fn zero_retirement_trap_loop_exhausts_the_attempt_budget() {
+        let mut machine = direct_machine();
+        let start = machine.cpu.pc;
+        write_program(&mut machine, &[0x0000_b283]); // ld x5,0(x1), with x1=0
+        let sys = machine.cpu.sys.as_mut().unwrap();
+        sys.medeleg |= 1 << 5;
+        sys.stvec = start;
+        let mut dispatch = TestDispatch::default();
+
+        let outcome = machine.run_cached_slice_outcome(8, &mut dispatch, true);
+
+        assert_eq!(outcome.retired, 0);
+        assert_eq!(machine.cpu.pc, start);
+        assert_eq!(machine.cpu.exc_counts[5], 8);
+    }
+
     fn sbi(machine: &mut VirtMachine, ext: u64, function: u64, arg0: u64, arg1: u64) {
         machine.cpu.x[17] = ext;
         machine.cpu.x[16] = function;
         machine.cpu.x[10] = arg0;
         machine.cpu.x[11] = arg1;
         machine.service_sbi();
+    }
+
+    #[test]
+    fn direct_sbi_remote_fence_i_invalidates_decoded_pages() {
+        let mut machine = direct_machine();
+        let generation = machine.cpu.icache_gen;
+
+        sbi(&mut machine, 0x5246_4e43, 1, 0, 0);
+        assert_eq!(machine.cpu.icache_gen, generation);
+        sbi(&mut machine, 0x5246_4e43, 0, 0, 0);
+        assert_eq!(machine.cpu.icache_gen, generation + 1);
+        sbi(&mut machine, 5, 0, 0, 0);
+        assert_eq!(machine.cpu.icache_gen, generation + 2);
     }
 
     #[test]

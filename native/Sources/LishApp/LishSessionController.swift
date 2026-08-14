@@ -324,6 +324,7 @@ public final class LishSessionController: NSObject {
 
     private static func findBaseDisk(in root: URL) -> URL {
         let candidates = [
+            root.appendingPathComponent("images/alpine/alpine-native.ext4"),
             root.appendingPathComponent("images/alpine/alpine.ext4"),
             root.appendingPathComponent("alpine.ext4"),
             root.appendingPathComponent("disk.img"),

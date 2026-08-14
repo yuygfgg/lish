@@ -3,6 +3,7 @@ import { RV64 } from "./rv64.js";
 const INTERNAL_EVENTS = ["stop", "error", "diskError"];
 
 let vm = null;
+let instructionRateSample = null;
 
 function serializeError(error) {
   return {
@@ -13,8 +14,20 @@ function serializeError(error) {
 }
 
 function state() {
+  const instructions = vm ? vm.instructions : 0n;
+  const timestamp = performance.now();
+  let instructionsPerSecond = 0;
+  if (instructionRateSample && timestamp > instructionRateSample.timestamp) {
+    const delta = instructions >= instructionRateSample.instructions
+      ? instructions - instructionRateSample.instructions
+      : 0n;
+    const rate = Number(delta) * 1000 / (timestamp - instructionRateSample.timestamp);
+    if (Number.isFinite(rate)) instructionsPerSecond = rate;
+  }
+  instructionRateSample = { instructions, timestamp };
   return {
-    instructions: vm ? vm.instructions : 0n,
+    instructions,
+    instructionsPerSecond,
     running: vm?.running ?? false,
     jitMetrics: vm?.jitMetrics() ?? null,
   };

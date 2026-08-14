@@ -16,6 +16,7 @@ extern "C" {
     fn host_unix_ms() -> f64;
     /// Queue a dead table slot for cleanup after the current Wasm entry
     /// returns to JavaScript. reason=1 identifies policy eviction.
+    #[cfg(not(test))]
     fn host_jit_retire(idx: i32, reason: u32);
     /// One Ethernet frame the guest transmitted, for the page to forward over
     /// its WebSocket relay. Called at quantum granularity, like host_write.
@@ -62,6 +63,16 @@ fn emit_host_net(frame: &[u8]) {
     }
 }
 
+#[inline]
+fn emit_host_jit_retire(idx: i32, reason: u32) {
+    #[cfg(not(test))]
+    unsafe {
+        host_jit_retire(idx, reason);
+    }
+    #[cfg(test)]
+    let _ = (idx, reason);
+}
+
 // ---- shared staging buffer (JS -> wasm data transfer) --------------------
 
 static mut STAGING: Vec<u8> = Vec::new();
@@ -99,6 +110,8 @@ struct JitBlock {
     last_used: u64,
 }
 
+type JitOwnerId = u64;
+
 /// Direct-mapped dispatch line: `pc` is the full key. A slot with
 /// `pc == NO_PC` is empty. Indexed by low pc bits — a single array read +
 /// compare replaces the HashMap+SipHash lookup on the hot path. Deliberately
@@ -132,6 +145,71 @@ struct PendingSuperblockClaim {
     physical_page: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageModuleSource {
+    physical_page: u64,
+    generation: u64,
+    tlb_fill: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LivePageModule {
+    source: PageModuleSource,
+    owner: JitOwnerId,
+    entries: Box<[u64]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PageModuleState {
+    Attempted(PageModuleSource),
+    Pending {
+        source: PageModuleSource,
+        ticket: u64,
+        prior: Option<LivePageModule>,
+    },
+    Live(LivePageModule),
+}
+
+impl PageModuleState {
+    fn source(&self) -> PageModuleSource {
+        match self {
+            Self::Attempted(source) | Self::Pending { source, .. } => *source,
+            Self::Live(live) => live.source,
+        }
+    }
+
+    fn active_owner(&self) -> Option<JitOwnerId> {
+        match self {
+            Self::Live(live) => Some(live.owner),
+            Self::Pending {
+                prior: Some(live), ..
+            } => Some(live.owner),
+            Self::Attempted(_) | Self::Pending { prior: None, .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PageModuleDecision {
+    Individual,
+    Awaiting,
+    Build(Option<LivePageModule>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageModuleIssue {
+    Individual,
+    Awaiting,
+    Issued,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageModuleFinish {
+    Failed,
+    Cancelled,
+    Landed(JitOwnerId),
+}
+
 struct JitState {
     /// pc -> compiled block; None = tried and not translatable (blacklist).
     /// Authoritative store (iterated for per-page invalidation).
@@ -141,11 +219,25 @@ struct JitState {
     slot_refs: std::collections::HashMap<i32, u32>,
     /// A compiled module can own one slot, a contiguous batch, or one region
     /// function. Policy eviction retires the complete owner as one unit.
-    owner_slots: std::collections::HashMap<i32, Vec<i32>>,
-    slot_owner: std::collections::HashMap<i32, i32>,
+    owner_slots: std::collections::HashMap<JitOwnerId, Vec<i32>>,
+    slot_owner: std::collections::HashMap<i32, JitOwnerId>,
+    /// Owner-local cache entries make retirement proportional to one module,
+    /// not to the complete code cache. `owner_recency` and `cold_owners` are
+    /// the two views of one LRU index and must be updated together.
+    owner_entries: std::collections::HashMap<JitOwnerId, Vec<u64>>,
+    owner_recency: std::collections::HashMap<JitOwnerId, u64>,
+    cold_owners: std::collections::BTreeSet<(u64, JitOwnerId)>,
+    /// Module owner -> address-space/page key for page-packed modules. The key
+    /// is released with the last owned slot, which permits a clean rebuild
+    /// after dirty-code invalidation or policy eviction.
+    page_module_owner: std::collections::HashMap<JitOwnerId, (u64, u64)>,
     hot: std::collections::HashMap<u64, u32>,
     /// Fast dispatch cache: direct-mapped, populated lazily from `cache`.
     dispatch: Vec<DispatchLine>,
+    /// Conservative filter for compiled entry PCs. Decoded-block lookahead
+    /// avoids a HashMap miss for the common uncompiled instruction; stale bits
+    /// after eviction are harmless and are cleared with the whole JIT state.
+    entry_filter: Vec<u64>,
     /// Last observed cpu.jit_flush_gen; a change means the va→pa code
     /// mapping was invalidated (satp/SFENCE) — drop everything.
     flush_gen: u64,
@@ -154,12 +246,24 @@ struct JitState {
     /// a new entry appears the page's superblock is recompiled to cover it, and
     /// every entry's `cache`/`dispatch` slot points at the one superblock.
     page_entries: std::collections::HashMap<(u64, u64), Vec<u64>>,
-    /// Cheap direct-mapped hot counter for the interpreter-fallback path: an
-    /// interpreted stretch's interior blocks never reach the fast-path hot map
-    /// (run_slice_until never returns to the fast path inside a stretch), so
-    /// they'd stay interpreted forever (~half of fib's time). Bumping a real
-    /// HashMap per interpreted instruction taxes cold boot, so count in a u16
-    /// array here and only touch `hot` when a slot actually gets hot.
+    /// Actually hot entry PCs, kept separate from superblock reachability
+    /// seeds. Page-packed modules use these roots to discover one stable set of
+    /// independent bodies instead of creating another batch at every tier-up.
+    page_hot_entries: std::collections::HashMap<(u64, u64), Vec<u64>>,
+    /// Fully translated hot traces waiting for one shared module wrapper.
+    /// Staging is global because module packaging does not require code or
+    /// control-flow locality; each body keeps its own source-page proof.
+    confirmed_stage: Vec<StagedBlock>,
+    /// Exact PCs covered by staged or asynchronously compiling confirmed
+    /// traces. Reference counts keep overlapping traces independent.
+    confirmed_coverage: std::collections::HashMap<(u64, u64), u16>,
+    /// One lifecycle record per address-space/code-page generation. A failed
+    /// translation cannot retry until the source generation changes. Transient
+    /// cancellations restore the prior live owner or remove the pending plan.
+    page_modules: std::collections::HashMap<(u64, u64), PageModuleState>,
+    /// Cheap direct-mapped hot counter for decoded interpreter block entries.
+    /// A real HashMap update on every block taxes cold boot, so only promote an
+    /// entry into `hot` when its compact counter reaches the tier-up threshold.
     interp_hot: Vec<u16>,
     /// Full-pc tag for each interp_hot slot (low 32 bits of pc>>1). Untagged
     /// direct-mapped counters let unrelated pcs (or another address space)
@@ -203,6 +307,13 @@ struct JitState {
     /// seeds only kept ~12% of exits in-batch, because a trace's textual
     /// successors are not the ones execution actually takes.
     succ: Vec<(u64, u64, u32)>,
+    /// Repeated zero-retire entries which are not explained by the FP gate.
+    /// These are overwhelmingly first-memory-operation TLB misses. The direct
+    /// map keeps the signal cheap and identifies the few blocks worth
+    /// recompiling after the adaptive refill policy turns on.
+    tlb_bails: Vec<(u64, u8)>,
+    tlb_bail_total: u64,
+    tlb_auto_enabled: bool,
     /// Entry pcs already recompiled once with an inline cache — trace
     /// EXTENSION happens at most once per pc, so a flapping successor
     /// cannot loop the compiler.
@@ -261,6 +372,10 @@ impl JitState {
             slot_refs: Default::default(),
             owner_slots: Default::default(),
             slot_owner: Default::default(),
+            owner_entries: Default::default(),
+            owner_recency: Default::default(),
+            cold_owners: Default::default(),
+            page_module_owner: Default::default(),
             hot: Default::default(),
             dispatch: vec![
                 DispatchLine {
@@ -270,9 +385,17 @@ impl JitState {
                 };
                 DISPATCH_SIZE
             ],
+            entry_filter: vec![0; DISPATCH_SIZE / 64],
             flush_gen: 0,
             page_entries: Default::default(),
+            page_hot_entries: Default::default(),
+            confirmed_stage: Vec::new(),
+            confirmed_coverage: Default::default(),
+            page_modules: Default::default(),
             succ: vec![(NO_PC, 0, 0); DISPATCH_SIZE],
+            tlb_bails: vec![(NO_PC, 0); DISPATCH_SIZE],
+            tlb_bail_total: 0,
+            tlb_auto_enabled: false,
             ic_done: Default::default(),
             interp_hot: vec![0; DISPATCH_SIZE],
             interp_hot_tag: vec![0; DISPATCH_SIZE],
@@ -296,8 +419,16 @@ impl JitState {
         self.slot_refs.clear();
         self.owner_slots.clear();
         self.slot_owner.clear();
+        self.owner_entries.clear();
+        self.owner_recency.clear();
+        self.cold_owners.clear();
+        self.page_module_owner.clear();
         self.hot.clear();
         self.page_entries.clear();
+        self.page_hot_entries.clear();
+        self.confirmed_stage.clear();
+        self.confirmed_coverage.clear();
+        self.page_modules.clear();
         self.superblocked.clear();
         self.pending_superblocks.clear();
         self.regions.clear();
@@ -315,8 +446,15 @@ impl JitState {
         for e in self.succ.iter_mut() {
             *e = (NO_PC, 0, 0);
         }
+        for e in self.tlb_bails.iter_mut() {
+            *e = (NO_PC, 0);
+        }
+        self.tlb_bail_total = 0;
+        self.tlb_auto_enabled = false;
+        reset_tlb_fill_policy();
         self.ic_done.clear();
         self.page_blocks.clear();
+        self.entry_filter.fill(0);
         self.clear_dispatch();
     }
 
@@ -356,11 +494,28 @@ impl JitState {
         })
     }
 
-    fn pending_page_keys_for_physical(&self, physical_page: u64) -> Vec<(u64, u64)> {
-        self.pending_superblocks
+    fn tracked_page_keys_for_physical(&self, physical_page: u64) -> Vec<(u64, u64)> {
+        let mut keys: Vec<_> = self
+            .pending_superblocks
             .iter()
             .filter_map(|(&key, claim)| (claim.physical_page == physical_page).then_some(key))
-            .collect()
+            .collect();
+        keys.extend(self.page_modules.iter().filter_map(|(&key, state)| {
+            (state.source().physical_page == physical_page).then_some(key)
+        }));
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    fn record_page_hot_entry(&mut self, aspace: u64, pc: u64) {
+        let entries = self
+            .page_hot_entries
+            .entry((aspace, pc & !0xfff))
+            .or_default();
+        if let Err(index) = entries.binary_search(&pc) {
+            entries.insert(index, pc);
+        }
     }
 
     fn invalidate_superblock_state(
@@ -368,12 +523,36 @@ impl JitState {
         exact_pages: &std::collections::HashSet<(u64, u64)>,
         broad_virtual_pages: &std::collections::HashSet<u64>,
     ) {
-        let keep =
+        let keep_legacy =
             |key: &(u64, u64)| !exact_pages.contains(key) && !broad_virtual_pages.contains(&key.1);
-        self.page_entries.retain(|key, _| keep(key));
-        self.superblocked.retain(keep);
-        self.pending_superblocks.retain(|key, _| keep(key));
-        self.sb_gen.retain(|key, _| keep(key));
+        let retained_page_modules: std::collections::HashSet<_> = self
+            .page_modules
+            .keys()
+            .filter(|key| !exact_pages.contains(key))
+            .copied()
+            .collect();
+        let owners: Vec<_> = exact_pages
+            .iter()
+            .filter_map(|key| {
+                self.page_modules
+                    .get(key)
+                    .and_then(PageModuleState::active_owner)
+            })
+            .collect();
+        for owner in owners {
+            self.retire_owner(owner, false);
+        }
+
+        self.page_entries.retain(|key, _| keep_legacy(key));
+        self.page_hot_entries.retain(|key, _| {
+            !exact_pages.contains(key)
+                && (!broad_virtual_pages.contains(&key.1) || retained_page_modules.contains(key))
+        });
+        self.page_modules
+            .retain(|key, _| !exact_pages.contains(key));
+        self.superblocked.retain(keep_legacy);
+        self.pending_superblocks.retain(|key, _| keep_legacy(key));
+        self.sb_gen.retain(|key, _| keep_legacy(key));
     }
 
     /// Finish only page claims still owned by `ticket`. A newer overlapping
@@ -401,29 +580,235 @@ impl JitState {
         }
     }
 
-    fn track_owner(&mut self, slots: impl IntoIterator<Item = i32>) -> Option<i32> {
+    fn page_module_pending_is_current(&self, ticket: u64, batch: &PendingBatch) -> bool {
+        let Some(key) = batch.page_module else {
+            return true;
+        };
+        matches!(
+            self.page_modules.get(&key),
+            Some(PageModuleState::Pending { ticket: current, .. }) if *current == ticket
+        )
+    }
+
+    fn page_module_decision(
+        &self,
+        key: (u64, u64),
+        source: PageModuleSource,
+    ) -> PageModuleDecision {
+        let Some(state) = self.page_modules.get(&key) else {
+            return PageModuleDecision::Build(None);
+        };
+        match state {
+            PageModuleState::Attempted(attempted) if *attempted == source => {
+                PageModuleDecision::Individual
+            }
+            PageModuleState::Attempted(_) => PageModuleDecision::Build(None),
+            PageModuleState::Pending { .. } => PageModuleDecision::Awaiting,
+            PageModuleState::Live(live) if live.source != source => {
+                PageModuleDecision::Build(Some(live.clone()))
+            }
+            PageModuleState::Live(_) => PageModuleDecision::Individual,
+        }
+    }
+
+    fn record_page_module_failure(
+        &mut self,
+        key: (u64, u64),
+        source: PageModuleSource,
+        prior: Option<LivePageModule>,
+    ) {
+        if let Some(live) = prior {
+            self.page_modules.insert(key, PageModuleState::Live(live));
+        } else {
+            self.page_modules
+                .insert(key, PageModuleState::Attempted(source));
+        }
+    }
+
+    fn finish_pending_page_module(
+        &mut self,
+        ticket: u64,
+        batch: &PendingBatch,
+        finish: PageModuleFinish,
+    ) -> Option<JitOwnerId> {
+        let key = batch.page_module?;
+        let Some(PageModuleState::Pending {
+            source,
+            ticket: current,
+            prior,
+        }) = self.page_modules.get(&key).cloned()
+        else {
+            return None;
+        };
+        if current != ticket {
+            return None;
+        }
+        match finish {
+            PageModuleFinish::Failed => {
+                self.record_page_module_failure(key, source, prior);
+                None
+            }
+            PageModuleFinish::Cancelled => {
+                if let Some(live) = prior {
+                    self.page_modules.insert(key, PageModuleState::Live(live));
+                } else {
+                    self.page_modules.remove(&key);
+                }
+                None
+            }
+            PageModuleFinish::Landed(owner) => {
+                let mut entries: Vec<_> = batch.members.iter().map(|member| member.pc).collect();
+                entries.sort_unstable();
+                entries.dedup();
+                self.page_modules.insert(
+                    key,
+                    PageModuleState::Live(LivePageModule {
+                        source,
+                        owner,
+                        entries: entries.into_boxed_slice(),
+                    }),
+                );
+                self.page_module_owner.insert(owner, key);
+                prior.map(|live| live.owner)
+            }
+        }
+    }
+
+    fn page_module_owns_cached_entry(&self, aspace: u64, pc: u64) -> bool {
+        let key = (aspace, pc & !0xfff);
+        let Some(owner) = self
+            .page_modules
+            .get(&key)
+            .and_then(PageModuleState::active_owner)
+        else {
+            return false;
+        };
+        matches!(
+            self.cache.get(&pc),
+            Some(Some(block))
+                if block.idx >= 0 && self.slot_owner.get(&block.idx) == Some(&owner)
+        )
+    }
+
+    fn owner_for_slot(&self, index: i32) -> Option<JitOwnerId> {
+        self.slot_owner.get(&index).copied()
+    }
+
+    fn update_owner_recency(&mut self, owner: JitOwnerId, stamp: u64) {
+        if self
+            .owner_recency
+            .get(&owner)
+            .is_some_and(|&current| current >= stamp)
+        {
+            return;
+        }
+        if let Some(previous) = self.owner_recency.insert(owner, stamp) {
+            self.cold_owners.remove(&(previous, owner));
+        }
+        self.cold_owners.insert((stamp, owner));
+    }
+
+    fn add_owner_entry(&mut self, owner: JitOwnerId, pc: u64) {
+        let entries = self.owner_entries.entry(owner).or_default();
+        if !entries.contains(&pc) {
+            entries.push(pc);
+        }
+    }
+
+    fn remove_owner_entry(&mut self, owner: JitOwnerId, pc: u64) {
+        let mut empty = false;
+        if let Some(entries) = self.owner_entries.get_mut(&owner) {
+            entries.retain(|&entry| entry != pc);
+            empty = entries.is_empty();
+        }
+        if empty {
+            self.owner_entries.remove(&owner);
+        }
+    }
+
+    fn forget_owner(&mut self, owner: JitOwnerId) {
+        self.owner_slots.remove(&owner);
+        self.owner_entries.remove(&owner);
+        if let Some(stamp) = self.owner_recency.remove(&owner) {
+            self.cold_owners.remove(&(stamp, owner));
+        }
+        if let Some(key) = self.page_module_owner.remove(&owner) {
+            let remove_state = match self.page_modules.get_mut(&key) {
+                Some(PageModuleState::Live(live)) => live.owner == owner,
+                Some(PageModuleState::Pending { prior, .. }) => {
+                    if prior.as_ref().is_some_and(|live| live.owner == owner) {
+                        *prior = None;
+                    }
+                    false
+                }
+                Some(PageModuleState::Attempted(_)) | None => false,
+            };
+            if remove_state {
+                self.page_modules.remove(&key);
+            }
+        }
+    }
+
+    fn track_owner(
+        &mut self,
+        owner: JitOwnerId,
+        slots: impl IntoIterator<Item = i32>,
+    ) -> Option<JitOwnerId> {
         let slots: Vec<i32> = slots.into_iter().filter(|&idx| idx >= 0).collect();
-        let owner = slots.first().copied()?;
+        if slots.is_empty() {
+            return None;
+        }
+        assert!(
+            !self.owner_slots.contains_key(&owner),
+            "asynchronous JIT ticket reused as a live owner"
+        );
         for &idx in &slots {
             register_table_slot(idx);
-            self.slot_owner.insert(idx, owner);
+            assert!(
+                self.slot_owner.insert(idx, owner).is_none(),
+                "live JIT table slot assigned to two owners"
+            );
         }
         self.owner_slots.insert(owner, slots);
+        self.update_owner_recency(owner, next_jit_use_stamp());
         Some(owner)
     }
 
     fn cache_insert(&mut self, pc: u64, entry: Option<JitBlock>) -> Option<Option<JitBlock>> {
+        if entry.is_some_and(|block| block.idx >= 0) {
+            let slot = Self::dslot(pc);
+            self.entry_filter[slot / 64] |= 1 << (slot % 64);
+        }
         let previous = self.cache.insert(pc, entry);
         let old_idx = previous
             .flatten()
             .map(|block| block.idx)
             .filter(|&idx| idx >= 0);
         let new_idx = entry.map(|block| block.idx).filter(|&idx| idx >= 0);
+        let old_owner = old_idx.map(|idx| {
+            self.owner_for_slot(idx)
+                .expect("cached JIT slot is missing its owner")
+        });
+        let new_owner = new_idx.map(|idx| {
+            self.owner_for_slot(idx)
+                .expect("new JIT slot is missing its owner")
+        });
         if let Some(Some(block)) = previous {
             self.unindex_block(pc, block);
         }
         if let Some(block) = entry {
             self.index_block(pc, block);
+        }
+        if old_owner != new_owner {
+            if let Some(owner) = old_owner {
+                self.remove_owner_entry(owner, pc);
+            }
+            if let Some(owner) = new_owner {
+                self.add_owner_entry(owner, pc);
+            }
+        }
+        if let (Some(owner), Some(block)) = (new_owner, entry) {
+            self.update_owner_recency(owner, block.last_used);
         }
         if old_idx != new_idx {
             if let Some(idx) = new_idx {
@@ -445,6 +830,10 @@ impl JitState {
         if let Some(Some(block)) = previous {
             self.unindex_block(*pc, block);
             if block.idx >= 0 {
+                let owner = self
+                    .owner_for_slot(block.idx)
+                    .expect("cached JIT slot is missing its owner");
+                self.remove_owner_entry(owner, *pc);
                 self.release_slot(block.idx, evicted);
             }
         }
@@ -509,7 +898,7 @@ impl JitState {
             remove_owner = slots.is_empty();
         }
         if remove_owner {
-            self.owner_slots.remove(&owner);
+            self.forget_owner(owner);
         }
         self.regions.remove(&idx);
         self.region_exits.remove(&idx);
@@ -517,7 +906,7 @@ impl JitState {
         retire_table_slot(idx, evicted);
     }
 
-    fn retire_unreferenced_slots(&mut self, owner: i32) {
+    fn retire_unreferenced_slots(&mut self, owner: JitOwnerId) {
         let slots = self.owner_slots.get(&owner).cloned().unwrap_or_default();
         for idx in slots {
             if !self.slot_refs.contains_key(&idx) {
@@ -528,61 +917,96 @@ impl JitState {
 
     fn touch(&mut self, pc: u64) {
         let stamp = next_jit_use_stamp();
-        if let Some(Some(block)) = self.cache.get_mut(&pc) {
+        let Some(index) = self.cache.get_mut(&pc).and_then(|entry| {
+            let block = entry.as_mut()?;
             block.last_used = stamp;
+            Some(block.idx)
+        }) else {
+            return;
+        };
+        if let Some(owner) = self.owner_for_slot(index) {
+            self.update_owner_recency(owner, stamp);
         }
     }
 
-    /// Evict the coldest module owner. The scan is intentionally infrequent:
-    /// it runs only after the JavaScript store rejects a registration.
-    fn evict_cold_owner(&mut self) -> usize {
-        let mut recency: std::collections::HashMap<i32, u64> = Default::default();
-        for block in self.cache.values().flatten().filter(|block| block.idx >= 0) {
-            let owner = self
-                .slot_owner
-                .get(&block.idx)
-                .copied()
-                .unwrap_or(block.idx);
-            recency
-                .entry(owner)
-                .and_modify(|stamp| *stamp = (*stamp).max(block.last_used))
-                .or_insert(block.last_used);
+    fn cool_evicted_entry(&mut self, pc: u64) {
+        self.hot.remove(&pc);
+        let slot = Self::dslot(pc);
+        if self.interp_hot_tag[slot] == (pc >> 1) as u32 {
+            self.interp_hot[slot] = 0;
         }
-        let Some(owner) = recency
-            .into_iter()
-            .min_by_key(|&(_, stamp)| stamp)
-            .map(|v| v.0)
-        else {
-            return 0;
+        unsafe { JIT_EVICTION_COOLED_ENTRIES += 1 };
+    }
+
+    fn is_page_module_slot(&self, index: i32) -> bool {
+        self.slot_owner
+            .get(&index)
+            .is_some_and(|owner| self.page_module_owner.contains_key(owner))
+    }
+
+    fn tagged_dispatch_index(&self, block: JitBlock) -> i32 {
+        let mut index = if block.n == 0 && block.idx >= 0 {
+            block.idx | SB_IDX_BIT
+        } else {
+            block.idx
         };
+        if block.idx >= 0 && self.is_page_module_slot(block.idx) {
+            index |= PAGE_IDX_BIT;
+        }
+        index
+    }
+
+    /// Retire one complete generated module and every cache entry which points
+    /// into it. Page routers require this atomic unit: removing one PC would
+    /// leave other entries able to call private code from the old page image.
+    fn retire_owner(&mut self, owner: JitOwnerId, evicted: bool) -> usize {
         let slots = self.owner_slots.get(&owner).cloned().unwrap_or_default();
-        let pcs: Vec<u64> = self
-            .cache
-            .iter()
-            .filter_map(|(&pc, entry)| {
-                let block = entry.as_ref()?;
-                let block_owner = self.slot_owner.get(&block.idx).copied()?;
-                (block_owner == owner).then_some(pc)
-            })
-            .collect();
+        let pcs = self.owner_entries.remove(&owner).unwrap_or_default();
         for pc in pcs {
+            if evicted {
+                self.cool_evicted_entry(pc);
+            }
             let dispatch = Self::dslot(pc);
             if self.dispatch[dispatch].pc == pc {
                 self.dispatch[dispatch].pc = NO_PC;
             }
-            self.cache_remove_with_reason(&pc, true);
+            self.cache_remove_with_reason(&pc, evicted);
         }
-        // An owner can contain batch exports that never entered the cache.
+        // A batch export can be unreferenced because a newer landing won the
+        // cache race. It still belongs to this owner and must be released.
         for idx in slots.iter().copied() {
             if !self.slot_refs.contains_key(&idx) {
-                self.retire_owned_slot(idx, true);
+                self.retire_owned_slot(idx, evicted);
             }
         }
-        unsafe {
-            JIT_EVICTED_OWNERS += 1;
-            JIT_EVICTED_SLOTS += slots.len() as u64;
+        if slots.is_empty() {
+            self.forget_owner(owner);
         }
         slots.len()
+    }
+
+    fn retire_page_module_for_slot(&mut self, index: i32) -> bool {
+        let Some(owner) = self.slot_owner.get(&index).copied() else {
+            return false;
+        };
+        if !self.page_module_owner.contains_key(&owner) {
+            return false;
+        }
+        self.retire_owner(owner, false);
+        true
+    }
+
+    /// Evict the coldest module owner without scanning the complete code cache.
+    fn evict_cold_owner(&mut self) -> usize {
+        let Some(&(_, owner)) = self.cold_owners.first() else {
+            return 0;
+        };
+        let retired = self.retire_owner(owner, true);
+        unsafe {
+            JIT_EVICTED_OWNERS += 1;
+            JIT_EVICTED_SLOTS += retired as u64;
+        }
+        retired
     }
     #[inline]
     fn clear_dispatch(&mut self) {
@@ -594,12 +1018,158 @@ impl JitState {
     fn dslot(pc: u64) -> usize {
         ((pc >> 1) as usize) & (DISPATCH_SIZE - 1)
     }
+
+    #[inline]
+    fn may_have_compiled(&self, pc: u64) -> bool {
+        let slot = Self::dslot(pc);
+        self.entry_filter[slot / 64] & (1 << (slot % 64)) != 0
+    }
+
+    fn add_confirmed_coverage(&mut self, block: &PendingBlock) {
+        for &pc in &block.trace_pcs {
+            let refs = self
+                .confirmed_coverage
+                .entry((block.aspace, pc))
+                .or_insert(0);
+            *refs = refs.saturating_add(1);
+        }
+    }
+
+    fn remove_confirmed_coverage(&mut self, block: &PendingBlock) {
+        for &pc in &block.trace_pcs {
+            let key = (block.aspace, pc);
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.confirmed_coverage.entry(key)
+            {
+                if *entry.get() <= 1 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() -= 1;
+                }
+            }
+        }
+    }
+
+    fn remove_pending_coverage(&mut self, kind: &PendingJitKind) {
+        match kind {
+            PendingJitKind::Block(block) => self.remove_confirmed_coverage(block),
+            PendingJitKind::Batch(batch) => {
+                for block in &batch.members {
+                    self.remove_confirmed_coverage(block);
+                }
+            }
+            PendingJitKind::Region(_) => {}
+        }
+    }
+}
+
+struct InterpreterDispatch<'a> {
+    jit: &'a mut JitState,
+    tier_up: bool,
+    aspace: u64,
+}
+
+impl InterpreterDispatch<'_> {
+    #[inline]
+    fn compiled(&self, pc: u64) -> bool {
+        if !self.jit.may_have_compiled(pc) {
+            return false;
+        }
+        matches!(self.jit.cache.get(&pc), Some(Some(block)) if block.idx >= 0)
+    }
+}
+
+impl rv64_system::CodeDispatch for InterpreterDispatch<'_> {
+    #[inline]
+    fn contains(&self, pc: u64) -> bool {
+        self.compiled(pc)
+    }
+
+    #[inline]
+    fn observe(&mut self, pc: u64) -> bool {
+        if self.compiled(pc) {
+            return true;
+        }
+        if !self.tier_up {
+            return false;
+        }
+        if self.jit.confirmed_coverage.contains_key(&(self.aspace, pc)) {
+            return false;
+        }
+
+        let slot = JitState::dslot(pc);
+        let tag = (pc >> 1) as u32;
+        if self.jit.interp_hot_tag[slot] != tag {
+            self.jit.interp_hot_tag[slot] = tag;
+            self.jit.interp_hot[slot] = 0;
+        }
+        let (warm, tiered) = {
+            let count = &mut self.jit.interp_hot[slot];
+            *count = count.saturating_add(1);
+            (
+                usize::from(*count) == PAGE_MODULE_WARM_THRESHOLD,
+                u32::from(*count) >= unsafe { JIT_THRESHOLD },
+            )
+        };
+        if warm && unsafe { PAGE_MODULES_ON } {
+            self.jit.record_page_hot_entry(self.aspace, pc);
+        }
+        if !tiered {
+            return false;
+        }
+        self.jit.hot.insert(pc, unsafe { JIT_THRESHOLD });
+        true
+    }
 }
 
 #[cfg(test)]
 mod jit_state_tests {
-    use super::{account_compiled_dispatch, block_should_replace_region, JitBlock, JitState};
+    use super::{
+        account_compiled_dispatch, block_should_replace_region, JitBlock, JitState, LivePageModule,
+        PageModuleDecision, PageModuleFinish, PageModuleSource, PageModuleState, PendingBatch,
+        PendingBlock, PAGE_IDX_BIT,
+    };
     use std::collections::HashSet;
+
+    fn page_source(physical_page: u64) -> PageModuleSource {
+        PageModuleSource {
+            physical_page,
+            generation: 3,
+            tlb_fill: false,
+        }
+    }
+
+    fn compiled_block(idx: i32, pa: u64) -> JitBlock {
+        JitBlock {
+            fp: false,
+            idx,
+            n: 4,
+            mix: [0; 5],
+            mem: [0; 10],
+            control: [0; 3],
+            alu: [0; 5],
+            pa,
+            last_used: 0,
+        }
+    }
+
+    fn pending_page_batch(key: (u64, u64), pc: u64) -> PendingBatch {
+        PendingBatch {
+            cell: 0,
+            sequence: 0,
+            members: vec![PendingBlock {
+                aspace: key.0,
+                pc,
+                block: compiled_block(-1, 0x8000_0000 + (pc & 0xfff)),
+                pages: vec![(key.1, 0x8000_0000)],
+                page_generations: vec![3],
+                seeds: Vec::new(),
+                trace_pcs: Vec::new(),
+                missed_superblock: false,
+            }],
+            page_module: Some(key),
+        }
+    }
 
     #[test]
     fn latest_pending_superblock_owns_overlapping_page_claims() {
@@ -613,8 +1183,8 @@ mod jit_state_tests {
 
         assert!(!jit.pending_superblock_is_current(1, 7, &[a, b]));
         assert!(jit.pending_superblock_is_current(2, 7, &[b, c]));
-        assert_eq!(jit.pending_page_keys_for_physical(1), vec![(7, a.0)]);
-        assert_eq!(jit.pending_page_keys_for_physical(2), vec![(7, b.0)]);
+        assert_eq!(jit.tracked_page_keys_for_physical(1), vec![(7, a.0)]);
+        assert_eq!(jit.tracked_page_keys_for_physical(2), vec![(7, b.0)]);
         jit.finish_pending_superblock(1, 7, &[a, b], false);
         assert!(!jit.superblocked.contains(&(7, a.0)));
         assert!(jit.superblocked.contains(&(7, b.0)));
@@ -631,6 +1201,167 @@ mod jit_state_tests {
     }
 
     #[test]
+    fn failed_page_module_reopens_only_for_a_new_source() {
+        let mut jit = JitState::new();
+        let key = (7, 0x4000);
+        let source = page_source(1);
+        jit.page_modules
+            .insert(key, PageModuleState::Attempted(source));
+
+        assert_eq!(
+            jit.page_module_decision(key, source),
+            PageModuleDecision::Individual
+        );
+        let changed = PageModuleSource {
+            generation: source.generation + 1,
+            ..source
+        };
+        assert_eq!(
+            jit.page_module_decision(key, changed),
+            PageModuleDecision::Build(None)
+        );
+    }
+
+    #[test]
+    fn pending_page_module_defers_same_page_individual_work() {
+        let mut jit = JitState::new();
+        let key = (7, 0x4000);
+        let source = page_source(1);
+        jit.page_modules.insert(
+            key,
+            PageModuleState::Pending {
+                source,
+                ticket: 9,
+                prior: None,
+            },
+        );
+
+        assert_eq!(
+            jit.page_module_decision(key, source),
+            PageModuleDecision::Awaiting
+        );
+    }
+
+    #[test]
+    fn page_module_priority_is_scoped_to_address_space() {
+        let mut jit = JitState::new();
+        let pc = 0x4120;
+        let key = (7, 0x4000);
+        let owner = 21_u64;
+        let slot = 21;
+        jit.owner_slots.insert(owner, vec![slot]);
+        jit.slot_owner.insert(slot, owner);
+        jit.page_module_owner.insert(owner, key);
+        jit.page_modules.insert(
+            key,
+            PageModuleState::Live(LivePageModule {
+                source: page_source(1),
+                owner,
+                entries: vec![pc].into_boxed_slice(),
+            }),
+        );
+        jit.cache
+            .insert(pc, Some(compiled_block(slot, 0x8000_1120)));
+
+        assert!(jit.page_module_owns_cached_entry(7, pc));
+        assert!(!jit.page_module_owns_cached_entry(8, pc));
+    }
+
+    #[test]
+    fn failed_page_replacement_restores_the_live_owner() {
+        let mut jit = JitState::new();
+        let key = (7, 0x4000);
+        let source = page_source(1);
+        let prior = LivePageModule {
+            source,
+            owner: 21,
+            entries: vec![0x4000, 0x4004].into_boxed_slice(),
+        };
+        jit.page_modules.insert(
+            key,
+            PageModuleState::Pending {
+                source,
+                ticket: 9,
+                prior: Some(prior),
+            },
+        );
+        let batch = pending_page_batch(key, 0x4010);
+
+        assert_eq!(
+            jit.finish_pending_page_module(8, &batch, PageModuleFinish::Failed),
+            None
+        );
+        assert!(matches!(
+            jit.page_modules.get(&key),
+            Some(PageModuleState::Pending { .. })
+        ));
+        assert_eq!(
+            jit.finish_pending_page_module(9, &batch, PageModuleFinish::Failed),
+            None
+        );
+        assert!(matches!(
+            jit.page_modules.get(&key),
+            Some(PageModuleState::Live(LivePageModule { owner: 21, .. }))
+        ));
+    }
+
+    #[test]
+    fn successful_page_replacement_transfers_lifecycle_ownership() {
+        let mut jit = JitState::new();
+        let key = (7, 0x4000);
+        let source = page_source(1);
+        jit.page_modules.insert(
+            key,
+            PageModuleState::Pending {
+                source,
+                ticket: 9,
+                prior: Some(LivePageModule {
+                    source,
+                    owner: 21,
+                    entries: vec![0x4000].into_boxed_slice(),
+                }),
+            },
+        );
+        let batch = pending_page_batch(key, 0x4010);
+
+        assert_eq!(
+            jit.finish_pending_page_module(9, &batch, PageModuleFinish::Landed(31)),
+            Some(21)
+        );
+        assert!(matches!(
+            jit.page_modules.get(&key),
+            Some(PageModuleState::Live(LivePageModule { owner: 31, .. }))
+        ));
+        assert_eq!(jit.page_module_owner.get(&31), Some(&key));
+    }
+
+    #[test]
+    fn cancelled_page_module_can_retry_the_same_source() {
+        let mut jit = JitState::new();
+        let key = (7, 0x4000);
+        let source = page_source(1);
+        jit.page_modules.insert(
+            key,
+            PageModuleState::Pending {
+                source,
+                ticket: 9,
+                prior: None,
+            },
+        );
+        let batch = pending_page_batch(key, 0x4010);
+
+        assert_eq!(
+            jit.finish_pending_page_module(9, &batch, PageModuleFinish::Cancelled),
+            None
+        );
+        assert!(!jit.page_modules.contains_key(&key));
+        assert_eq!(
+            jit.page_module_decision(key, source),
+            PageModuleDecision::Build(None)
+        );
+    }
+
+    #[test]
     fn dirty_pending_pages_do_not_invalidate_another_address_space() {
         let mut jit = JitState::new();
         let virtual_page = 0x1000;
@@ -644,7 +1375,7 @@ mod jit_state_tests {
             jit.sb_gen.insert(key, (1, 0, physical));
         }
 
-        let exact = jit.pending_page_keys_for_physical(1).into_iter().collect();
+        let exact = jit.tracked_page_keys_for_physical(1).into_iter().collect();
         jit.invalidate_superblock_state(&exact, &Default::default());
 
         assert!(!jit.page_entries.contains_key(&a));
@@ -661,6 +1392,153 @@ mod jit_state_tests {
         assert!(!jit.superblocked.contains(&b));
         assert!(!jit.pending_superblocks.contains_key(&b));
         assert!(!jit.sb_gen.contains_key(&b));
+    }
+
+    #[test]
+    fn dirty_page_module_invalidation_is_physical_and_owner_atomic() {
+        let mut jit = JitState::new();
+        let virtual_page = 0x4000;
+        let a = (7, virtual_page);
+        let b = (8, virtual_page);
+        let pc_a = virtual_page + 0x120;
+        let pc_b = virtual_page + 0x220;
+
+        for (key, owner, physical, pc) in [(a, 21_u64, 1, pc_a), (b, 31, 2, pc_b)] {
+            let slot = owner as i32;
+            jit.owner_slots.insert(owner, vec![slot]);
+            jit.slot_owner.insert(slot, owner);
+            jit.page_module_owner.insert(owner, key);
+            jit.page_modules.insert(
+                key,
+                PageModuleState::Live(LivePageModule {
+                    source: page_source(physical),
+                    owner,
+                    entries: vec![pc].into_boxed_slice(),
+                }),
+            );
+            jit.page_hot_entries.insert(key, vec![pc]);
+            jit.cache_insert(
+                pc,
+                Some(compiled_block(
+                    slot,
+                    0x8000_0000 + (physical << 12) + (pc & 0xfff),
+                )),
+            );
+        }
+
+        let exact: HashSet<_> = jit.tracked_page_keys_for_physical(1).into_iter().collect();
+        jit.invalidate_superblock_state(&exact, &HashSet::from([virtual_page]));
+
+        assert!(!jit.page_modules.contains_key(&a));
+        assert!(!jit.page_module_owner.contains_key(&21));
+        assert!(!jit.slot_owner.contains_key(&21));
+        assert!(!jit.cache.contains_key(&pc_a));
+
+        assert!(jit.page_modules.contains_key(&b));
+        assert_eq!(jit.page_module_owner.get(&31), Some(&b));
+        assert_eq!(jit.slot_owner.get(&31), Some(&31));
+        assert!(jit.cache.contains_key(&pc_b));
+        assert!(jit.page_hot_entries.contains_key(&b));
+        assert_eq!(
+            jit.tagged_dispatch_index(compiled_block(31, 0x8000_2220)) & PAGE_IDX_BIT,
+            PAGE_IDX_BIT
+        );
+    }
+
+    #[test]
+    fn cold_owner_eviction_retires_the_complete_owner() {
+        let mut jit = JitState::new();
+        let hot_owner = 21_u64;
+        let cold_owner = 31_u64;
+        let hot_pc = 0x4120;
+        let cold_pcs = [0x8120, 0x9120];
+
+        for (owner, slots) in [(hot_owner, vec![21]), (cold_owner, vec![31, 32])] {
+            jit.owner_slots.insert(owner, slots.clone());
+            for slot in slots {
+                jit.slot_owner.insert(slot, owner);
+            }
+        }
+        jit.cache_insert(hot_pc, Some(compiled_block(21, 0x8000_1120)));
+        jit.cache_insert(cold_pcs[0], Some(compiled_block(31, 0x8000_2120)));
+        jit.cache_insert(cold_pcs[1], Some(compiled_block(32, 0x8000_3120)));
+        for pc in cold_pcs {
+            jit.hot.insert(pc, unsafe { super::JIT_THRESHOLD });
+            let slot = JitState::dslot(pc);
+            jit.interp_hot_tag[slot] = (pc >> 1) as u32;
+            jit.interp_hot[slot] = unsafe { super::JIT_THRESHOLD } as u16;
+        }
+
+        jit.update_owner_recency(hot_owner, super::next_jit_use_stamp());
+        jit.update_owner_recency(cold_owner, super::next_jit_use_stamp());
+        jit.touch(hot_pc);
+
+        assert_eq!(jit.evict_cold_owner(), 2);
+        assert!(jit.cache.contains_key(&hot_pc));
+        assert!(cold_pcs.iter().all(|pc| !jit.cache.contains_key(pc)));
+        assert!(!jit.owner_slots.contains_key(&cold_owner));
+        assert!(!jit.owner_entries.contains_key(&cold_owner));
+        assert!(!jit.owner_recency.contains_key(&cold_owner));
+        assert!(jit
+            .cold_owners
+            .iter()
+            .all(|&(_, owner)| owner != cold_owner));
+        assert!(jit.slot_owner.values().all(|&owner| owner != cold_owner));
+        assert!(jit.slot_refs.keys().all(|slot| ![31, 32].contains(slot)));
+        for pc in cold_pcs {
+            assert!(!jit.hot.contains_key(&pc));
+            assert_eq!(jit.interp_hot[JitState::dslot(pc)], 0);
+        }
+
+        jit.retire_owner(hot_owner, false);
+    }
+
+    #[test]
+    fn reused_table_slot_does_not_merge_distinct_owners() {
+        let mut jit = JitState::new();
+        let first_owner = 100_u64;
+        let second_owner = 101_u64;
+        let first_pc = 0x10_120;
+        let second_pc = 0x20_120;
+
+        jit.track_owner(first_owner, [101, 102]).unwrap();
+        jit.cache_insert(first_pc, Some(compiled_block(102, 0x8001_0120)));
+        jit.retire_unreferenced_slots(first_owner);
+        assert!(!jit.slot_owner.contains_key(&101));
+        assert_eq!(jit.slot_owner.get(&102), Some(&first_owner));
+
+        jit.track_owner(second_owner, [101]).unwrap();
+        jit.cache_insert(second_pc, Some(compiled_block(101, 0x8002_0120)));
+        assert_eq!(jit.owner_entries.get(&first_owner), Some(&vec![first_pc]));
+        assert_eq!(jit.owner_entries.get(&second_owner), Some(&vec![second_pc]));
+
+        jit.retire_owner(first_owner, false);
+        assert!(!jit.cache.contains_key(&first_pc));
+        assert!(jit.cache.contains_key(&second_pc));
+        assert_eq!(jit.slot_owner.get(&101), Some(&second_owner));
+        jit.retire_owner(second_owner, false);
+    }
+
+    #[test]
+    fn one_slot_owner_retires_all_shared_entries() {
+        let mut jit = JitState::new();
+        let owner = 200_u64;
+        let entries = [0x30_120, 0x30_220, 0x30_320];
+
+        jit.track_owner(owner, [201]).unwrap();
+        for (offset, pc) in entries.into_iter().enumerate() {
+            jit.cache_insert(
+                pc,
+                Some(compiled_block(201, 0x8003_0120 + offset as u64 * 0x100)),
+            );
+        }
+
+        assert_eq!(jit.retire_owner(owner, false), 1);
+        assert!(entries.iter().all(|pc| !jit.cache.contains_key(pc)));
+        assert!(!jit.slot_owner.contains_key(&201));
+        assert!(!jit.owner_slots.contains_key(&owner));
+        assert!(!jit.owner_entries.contains_key(&owner));
+        assert!(!jit.owner_recency.contains_key(&owner));
     }
 
     #[test]
@@ -757,6 +1635,7 @@ static mut JIT_TABLE_RETIRED: u64 = 0;
 static mut JIT_EVICTED_OWNERS: u64 = 0;
 static mut JIT_EVICTED_SLOTS: u64 = 0;
 static mut JIT_CAPACITY_REJECTIONS: u64 = 0;
+static mut JIT_EVICTION_COOLED_ENTRIES: u64 = 0;
 static mut JIT_CAPACITY_BLOCKED: bool = false;
 static mut JIT_USE_STAMP: u64 = 0;
 
@@ -789,7 +1668,7 @@ fn retire_table_slot(idx: i32, evicted: bool) {
             return;
         };
         if live.remove(&idx) {
-            host_jit_retire(idx, u32::from(evicted));
+            emit_host_jit_retire(idx, u32::from(evicted));
             JIT_TABLE_RETIRED += 1;
         }
     }
@@ -823,6 +1702,7 @@ struct PendingBlock {
     pages: Vec<(u64, u64)>,
     page_generations: Vec<u64>,
     seeds: Vec<u64>,
+    trace_pcs: Vec<u64>,
     missed_superblock: bool,
 }
 
@@ -830,6 +1710,12 @@ struct PendingBatch {
     cell: usize,
     sequence: u64,
     members: Vec<PendingBlock>,
+    page_module: Option<(u64, u64)>,
+}
+
+struct StagedBlock {
+    body: rv64_jit::RawBatchBody,
+    pending: PendingBlock,
 }
 
 /// A page superblock compiling asynchronously on the browser's Wasm compiler.
@@ -866,6 +1752,7 @@ impl PendingJit {
     fn slot_count(&self) -> u32 {
         match &self.kind {
             PendingJitKind::Block(_) | PendingJitKind::Region(_) => 1,
+            PendingJitKind::Batch(batch) if batch.page_module.is_some() => 1,
             PendingJitKind::Batch(batch) => batch.members.len() as u32,
         }
     }
@@ -908,6 +1795,10 @@ const EXT_TARGET_CAP: usize = 8;
 /// keeps its sign.
 /// Shared with the emitter, whose chain transfers mask it off.
 const SB_IDX_BIT: i32 = rv64_jit::SB_IDX_BIT;
+/// Page-module marker carried in DispatchLine::idx. Unlike owner lookup, this
+/// is cheap enough to test after every compiled call.
+const PAGE_IDX_BIT: i32 = rv64_jit::PAGE_IDX_BIT;
+const IDX_TAG_MASK: i32 = rv64_jit::IDX_TAG_MASK;
 /// Measured average stay (retired insns per dispatch of a region function)
 /// below which an EXTENDED region is built with registers in MEMORY instead
 /// of locals: short stays pay the union load/store at every entry/exit,
@@ -947,7 +1838,7 @@ const TRACE_WIN_PAGES: u64 = 64;
 const TRACE_WIN_MASK: u64 = TRACE_WIN_PAGES * 0x1000 - 1;
 struct TraceWin {
     aspace: u64,
-    map_gen: u64,
+    map_gen: u32,
     boot_gen: u64,
     first_va: u64,
     /// (va, physical page) of every RAM-backed mapped page in the window;
@@ -1056,8 +1947,288 @@ fn pending_block<M: FullSystemJitMachine>(
         page_generations: code_page_generations(m, &pages)?,
         pages,
         seeds,
+        trace_pcs: Vec::new(),
         missed_superblock,
     })
+}
+
+fn staged_block<M: FullSystemJitMachine>(
+    m: &mut M,
+    aspace: u64,
+    source_pages: &[(u64, u64)],
+    body: rv64_jit::RawBatchBody,
+    mut member: rv64_jit::BatchMember,
+    missed_superblock: bool,
+) -> Option<StagedBlock> {
+    let (lo, hi) = if member.span == (0, 0) {
+        (member.pc, member.pc.checked_add(2)?)
+    } else {
+        member.span
+    };
+    let last = hi.checked_sub(1)?;
+    let last_page = last & !0xfff;
+    let mut pages = Vec::new();
+    let mut va = lo & !0xfff;
+    loop {
+        let &(_, physical) = source_pages.iter().find(|&&(page, _)| page == va)?;
+        pages.push((va, physical));
+        if va == last_page {
+            break;
+        }
+        va = va.checked_add(0x1000)?;
+    }
+    let entry_page = member.pc & !0xfff;
+    let &(_, physical) = pages.iter().find(|&&(page, _)| page == entry_page)?;
+    let block = JitBlock {
+        fp: member.uses_fp,
+        idx: -1,
+        n: member.n_insns,
+        mix: member.trace_mix,
+        mem: member.trace_mem,
+        control: member.trace_control,
+        alu: member.trace_alu,
+        pa: physical + (member.pc & 0xfff),
+        last_used: 0,
+    };
+    for &(_, physical) in &pages {
+        m.code_mark_page(physical);
+    }
+    let mut trace_pcs = core::mem::take(&mut member.trace_pcs);
+    trace_pcs.extend_from_slice(&member.seeds);
+    trace_pcs.sort_unstable();
+    trace_pcs.dedup();
+    let mut pending = pending_block(
+        m,
+        aspace,
+        member.pc,
+        block,
+        pages,
+        member.seeds,
+        missed_superblock && block.n < unsafe { TRACE_KEEP_MIN },
+    )?;
+    pending.trace_pcs = trace_pcs;
+    Some(StagedBlock { body, pending })
+}
+
+fn jit_work_contains_pc(jit: &JitState, aspace: u64, pc: u64) -> bool {
+    jit.confirmed_stage
+        .iter()
+        .any(|staged| staged.pending.aspace == aspace && staged.pending.pc == pc)
+        || pending_jit_contains_pc(aspace, pc)
+}
+
+#[allow(static_mut_refs)]
+fn submit_confirmed_stage(jit: &mut JitState) -> bool {
+    let target = unsafe { CONFIRMED_BATCH_TARGET };
+    if jit.confirmed_stage.len() < target || !full_system_jit_issue_allowed() {
+        return false;
+    }
+
+    let staged: Vec<_> = jit.confirmed_stage.drain(..target).collect();
+    let mut raw = Vec::with_capacity(target);
+    let mut members = Vec::with_capacity(target);
+    for entry in staged {
+        raw.push(entry.body);
+        members.push(entry.pending);
+    }
+    let wasm = rv64_jit::finish_confirmed_body_batch(raw);
+
+    let (cell, sequence) = unsafe {
+        let cell = BATCH_CELL_NEXT;
+        BATCH_CELL_NEXT = (cell + 1) % BATCH_CELLS;
+        let sequence = NEXT_BATCH_SEQUENCE;
+        NEXT_BATCH_SEQUENCE = NEXT_BATCH_SEQUENCE.wrapping_add(1);
+        BATCH_CELL_SEQUENCE[cell] = sequence;
+        (cell, sequence)
+    };
+    unsafe { JIT_OUT = wasm };
+    submit_pending_jit(PendingJitKind::Batch(PendingBatch {
+        cell,
+        sequence,
+        members,
+        page_module: None,
+    }))
+    .expect("confirmed batch lost its reserved issue slot");
+    true
+}
+
+/// Build one stable multi-function module for a hot code page. Observed hot
+/// targets become independent traces; loop headers stay with the structured
+/// loop translator.
+fn issue_page_module<M: FullSystemJitMachine>(
+    m: &mut M,
+    jit: &mut JitState,
+    current_pc: u64,
+    pa_page: u64,
+    code: &[u8],
+    mut lay: rv64_jit::JitLayout,
+) -> PageModuleIssue {
+    let aspace = m.cpu().sys.as_ref().map_or(0, |context| context.satp);
+    let vpage = current_pc & !0xfff;
+    let key = (aspace, vpage);
+    if !unsafe { PAGE_MODULES_ON } {
+        return PageModuleIssue::Individual;
+    }
+    let Some(seeds) = jit.page_hot_entries.get(&key).cloned() else {
+        return PageModuleIssue::Individual;
+    };
+    if seeds.len() < PAGE_MODULE_THRESHOLD {
+        return PageModuleIssue::Individual;
+    }
+    if !full_system_jit_issue_allowed() {
+        return PageModuleIssue::Individual;
+    }
+    let Some(physical_page) = pa_page
+        .checked_sub(rv64_system::RAM_BASE)
+        .map(|offset| offset >> 12)
+    else {
+        return PageModuleIssue::Individual;
+    };
+    let Some(generation) = m.code_page_generation(physical_page) else {
+        return PageModuleIssue::Individual;
+    };
+    let source = PageModuleSource {
+        physical_page,
+        generation,
+        tlb_fill: unsafe {
+            TLB_FILL_POLICY == TLB_FILL_ON
+                || (TLB_FILL_POLICY == TLB_FILL_AUTO && jit.tlb_auto_enabled)
+        },
+    };
+    let usable = |entry: u64| {
+        rv64_jit::emittable_at(code, vpage, entry, lay)
+            && !rv64_jit::is_loop_at(code, vpage, entry, lay)
+    };
+    if !usable(current_pc) {
+        return PageModuleIssue::Individual;
+    }
+    let prior = match jit.page_module_decision(key, source) {
+        PageModuleDecision::Individual => return PageModuleIssue::Individual,
+        PageModuleDecision::Awaiting => return PageModuleIssue::Awaiting,
+        PageModuleDecision::Build(prior) => prior,
+    };
+
+    // Keep table-visible entries small. Further observed hot targets remain
+    // private functions in the module and are reachable through direct links
+    // or the private computed-target router.
+    let mut entries = Vec::with_capacity(PAGE_MODULE_MAX_LEADERS);
+    entries.push(current_pc);
+    for entry in seeds.iter().copied() {
+        if entries.len() >= PAGE_MODULE_MAX_LEADERS {
+            break;
+        }
+        if entry != current_pc && usable(entry) && !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    let trace_entries = entries.len();
+    if let Some(live) = prior.as_ref() {
+        for &entry in live.entries.iter() {
+            if entries.len() >= PAGE_MODULE_MAX_LEADERS {
+                break;
+            }
+            if !entries.contains(&entry) && usable(entry) {
+                entries.push(entry);
+            }
+        }
+    }
+    let (discovered, loop_candidates) = rv64_jit::discover_page_leaders_ext(
+        code,
+        vpage,
+        vpage,
+        0x1000,
+        &entries,
+        PAGE_MODULE_MAX_LEADERS,
+    );
+    for entry in discovered {
+        if entries.len() >= PAGE_MODULE_MAX_LEADERS || entries.contains(&entry) {
+            continue;
+        }
+        if !rv64_jit::emittable_at(code, vpage, entry, lay) {
+            continue;
+        }
+        if loop_candidates.contains(&entry) && rv64_jit::is_loop_at(code, vpage, entry, lay) {
+            continue;
+        }
+        entries.push(entry);
+    }
+    if entries.len() < 2 {
+        return PageModuleIssue::Individual;
+    }
+    lay.dispatch_base = jit.dispatch.as_ptr() as u32;
+    lay.dispatch_mask = (DISPATCH_SIZE - 1) as u32;
+    lay.map_gen_addr = m.cpu().jit_map_gen_ptr() as u32;
+    let hot = |pc: u64| matches!(jit.cache.get(&pc), Some(Some(block)) if block.idx >= 0);
+    let next = |pc: u64| {
+        let successor = jit.succ[JitState::dslot(pc)];
+        (successor.0 == pc).then_some(successor.1)
+    };
+    let Some((wasm, members)) =
+        rv64_jit::translate_page_module(code, vpage, &entries, trace_entries, lay, &hot, &next)
+    else {
+        jit.record_page_module_failure(key, source, prior);
+        return PageModuleIssue::Individual;
+    };
+
+    let mut pending_members = Vec::with_capacity(members.len());
+    for member in members {
+        let block = JitBlock {
+            fp: member.uses_fp,
+            idx: -1,
+            n: member.n_insns,
+            mix: member.trace_mix,
+            mem: member.trace_mem,
+            control: member.trace_control,
+            alu: member.trace_alu,
+            pa: pa_page + (member.pc - vpage),
+            last_used: 0,
+        };
+        let Some(member) = pending_block(
+            m,
+            aspace,
+            member.pc,
+            block,
+            vec![(vpage, pa_page)],
+            member.seeds,
+            false,
+        ) else {
+            return PageModuleIssue::Individual;
+        };
+        pending_members.push(member);
+    }
+    if pending_members.len() < 2 {
+        return PageModuleIssue::Individual;
+    }
+
+    let (cell, sequence) = unsafe {
+        let cell = BATCH_CELL_NEXT;
+        BATCH_CELL_NEXT = (cell + 1) % BATCH_CELLS;
+        let sequence = NEXT_BATCH_SEQUENCE;
+        NEXT_BATCH_SEQUENCE = NEXT_BATCH_SEQUENCE.wrapping_add(1);
+        BATCH_CELL_SEQUENCE[cell] = sequence;
+        (cell, sequence)
+    };
+    m.code_mark_page(pa_page);
+    unsafe { JIT_OUT = wasm };
+    let pending = PendingJitKind::Batch(PendingBatch {
+        cell,
+        sequence,
+        members: pending_members,
+        page_module: Some(key),
+    });
+    let Some(ticket) = submit_pending_jit(pending) else {
+        return PageModuleIssue::Individual;
+    };
+    jit.page_modules.insert(
+        key,
+        PageModuleState::Pending {
+            source,
+            ticket,
+            prior,
+        },
+    );
+    unsafe { PAGE_MODULES_ISSUED += 1 };
+    PageModuleIssue::Issued
 }
 
 #[allow(static_mut_refs)]
@@ -1436,6 +2607,29 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
                 .iter()
                 .filter(|pending| matches!(pending.kind, PendingJitKind::Region(_)))
                 .count() as u64,
+            82 => SYS_JIT
+                .as_ref()
+                .map_or(0, |jit| jit.page_blocks.len() as u64),
+            83 => SYS_JIT.as_ref().map_or(0, |jit| {
+                jit.cache
+                    .keys()
+                    .map(|pc| pc & !0xfff)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len() as u64
+            }),
+            84 => SYS_JIT.as_ref().map_or(0, |jit| jit.hot.len() as u64),
+            85 => SYS_JIT.as_ref().map_or(0, |jit| jit.tlb_bail_total),
+            86 => SYS_JIT.as_ref().is_some_and(|jit| jit.tlb_auto_enabled) as u64,
+            87 => PAGE_MODULES_ISSUED,
+            88 => PAGE_MODULES_LANDED,
+            89 => PAGE_MODULE_MEMBERS,
+            90 => SYS_JIT
+                .as_ref()
+                .map_or(0, |jit| jit.confirmed_stage.len() as u64),
+            91 => SYS_JIT
+                .as_ref()
+                .map_or(0, |jit| jit.confirmed_coverage.len() as u64),
+            92 => JIT_EVICTION_COOLED_ENTRIES,
             _ => 0,
         }
     }
@@ -1448,16 +2642,6 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
 /// loops (dispatched millions of times) tier up quickly.
 const JIT_ON_THRESHOLD: u32 = 64;
 static mut JIT_THRESHOLD: u32 = 64;
-/// Tier-up threshold for the per-EXECUTION interp-stretch counter. Deliberately
-/// much higher than JIT_THRESHOLD (which counts block-entry events): blocks and
-/// hot-counts persist across context switches now, so a low per-execution bar
-/// makes boot synchronously compile ~19k one-shot cold blocks (~0.1ms of
-/// WebAssembly.Module each = seconds of boot). Steady-state hot code executes
-/// millions of times and crosses 1024 in microseconds.
-const INTERP_HOT_THRESHOLD: u16 = 2048;
-/// Interpreter fallback slice once JIT blocks exist (tuned below).
-const SYS_WARM_SLICE: u64 = 256;
-
 /// Enable/disable JIT tier-up (1/0). Disabling sets the threshold beyond
 /// any counter so blocks are never compiled — pure interpreter baseline.
 #[no_mangle]
@@ -1475,6 +2659,13 @@ pub extern "C" fn jit_set_enabled(on: u32) {
             }
         }
     }
+}
+
+/// Set the tier-up threshold for performance diagnostics. Production keeps
+/// the measured default unless the embedding configures this before boot.
+#[no_mangle]
+pub extern "C" fn jit_set_threshold(threshold: u32) {
+    unsafe { JIT_THRESHOLD = threshold.max(1) }
 }
 /// Opt-in: fold branchy code pages into one superblock (function-per-page with
 /// an internal br_table dispatch). Correct and validated, but per-page
@@ -1561,6 +2752,22 @@ static mut SB_LAST_ICOUNT: u64 = 0;
 /// worse without flipping the tcc row, so the policy stays explicit:
 /// jit_set_tlb_fill(1) for guests with a working set past the 4096-entry TLB.
 static mut TLB_FILLS: u64 = 0;
+/// JIT TLB-refill policy: 0 = forced off, 1 = forced on, 2 = adaptive.
+/// Adaptive is the product default. It preserves the smaller register set for
+/// locality-friendly workloads, then enables refill only after execution has
+/// proved that first-operation TLB bails are material.
+const TLB_FILL_OFF: u8 = 0;
+const TLB_FILL_ON: u8 = 1;
+const TLB_FILL_AUTO: u8 = 2;
+static mut TLB_FILL_POLICY: u8 = TLB_FILL_AUTO;
+const TLB_AUTO_BAIL_TRIGGER: u64 = 65_536;
+const TLB_AUTO_PC_RECOMPILE: u8 = 8;
+
+fn reset_tlb_fill_policy() {
+    unsafe {
+        rv64_jit::set_tlb_fill(TLB_FILL_POLICY == TLB_FILL_ON);
+    }
+}
 /// Leaders per superblock. Every entry into the function loads the register
 /// UNION over all its bodies and every exit stores the written union, so a
 /// function that covers more of the page pays more on each entry — worth it
@@ -1990,14 +3197,12 @@ trait FullSystemJitMachine {
     fn jit_pages(&self) -> &rv64_system::JitPageState;
     fn jit_pages_mut(&mut self) -> &mut rv64_system::JitPageState;
 
-    fn run_interpreter(&mut self, max_insns: u64) -> rv64_system::RunSliceOutcome;
-    fn run_interpreter_until<F>(
+    fn run_interpreter_cached(
         &mut self,
         max_insns: u64,
-        compiled: F,
-    ) -> rv64_system::RunSliceOutcome
-    where
-        F: FnMut(u64) -> bool;
+        jit: &mut JitState,
+        tier_up: bool,
+    ) -> rv64_system::RunSliceOutcome;
     fn sync_jit_devices(&mut self);
     fn powered_off(&self) -> bool;
     fn refresh_jit_time(&mut self, force: bool);
@@ -2031,7 +3236,9 @@ trait FullSystemJitMachine {
 
     #[inline]
     fn code_mark_page(&mut self, pa: u64) {
-        self.jit_pages_mut().mark_address(pa);
+        if self.jit_pages_mut().mark_address(pa) {
+            self.cpu_mut().invalidate_store_jtlb_page(pa);
+        }
     }
 
     #[inline]
@@ -2096,20 +3303,20 @@ impl FullSystemJitMachine for rv64_system::virt::VirtMachine {
     }
 
     #[inline]
-    fn run_interpreter(&mut self, max_insns: u64) -> rv64_system::RunSliceOutcome {
-        self.run_slice_outcome(max_insns)
-    }
-
-    #[inline]
-    fn run_interpreter_until<F>(
+    fn run_interpreter_cached(
         &mut self,
         max_insns: u64,
-        compiled: F,
-    ) -> rv64_system::RunSliceOutcome
-    where
-        F: FnMut(u64) -> bool,
-    {
-        self.run_slice_until_outcome(max_insns, compiled)
+        jit: &mut JitState,
+        tier_up: bool,
+    ) -> rv64_system::RunSliceOutcome {
+        let stop_capable = !jit.cache.is_empty();
+        let aspace = self.cpu.sys.as_ref().map_or(0, |system| system.satp);
+        let mut dispatch = InterpreterDispatch {
+            jit,
+            tier_up,
+            aspace,
+        };
+        self.run_cached_slice_outcome(max_insns, &mut dispatch, stop_capable)
     }
 
     #[inline]
@@ -2153,6 +3360,8 @@ fn jit_layout(cpu: &Cpu) -> rv64_jit::JitLayout {
             ftlb_store_tag: st as u32,
             ftlb_store_off: so as u32,
             tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
+            context_tag: cpu.jit_tlb_context_tag(),
+            context_addr: cpu.jit_tlb_context_ptr() as u32,
         }),
         mem_profile: mem_profile_layout(),
         reg_stress: reg_stress(),
@@ -2480,7 +3689,6 @@ fn issue_region_inner<M: FullSystemJitMachine>(
             m.cpu().insn_count,
         ),
     );
-    m.cpu_mut().clear_store_jtlb(); // pages may now hold code
     unsafe {
         SB_ISSUED += 1;
         SB_LAST_ICOUNT = m.cpu().insn_count;
@@ -2714,6 +3922,59 @@ fn account_compiled_dispatch(
     stop_requested || retired == 0
 }
 
+/// Feed a zero-progress compiled entry into the adaptive TLB-refill policy.
+/// Returns true when the current entry was removed for one refill-enabled
+/// recompilation, so the chain must return to the tier-up path.
+fn observe_tlb_bail(jit: &mut JitState, cpu: &Cpu, pc: u64) -> bool {
+    unsafe {
+        if TLB_FILL_POLICY != TLB_FILL_AUTO {
+            return false;
+        }
+    }
+
+    // FP blocks deliberately bail before their first instruction while the
+    // architectural FP gate is closed. That is not a memory-locality signal.
+    let uses_fp = matches!(jit.cache.get(&pc), Some(Some(block)) if block.fp);
+    if uses_fp {
+        let fs = cpu
+            .sys
+            .as_ref()
+            .map_or(3, |system| (system.mstatus >> 13) & 3);
+        if cpu.fcsr & 1 == 0 || (cpu.fcsr >> 5) & 7 != 0 || fs != 3 {
+            return false;
+        }
+    }
+
+    jit.tlb_bail_total = jit.tlb_bail_total.saturating_add(1);
+    let slot = JitState::dslot(pc);
+    let entry = &mut jit.tlb_bails[slot];
+    if entry.0 != pc {
+        *entry = (pc, 1);
+    } else if entry.1 != u8::MAX {
+        entry.1 = entry.1.saturating_add(1);
+    }
+
+    if !jit.tlb_auto_enabled && jit.tlb_bail_total >= TLB_AUTO_BAIL_TRIGGER {
+        rv64_jit::set_tlb_fill(true);
+        jit.tlb_auto_enabled = true;
+    }
+    if !jit.tlb_auto_enabled || entry.1 < TLB_AUTO_PC_RECOMPILE || entry.1 == u8::MAX {
+        return false;
+    }
+
+    // Recompile a repeatedly bailing entry once. A page router has unchecked
+    // private links, so retire that complete owner as one coherent unit.
+    entry.1 = u8::MAX;
+    let block_idx = jit.cache.get(&pc).and_then(Option::as_ref).map(|b| b.idx);
+    if !block_idx.is_some_and(|idx| jit.retire_page_module_for_slot(idx)) {
+        jit.cache_remove(&pc);
+        if jit.dispatch[slot].pc == pc {
+            jit.dispatch[slot].pc = NO_PC;
+        }
+    }
+    true
+}
+
 #[allow(clippy::needless_range_loop)] // avoids references to mutable profiling statics
 #[allow(static_mut_refs)]
 fn run_full_system_jit<M: FullSystemJitMachine>(
@@ -2726,6 +3987,10 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
         JIT_CAPACITY_BLOCKED = false;
         JIT_ISSUES_THIS_RUN = 0;
     }
+    // SysCsrs remains public for machine integration. Synchronize the packed
+    // live context at the ABI boundary so direct setup changes cannot leave
+    // compiled memory probes observing an old privilege state.
+    m.cpu_mut().refresh_jit_tlb_context();
     let context = m.execution_context(jit);
     unsafe { ACTIVE_JIT_CONTEXT = Some(context) };
     let mut remaining = max_insns;
@@ -2737,7 +4002,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
     FullSystemJitMachine::sync_jit_devices(m);
     m.check_interrupts();
 
-    while remaining > 0 && !m.powered_off() {
+    'run: while remaining > 0 && !m.powered_off() {
         // Refresh the wall-clock time source (opt-in) so the CLINT tracks real
         // host time. host_now_ms is a wasm->JS round-trip (~7% of a dispatch-
         // heavy workload if done per iteration), so gate it: refresh only after
@@ -2774,6 +4039,11 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                 jit.pending_superblocks.clear();
                 jit.sb_gen.clear();
             }
+            if jit.page_hot_entries.len() > SB_SPACE_CAP {
+                jit.page_hot_entries.clear();
+                jit.page_modules
+                    .retain(|_, state| !matches!(state, PageModuleState::Attempted(_)));
+            }
         }
         // Per-page invalidation: drop only blocks whose physical code page
         // was written (self-modifying code / recycled pages), and clear only
@@ -2788,7 +4058,20 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                 TRACE_WIN.clear();
             }
             for &ppage in &dirty {
-                dirty_pending_pages.extend(jit.pending_page_keys_for_physical(ppage));
+                dirty_pending_pages.extend(jit.tracked_page_keys_for_physical(ppage));
+                let staged_blocks = core::mem::take(&mut jit.confirmed_stage);
+                for staged in staged_blocks {
+                    let source_dirty = staged.pending.pages.iter().any(|&(_, physical)| {
+                        physical
+                            .checked_sub(rv64_system::RAM_BASE)
+                            .is_some_and(|offset| offset >> 12 == ppage)
+                    });
+                    if source_dirty {
+                        jit.remove_confirmed_coverage(&staged.pending);
+                    } else {
+                        jit.confirmed_stage.push(staged);
+                    }
+                }
                 if let Some(pcs) = jit.page_blocks.remove(&ppage) {
                     for pc in pcs {
                         unsafe { DIRTY_DROPPED += 1 };
@@ -2808,6 +4091,9 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                 jit.invalidate_superblock_state(&dirty_pending_pages, &dirty_cached_vpages);
             }
         }
+        if unsafe { CONFIRMED_BATCH_ON } && submit_confirmed_stage(jit) {
+            break;
+        }
         // --- JIT fast path: direct-mapped dispatch + cheap pa-verify ---
         // Per-dispatch bookkeeping accumulates in LOCALS and flushes once after
         // the chain: at ~200M+ dispatches per second of guest compute, the five
@@ -2816,10 +4102,9 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
         // of total wall time. map_gen is hoisted too — blocks can't execute
         // satp/SFENCE (SYSTEM never compiles; blocks bail AT it), so it cannot
         // move inside a chain.
-        let map_gen = m.cpu().map_gen as u32;
+        let map_gen = m.cpu().map_generation();
         let mut chained = 0u32;
         let mut retired_sum = 0u64;
-        let mut pending_host_io = false;
         // Budget/interrupt contract: this round may retire at most
         // min(remaining, INTERRUPT_QUANTUM) instructions (to block/iteration
         // granularity); each dispatch is granted the leftover as loop fuel.
@@ -2873,18 +4158,16 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                                     DROP_REGION += 1;
                                 }
                             }
-                            jit.cache_remove(&pc);
-                            jit.dispatch[slot].pc = NO_PC;
+                            if !jit.retire_page_module_for_slot(b.idx) {
+                                jit.cache_remove(&pc);
+                                jit.dispatch[slot].pc = NO_PC;
+                            }
                             break;
                         }
                         // Region functions (n == 0) carry SB_IDX_BIT in their
                         // dispatch line so the exit below can be attributed
                         // without a cache probe (blacklist -1 keeps its sign).
-                        let tagged = if b.n == 0 && b.idx >= 0 {
-                            b.idx | SB_IDX_BIT
-                        } else {
-                            b.idx
-                        };
+                        let tagged = jit.tagged_dispatch_index(b);
                         jit.dispatch[slot] = DispatchLine {
                             pc,
                             idx: tagged,
@@ -2901,9 +4184,12 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
             if chained & 0xff == 0 {
                 jit.touch(pc);
             }
-            call_block(idx & !SB_IDX_BIT, FULL_SYSTEM_CONTEXT_HANDLE);
-            pending_host_io = m.pending_host_io();
-            let mut stop_after_dispatch = pending_host_io;
+            call_block(idx & !IDX_TAG_MASK, FULL_SYSTEM_CONTEXT_HANDLE);
+            // Compiled memory operations can access RAM only. MMIO misses bail
+            // before the access, so a JIT block cannot create a host disk
+            // request. Check host I/O once after the chain instead of scanning
+            // the virtio devices after every short compiled block.
+            let mut stop_after_dispatch = false;
             // Observed successor + stability count (JitState::succ). A
             // trace ends at its first indirect jump, so this records where
             // that jump actually goes. Once the target is proven stable,
@@ -2912,20 +4198,31 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
             // side exit, the mechanism that reduces dispatch COUNT for
             // indirect-heavy code. (The oracle is empty at first compile
             // by construction: the pc has never dispatched yet.)
-            {
+            if idx & PAGE_IDX_BIT == 0 {
                 let sl = JitState::dslot(pc);
                 let e = &mut jit.succ[sl];
-                if e.0 == pc && e.1 == m.cpu().pc {
-                    e.2 = e.2.saturating_add(1);
-                } else {
+                // A pc is extended at most once. Freeze its direct-mapped
+                // successor row afterwards instead of updating a saturated
+                // counter on every future dispatch. An alias replaces the row
+                // normally and therefore still receives a fresh profile.
+                if e.0 != pc {
                     *e = (pc, m.cpu().pc, 1);
-                }
-                if e.2 == unsafe { IC_EXTEND_TRIGGER } && !jit.ic_done.contains(&pc) {
-                    jit.ic_done.insert(pc);
-                    jit.cache_remove(&pc);
-                    jit.dispatch[sl].pc = NO_PC;
-                    unsafe { IC_EXTENDS += 1 };
-                    stop_after_dispatch = true; // recompile on the next tier-up pass
+                } else if e.2 != u32::MAX {
+                    if e.1 == m.cpu().pc {
+                        e.2 = e.2.saturating_add(1);
+                    } else {
+                        *e = (pc, m.cpu().pc, 1);
+                    }
+                    if e.2 == unsafe { IC_EXTEND_TRIGGER } {
+                        e.2 = u32::MAX;
+                        if !jit.ic_done.contains(&pc) {
+                            jit.ic_done.insert(pc);
+                            jit.cache_remove(&pc);
+                            jit.dispatch[sl].pc = NO_PC;
+                            unsafe { IC_EXTENDS += 1 };
+                            stop_after_dispatch = true; // recompile on the next tier-up pass
+                        }
+                    }
                 }
             }
             // Sampled exit attribution: after a region function returns,
@@ -2938,7 +4235,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                 };
                 if tick & ((1 << EXIT_SAMPLE_SHIFT) - 1) == 0 {
                     let stay = unsafe { RETIRED_CELL };
-                    record_region_exit(jit, idx & !SB_IDX_BIT, m.cpu().pc, stay);
+                    record_region_exit(jit, idx & !IDX_TAG_MASK, m.cpu().pc, stay);
                 }
             }
             // Sys blocks with inline memory ops may bail mid-block; read the
@@ -3000,6 +4297,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
             // spin re-calling it.
             if retired == 0 {
                 unsafe { ZERO_RETIRE += 1 };
+                stop_after_dispatch |= observe_tlb_bail(jit, m.cpu(), pc);
                 if dprof_sample {
                     let fcsr = m.cpu().fcsr;
                     let fs = m.cpu().sys.as_ref().map_or(3, |c| (c.mstatus >> 13) & 3);
@@ -3020,6 +4318,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                 break;
             }
         }
+        let pending_host_io = m.pending_host_io();
         m.cpu_mut().insn_count += retired_sum;
         unsafe {
             JIT_RETIRED += retired_sum;
@@ -3103,7 +4402,8 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
         if jit_compilation_allowed()
             && full_system_jit_issue_allowed()
             && !jit.cache.contains_key(&pc)
-            && !pending_jit_contains_pc(aspace, pc)
+            && !jit_work_contains_pc(jit, aspace, pc)
+            && !jit.confirmed_coverage.contains_key(&(aspace, pc))
         {
             let hot = {
                 let c = jit.hot.entry(pc).or_insert(0);
@@ -3119,6 +4419,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                         lay.map_gen_addr = m.cpu().jit_map_gen_ptr() as u32;
                         let vpage = pc & !0xfff;
                         let pa_page = pa & !0xfff;
+                        jit.record_page_hot_entry(aspace, pc);
                         let page_is_in_ram = m.ram_range(pa_page, 0x1000).is_some();
                         let off = range.start;
                         let end = ((off + 1024).min(off | 0xfff) + 1).min(m.ram().len());
@@ -3255,7 +4556,7 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                         if m.code_has_dirty() {
                             wins.clear();
                         }
-                        let mg = m.cpu().map_gen;
+                        let mg = m.cpu().map_generation();
                         let bg = unsafe { BOOT_GEN };
                         let hit = wins.iter().position(|w| {
                             w.aspace == aspace
@@ -3296,285 +4597,336 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
                         let w = &wins[wi];
                         let winpages = &w.pages;
                         unsafe { COMPILES_TICK += 1 };
-                        // BATCH: compile this pc together with its fixed-
-                        // target successors as one module whose members
-                        // tail-call each other directly (~2ns/hop, no table
-                        // import, O(1) registration). Falls back to the
-                        // single-block path whenever a batch can't form.
-                        let batch_t0 = unsafe { host_now_ms() };
-                        let cell = unsafe {
-                            let c = BATCH_CELL_NEXT;
-                            BATCH_CELL_NEXT = (c + 1) % BATCH_CELLS;
-                            c
-                        };
-                        let batch = if unsafe { BATCH_ON }
-                            && jit.cache.len() < unsafe { BATCH_POP_CAP }
-                            && !w.pages.is_empty()
-                        {
-                            let mut blay = lay;
-                            blay.batch_base_addr = batch_cell_addr(cell);
-                            let cache = &jit.cache;
-                            let hotmap = &jit.hot;
-                            let hot = |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
-                            let wlo = w.first_va;
-                            let whi = w.first_va + (TRACE_WIN_PAGES * 0x1000);
-                            let pages = &w.pages;
-                            // Members must be PROVEN hot: taking every exit
-                            // target compiled ~24 blocks per tier-up, most
-                            // never executed — a compile storm that ran
-                            // python fib 35x slower (173s). Warm pcs only
-                            // (half the tier-up threshold) keeps a batch to
-                            // the successor set actually being executed.
-                            let bar = unsafe { JIT_THRESHOLD >> BATCH_BAR_SHIFT };
-                            // Already-compiled successors DO join (the batch
-                            // supersedes them in the cache; the old block just
-                            // becomes unreachable): requiring uncompiled pcs
-                            // meant batches almost never formed with 2+
-                            // members, since a hot pc's successors are
-                            // normally compiled before it. Loop headers are
-                            // excluded — their tight wasm regions beat any
-                            // trace — as are superblock entries (n == 0).
-                            // BATCH_PAGE: co-locate the hot pcs of the seed's
-                            // OWN page. Successor-seeded batches only reached
-                            // ~12% in-batch exits; if the per-dispatch cost is
-                            // dominated by V8 instance switches (each block
-                            // module is its own instance), packing a page's
-                            // blocks into one instance pays on EVERY dispatch
-                            // between them, links or not.
-                            let seedpage = pc & !0xfff;
-                            let page_mode = unsafe { BATCH_PAGE };
-                            let want = |t: u64| {
-                                t >= wlo
-                                    && t < whi
-                                    && pages.iter().any(|&(va, _)| va == t & !0xfff)
-                                    && hotmap.get(&t).is_some_and(|&c| c >= bar)
-                                    && !matches!(cache.get(&t), Some(Some(b)) if b.n == 0)
-                                    && !pending_jit_contains_pc(aspace, t)
-                                    && (!page_mode || t & !0xfff == seedpage)
-                            };
-                            let succ = &jit.succ;
-                            // Observed successor of a pc, when we have one.
-                            let next = |t: u64| {
-                                let e = succ[JitState::dslot(t)];
-                                (e.0 == t).then_some(e.1)
-                            };
-                            rv64_jit::translate_batch_obs(
-                                &w.buf,
-                                w.first_va,
-                                pc,
-                                blay,
-                                &hot,
-                                &want,
-                                &next,
-                                unsafe { BATCH_CAP },
-                            )
-                        } else {
-                            None
-                        };
-                        if let Some((wasm, members)) = batch {
-                            unsafe {
-                                SB_BUILD_MS += host_now_ms() - batch_t0;
-                                SB_LAST_ICOUNT = m.cpu().insn_count;
-                            }
-                            // RATE GOVERNOR. The gates that separate a
-                            // workload batching PAYS for from one it does
-                            // not are neither population nor footprint
-                            // (both accumulate kernel/boot code and fire
-                            // for everyone) — it is how FAST batches are
-                            // demanded. nbench ASSIGNMENT wants a few dozen
-                            // over tens of billions of instructions; CPython
-                            // wants thousands inside its first second, and
-                            // pays a batch compile per tier-up for code it
-                            // never re-enters (python fib 3.7s -> 180s).
-                            // Once the observed rate proves that shape,
-                            // batching switches off for the rest of the run.
-                            unsafe {
-                                // Deferring this verdict until the guest is
-                                // warm was tried and is WORSE: python's
-                                // storm resumes unchecked (all runs time
-                                // out) while ASSIGNMENT still gains nothing.
-                                // Judging from the first batch on is what
-                                // produced python's MATCH.
-                                let gi = (m.cpu().insn_count / 1_000_000_000).max(1);
-                                if BATCHES > 64 && BATCHES / gi > BATCH_RATE_CAP {
-                                    BATCH_ON = false;
+                        let page_offset = usize::try_from(vpage - w.first_va)
+                            .expect("trace window contains the current page");
+                        let page_code = &w.buf[page_offset..page_offset + 0x1000];
+                        'compile_hot: {
+                            let confirmed_on = unsafe { CONFIRMED_BATCH_ON };
+                            if !confirmed_on && page_is_in_ram {
+                                match issue_page_module(m, jit, pc, pa_page, page_code, lay) {
+                                    PageModuleIssue::Individual | PageModuleIssue::Awaiting => {}
+                                    // Async completion requires returning to the
+                                    // host microtask queue.
+                                    PageModuleIssue::Issued => {
+                                        break 'run;
+                                    }
                                 }
                             }
-                            if members.len() >= 2 && full_system_jit_issue_allowed() {
-                                let mut pending_members = Vec::with_capacity(members.len());
-                                let mut valid_batch = true;
-                                for mb in members {
-                                    let (lo, hi) = if mb.span == (0, 0) {
-                                        (mb.pc, mb.pc + 2)
-                                    } else {
-                                        mb.span
+
+                            let structured_loop =
+                                confirmed_on && rv64_jit::is_loop_at(&w.buf, w.first_va, pc, lay);
+                            if confirmed_on && !structured_loop {
+                                let translated = {
+                                    let cache = &jit.cache;
+                                    let hot = |target: u64| matches!(cache.get(&target), Some(Some(block)) if block.idx >= 0);
+                                    let succ = &jit.succ;
+                                    let next = |entry: u64| {
+                                        let successor = succ[JitState::dslot(entry)];
+                                        (successor.0 == entry
+                                            && successor.2 >= unsafe { IC_EXTEND_TRIGGER })
+                                        .then_some(successor.1)
                                     };
-                                    let mut mpa = 0u64;
-                                    let mut spanned = Vec::new();
-                                    let mut va = lo & !0xfff;
-                                    while va <= (hi - 1) & !0xfff {
-                                        let Some(&(_, pp)) =
-                                            w.pages.iter().find(|&&(v, _)| v == va)
-                                        else {
+                                    rv64_jit::translate_confirmed_body(
+                                        &w.buf, w.first_va, pc, lay, &hot, &next,
+                                    )
+                                };
+                                let staged = translated.and_then(|(body, member)| {
+                                    staged_block(m, aspace, winpages, body, member, missed_here)
+                                });
+                                if let Some(staged) = staged {
+                                    jit.add_confirmed_coverage(&staged.pending);
+                                    jit.confirmed_stage.push(staged);
+                                    if submit_confirmed_stage(jit) {
+                                        break 'run;
+                                    }
+                                    // The staged pc remains interpreted until
+                                    // eight independently hot traces share one
+                                    // module compile.
+                                    break 'compile_hot;
+                                }
+                            }
+                            // BATCH: compile this pc together with its fixed-
+                            // target successors as one module whose members
+                            // tail-call each other directly (~2ns/hop, no table
+                            // import, O(1) registration). Falls back to the
+                            // single-block path whenever a batch can't form.
+                            let batch_t0 = unsafe { host_now_ms() };
+                            let cell = unsafe {
+                                let c = BATCH_CELL_NEXT;
+                                BATCH_CELL_NEXT = (c + 1) % BATCH_CELLS;
+                                c
+                            };
+                            let batch = if !confirmed_on
+                                && unsafe { BATCH_ON }
+                                && jit.cache.len() < unsafe { BATCH_POP_CAP }
+                                && !w.pages.is_empty()
+                            {
+                                let mut blay = lay;
+                                blay.batch_base_addr = batch_cell_addr(cell);
+                                let cache = &jit.cache;
+                                let hotmap = &jit.hot;
+                                let hot =
+                                    |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
+                                let wlo = w.first_va;
+                                let whi = w.first_va + (TRACE_WIN_PAGES * 0x1000);
+                                let pages = &w.pages;
+                                // Members must be PROVEN hot: taking every exit
+                                // target compiled ~24 blocks per tier-up, most
+                                // never executed — a compile storm that ran
+                                // python fib 35x slower (173s). Warm pcs only
+                                // (half the tier-up threshold) keeps a batch to
+                                // the successor set actually being executed.
+                                let bar = unsafe { JIT_THRESHOLD >> BATCH_BAR_SHIFT };
+                                // Already-compiled successors DO join (the batch
+                                // supersedes them in the cache; the old block just
+                                // becomes unreachable): requiring uncompiled pcs
+                                // meant batches almost never formed with 2+
+                                // members, since a hot pc's successors are
+                                // normally compiled before it. Loop headers are
+                                // excluded — their tight wasm regions beat any
+                                // trace — as are superblock entries (n == 0).
+                                // BATCH_PAGE: co-locate the hot pcs of the seed's
+                                // OWN page. Successor-seeded batches only reached
+                                // ~12% in-batch exits; if the per-dispatch cost is
+                                // dominated by V8 instance switches (each block
+                                // module is its own instance), packing a page's
+                                // blocks into one instance pays on EVERY dispatch
+                                // between them, links or not.
+                                let seedpage = pc & !0xfff;
+                                let page_mode = unsafe { BATCH_PAGE };
+                                let want = |t: u64| {
+                                    t >= wlo
+                                        && t < whi
+                                        && pages.iter().any(|&(va, _)| va == t & !0xfff)
+                                        && hotmap.get(&t).is_some_and(|&c| c >= bar)
+                                        && !matches!(cache.get(&t), Some(Some(b)) if b.n == 0)
+                                        && !jit_work_contains_pc(jit, aspace, t)
+                                        && (!page_mode || t & !0xfff == seedpage)
+                                };
+                                let succ = &jit.succ;
+                                // Observed successor of a pc, when we have one.
+                                let next = |t: u64| {
+                                    let e = succ[JitState::dslot(t)];
+                                    (e.0 == t).then_some(e.1)
+                                };
+                                rv64_jit::translate_batch_obs(
+                                    &w.buf,
+                                    w.first_va,
+                                    pc,
+                                    blay,
+                                    &hot,
+                                    &want,
+                                    &next,
+                                    unsafe { BATCH_CAP },
+                                )
+                            } else {
+                                None
+                            };
+                            if let Some((wasm, members)) = batch {
+                                unsafe {
+                                    SB_BUILD_MS += host_now_ms() - batch_t0;
+                                    SB_LAST_ICOUNT = m.cpu().insn_count;
+                                }
+                                // RATE GOVERNOR. The gates that separate a
+                                // workload batching PAYS for from one it does
+                                // not are neither population nor footprint
+                                // (both accumulate kernel/boot code and fire
+                                // for everyone) — it is how FAST batches are
+                                // demanded. nbench ASSIGNMENT wants a few dozen
+                                // over tens of billions of instructions; CPython
+                                // wants thousands inside its first second, and
+                                // pays a batch compile per tier-up for code it
+                                // never re-enters (python fib 3.7s -> 180s).
+                                // Once the observed rate proves that shape,
+                                // batching switches off for the rest of the run.
+                                unsafe {
+                                    // Deferring this verdict until the guest is
+                                    // warm was tried and is WORSE: python's
+                                    // storm resumes unchecked (all runs time
+                                    // out) while ASSIGNMENT still gains nothing.
+                                    // Judging from the first batch on is what
+                                    // produced python's MATCH.
+                                    let gi = (m.cpu().insn_count / 1_000_000_000).max(1);
+                                    if BATCHES > 64 && BATCHES / gi > BATCH_RATE_CAP {
+                                        BATCH_ON = false;
+                                    }
+                                }
+                                if members.len() >= 2 && full_system_jit_issue_allowed() {
+                                    let mut pending_members = Vec::with_capacity(members.len());
+                                    let mut valid_batch = true;
+                                    for mb in members {
+                                        let (lo, hi) = if mb.span == (0, 0) {
+                                            (mb.pc, mb.pc + 2)
+                                        } else {
+                                            mb.span
+                                        };
+                                        let mut mpa = 0u64;
+                                        let mut spanned = Vec::new();
+                                        let mut va = lo & !0xfff;
+                                        while va <= (hi - 1) & !0xfff {
+                                            let Some(&(_, pp)) =
+                                                w.pages.iter().find(|&&(v, _)| v == va)
+                                            else {
+                                                valid_batch = false;
+                                                break;
+                                            };
+                                            if va == mb.pc & !0xfff {
+                                                mpa = pp + (mb.pc & 0xfff);
+                                            }
+                                            spanned.push((va, pp));
+                                            va += 0x1000;
+                                        }
+                                        if !valid_batch || mpa == 0 {
+                                            valid_batch = false;
+                                            break;
+                                        }
+                                        let block = JitBlock {
+                                            fp: mb.uses_fp,
+                                            idx: -1,
+                                            n: mb.n_insns,
+                                            mix: mb.trace_mix,
+                                            mem: mb.trace_mem,
+                                            control: mb.trace_control,
+                                            alu: mb.trace_alu,
+                                            pa: mpa,
+                                            last_used: 0,
+                                        };
+                                        let Some(block) = pending_block(
+                                            m, aspace, mb.pc, block, spanned, mb.seeds, false,
+                                        ) else {
                                             valid_batch = false;
                                             break;
                                         };
-                                        if va == mb.pc & !0xfff {
-                                            mpa = pp + (mb.pc & 0xfff);
+                                        pending_members.push(block);
+                                    }
+                                    if valid_batch && pending_members.len() >= 2 {
+                                        for member in &pending_members {
+                                            for &(_, pp) in &member.pages {
+                                                m.code_mark_page(pp);
+                                            }
                                         }
-                                        spanned.push((va, pp));
-                                        va += 0x1000;
-                                    }
-                                    if !valid_batch || mpa == 0 {
-                                        valid_batch = false;
-                                        break;
-                                    }
-                                    let block = JitBlock {
-                                        fp: mb.uses_fp,
-                                        idx: -1,
-                                        n: mb.n_insns,
-                                        mix: mb.trace_mix,
-                                        mem: mb.trace_mem,
-                                        control: mb.trace_control,
-                                        alu: mb.trace_alu,
-                                        pa: mpa,
-                                        last_used: 0,
-                                    };
-                                    let Some(block) = pending_block(
-                                        m, aspace, mb.pc, block, spanned, mb.seeds, false,
-                                    ) else {
-                                        valid_batch = false;
-                                        break;
-                                    };
-                                    pending_members.push(block);
-                                }
-                                if valid_batch && pending_members.len() >= 2 {
-                                    for member in &pending_members {
-                                        for &(_, pp) in &member.pages {
-                                            m.code_mark_page(pp);
+                                        let sequence = unsafe {
+                                            let sequence = NEXT_BATCH_SEQUENCE;
+                                            NEXT_BATCH_SEQUENCE =
+                                                NEXT_BATCH_SEQUENCE.wrapping_add(1);
+                                            BATCH_CELL_SEQUENCE[cell] = sequence;
+                                            sequence
+                                        };
+                                        unsafe { JIT_OUT = wasm };
+                                        if submit_pending_jit(PendingJitKind::Batch(PendingBatch {
+                                            cell,
+                                            sequence,
+                                            members: pending_members,
+                                            page_module: None,
+                                        }))
+                                        .is_some()
+                                        {
+                                            break 'run;
                                         }
-                                    }
-                                    let sequence = unsafe {
-                                        let sequence = NEXT_BATCH_SEQUENCE;
-                                        NEXT_BATCH_SEQUENCE = NEXT_BATCH_SEQUENCE.wrapping_add(1);
-                                        BATCH_CELL_SEQUENCE[cell] = sequence;
-                                        sequence
-                                    };
-                                    unsafe { JIT_OUT = wasm };
-                                    if submit_pending_jit(PendingJitKind::Batch(PendingBatch {
-                                        cell,
-                                        sequence,
-                                        members: pending_members,
-                                    }))
-                                    .is_some()
-                                    {
-                                        m.cpu_mut().clear_store_jtlb();
-                                        break;
                                     }
                                 }
                             }
-                        }
-                        let blk = {
-                            // Hotness oracle for branch-direction bias: a
-                            // compiled (non-blacklisted) target is proven-hot.
-                            let cache = &jit.cache;
-                            let hot = |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
-                            // Inline-cache oracle: the target this pc's
-                            // indirect jump was last observed to take.
-                            let succ = &jit.succ;
-                            let next = |t: u64| {
-                                let e = succ[JitState::dslot(t)];
-                                (e.0 == t && e.2 >= unsafe { IC_EXTEND_TRIGGER }).then_some(e.1)
-                            };
-                            rv64_jit::translate_block_ic(
-                                &w.buf,
-                                w.first_va,
-                                pc,
-                                lay,
-                                &hot,
-                                &|_| None,
-                                &next,
-                            )
-                        };
-                        let entry = blk.and_then(|blk| {
-                            // Pages the emitted code actually came from
-                            // ((0,0) span = wholly within [pc, pc+len)).
-                            let (lo, hi) = if blk.span == (0, 0) {
-                                (pc, pc + blk.len.max(2))
-                            } else {
-                                blk.span
-                            };
-                            let mut spanned: Vec<(u64, u64)> = Vec::new();
-                            let mut va = lo & !0xfff;
-                            while va <= (hi - 1) & !0xfff {
-                                let Some(&(_, pp)) = winpages.iter().find(|&&(v, _)| v == va)
-                                else {
-                                    return None; // span escaped the window (impossible)
+                            let blk = {
+                                // Hotness oracle for branch-direction bias: a
+                                // compiled (non-blacklisted) target is proven-hot.
+                                let cache = &jit.cache;
+                                let hot =
+                                    |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
+                                // Inline-cache oracle: the target this pc's
+                                // indirect jump was last observed to take.
+                                let succ = &jit.succ;
+                                let next = |t: u64| {
+                                    let e = succ[JitState::dslot(t)];
+                                    (e.0 == t && e.2 >= unsafe { IC_EXTEND_TRIGGER }).then_some(e.1)
                                 };
-                                spanned.push((va, pp));
-                                va += 0x1000;
-                            }
-                            for &(_, pp) in &spanned {
-                                m.code_mark_page(pp);
-                            }
-                            m.cpu_mut().clear_store_jtlb(); // these pages may now hold code
-                            let block = JitBlock {
-                                fp: blk.uses_fp,
-                                idx: -1,
-                                n: blk.n_insns,
-                                mix: blk.trace_mix,
-                                mem: blk.trace_mem,
-                                control: blk.trace_control,
-                                alu: blk.trace_alu,
-                                pa,
-                                last_used: 0,
+                                rv64_jit::translate_block_ic(
+                                    &w.buf,
+                                    w.first_va,
+                                    pc,
+                                    lay,
+                                    &hot,
+                                    &|_| None,
+                                    &next,
+                                )
                             };
-                            let pending = pending_block(
-                                m,
-                                aspace,
-                                pc,
-                                block,
-                                spanned,
-                                blk.seeds,
-                                missed_here && block.n < unsafe { TRACE_KEEP_MIN },
-                            )?;
-                            unsafe { JIT_OUT = blk.wasm };
-                            submit_pending_jit(PendingJitKind::Block(pending))?;
-                            Some(())
-                        });
-                        match entry {
-                            Some(()) => break,
-                            // Untranslatable at THESE code bytes: blacklist with
-                            // a pa-stamped sentinel (idx = -1). It's re-verified
-                            // like a real block (map_gen / dispatch probe) so it
-                            // survives context switches without poisoning a
-                            // different address space at the same va, and the
-                            // dirty-page tracker naturally drops it if the code
-                            // bytes are overwritten.
-                            None => {
-                                // Pending capacity is temporary. Do not poison a
-                                // valid pc merely because the async queue is full.
-                                if !full_system_jit_issue_allowed() {
-                                    continue;
+                            let entry = blk.and_then(|blk| {
+                                // Pages the emitted code actually came from
+                                // ((0,0) span = wholly within [pc, pc+len)).
+                                let (lo, hi) = if blk.span == (0, 0) {
+                                    (pc, pc + blk.len.max(2))
+                                } else {
+                                    blk.span
+                                };
+                                let mut spanned: Vec<(u64, u64)> = Vec::new();
+                                let mut va = lo & !0xfff;
+                                while va <= (hi - 1) & !0xfff {
+                                    let Some(&(_, pp)) = winpages.iter().find(|&&(v, _)| v == va)
+                                    else {
+                                        return None; // span escaped the window (impossible)
+                                    };
+                                    spanned.push((va, pp));
+                                    va += 0x1000;
                                 }
-                                if missed_here {
-                                    *jit.sb_missed.entry((aspace, vpage)).or_insert(0) += 1;
-                                    unsafe { SB_INDIV += 1 };
+                                for &(_, pp) in &spanned {
+                                    m.code_mark_page(pp);
                                 }
-                                m.code_mark_page(pa);
-                                m.cpu_mut().clear_store_jtlb();
-                                let jb = JitBlock {
-                                    fp: false,
+                                let block = JitBlock {
+                                    fp: blk.uses_fp,
                                     idx: -1,
-                                    n: 0,
-                                    mix: [0; 5],
-                                    mem: [0; 10],
-                                    control: [0; 3],
-                                    alu: [0; 5],
+                                    n: blk.n_insns,
+                                    mix: blk.trace_mix,
+                                    mem: blk.trace_mem,
+                                    control: blk.trace_control,
+                                    alu: blk.trace_alu,
                                     pa,
                                     last_used: 0,
                                 };
-                                jit.cache_insert(pc, Some(jb));
+                                let pending = pending_block(
+                                    m,
+                                    aspace,
+                                    pc,
+                                    block,
+                                    spanned,
+                                    blk.seeds,
+                                    missed_here && block.n < unsafe { TRACE_KEEP_MIN },
+                                )?;
+                                unsafe { JIT_OUT = blk.wasm };
+                                submit_pending_jit(PendingJitKind::Block(pending))?;
+                                Some(())
+                            });
+                            match entry {
+                                Some(()) => break 'run,
+                                // Untranslatable at THESE code bytes: blacklist with
+                                // a pa-stamped sentinel (idx = -1). It's re-verified
+                                // like a real block (map_gen / dispatch probe) so it
+                                // survives context switches without poisoning a
+                                // different address space at the same va, and the
+                                // dirty-page tracker naturally drops it if the code
+                                // bytes are overwritten.
+                                None => {
+                                    // Pending capacity is temporary. Do not poison a
+                                    // valid pc merely because the async queue is full.
+                                    if !full_system_jit_issue_allowed() {
+                                        continue 'run;
+                                    }
+                                    if missed_here {
+                                        *jit.sb_missed.entry((aspace, vpage)).or_insert(0) += 1;
+                                        unsafe { SB_INDIV += 1 };
+                                    }
+                                    m.code_mark_page(pa);
+                                    let jb = JitBlock {
+                                        fp: false,
+                                        idx: -1,
+                                        n: 0,
+                                        mix: [0; 5],
+                                        mem: [0; 10],
+                                        control: [0; 3],
+                                        alu: [0; 5],
+                                        pa,
+                                        last_used: 0,
+                                    };
+                                    jit.cache_insert(pc, Some(jb));
+                                }
                             }
                         }
                     }
@@ -3582,81 +4934,29 @@ fn run_full_system_jit<M: FullSystemJitMachine>(
             }
         }
 
-        // --- interpreter + devices ---
-        if jit.cache.is_empty() {
-            // Cold: no compiled blocks to return to — one big slice avoids
-            // dispatch churn before any block exists.
-            let outcome = m.run_interpreter(remaining.min(4096));
-            unsafe {
-                SLICE_CALLS += 1;
-                SLICE_INSNS += outcome.retired;
+        // --- decoded interpreter + devices ---
+        // One code-page cache serves both cold interpretation and JIT fallback.
+        // It predecodes instructions, runs to a basic-block boundary, and overlays
+        // compiled entries during the block scan. No path re-enters Cpu::run(1)
+        // merely to ask whether the next PC is compiled.
+        let icount_before = m.cpu().insn_count;
+        let tier_up = unsafe { JIT_THRESHOLD != u32::MAX }
+            && jit_compilation_allowed()
+            && full_system_jit_issue_allowed();
+        let outcome = m.run_interpreter_cached(remaining.min(4096), jit, tier_up);
+        unsafe {
+            SLICE_CALLS += 1;
+            SLICE_INSNS += outcome.retired;
+            if DPROF_ON && IHIST_LAST != usize::MAX {
+                // Charge the whole interpreted stretch to the instruction where
+                // compiled execution yielded to the shared page cache.
+                IHIST_INSNS[IHIST_LAST] += m.cpu().insn_count - icount_before;
+                IHIST_LAST = usize::MAX;
             }
-            remaining = remaining.saturating_sub(outcome.retired.max(1));
-            if outcome.idle {
-                break;
-            }
-            if m.pending_host_io() {
-                break;
-            }
-        } else {
-            // Warm: interpret ONLY the uncompiled stretch — stop the moment pc
-            // reaches a compiled block again. A fixed warm slice overshoots into
-            // compiled code and runs it in the interpreter; on the CPython eval
-            // loop that overshoot was ~half of all instructions (2.8M slices ×
-            // 256 insns). Run in small chunks, checking the (cheap, direct-
-            // mapped) dispatch cache between them.
-            // Interpret only the uncompiled stretch, stopping the instant pc
-            // reaches a hot compiled block — a fixed slice would overshoot into
-            // compiled code and run it in the interpreter (on the CPython eval
-            // loop that overshoot was ~half of all instructions). The first
-            // instruction always runs (pc may be a block that just bailed here),
-            // so no spin.
-            // Stop when pc reaches a compiled block; ALSO hot-count each
-            // uncompiled pc and stop once it's hot enough, so the interior of an
-            // interpreted stretch actually reaches the compile threshold (else
-            // run_slice_until would interpret the whole stretch forever without
-            // any of its blocks ever tiering up — that residual is ~half of
-            // fib's wall time).
-            let icount_before = m.cpu().insn_count;
-            let outcome = m.run_interpreter_until(remaining.min(SYS_WARM_SLICE), |pc| {
-                if jit.dispatch[JitState::dslot(pc)].pc == pc {
-                    return true;
-                }
-                let slot = JitState::dslot(pc);
-                let tag = (pc >> 1) as u32;
-                if jit.interp_hot_tag[slot] != tag {
-                    // different pc aliased here: heat belongs to someone else
-                    jit.interp_hot_tag[slot] = tag;
-                    jit.interp_hot[slot] = 0;
-                }
-                let cnt = &mut jit.interp_hot[slot];
-                *cnt = cnt.saturating_add(1);
-                if *cnt < INTERP_HOT_THRESHOLD {
-                    return false; // cold: cheap array bump only, no HashMap
-                }
-                // Hot stretch interior: force it onto the fast-path hot map so
-                // the compile step tiers it up, and stop interpreting here.
-                jit.hot.insert(pc, unsafe { JIT_THRESHOLD });
-                true
-            });
-            unsafe {
-                SLICE_CALLS += 1;
-                SLICE_INSNS += outcome.retired;
-                if DPROF_ON && IHIST_LAST != usize::MAX {
-                    // Charge the whole interpreted stretch to whatever the JIT
-                    // gave up on: one unsupported instruction can drag dozens
-                    // of interpreted instructions behind it.
-                    IHIST_INSNS[IHIST_LAST] += m.cpu().insn_count - icount_before;
-                    IHIST_LAST = usize::MAX;
-                }
-            }
-            remaining = remaining.saturating_sub(outcome.retired.max(1));
-            if outcome.idle {
-                break;
-            }
-            if m.pending_host_io() {
-                break;
-            }
+        }
+        remaining = remaining.saturating_sub(outcome.retired.max(1));
+        if outcome.idle || m.pending_host_io() {
+            break;
         }
 
         // Stream console output at quantum granularity, DURING execution —
@@ -3713,10 +5013,10 @@ pub extern "C" fn chain_next(context: i32) {
             }
             let pc = cpu.pc;
             let line = jit.dispatch[JitState::dslot(pc)];
-            if line.pc != pc || line.gen != cpu.map_gen as u32 || line.idx < 0 {
+            if line.pc != pc || line.gen != cpu.map_generation() || line.idx < 0 {
                 return; // miss/blacklist/stale: the host loop owns the slow path
             }
-            line.idx & !SB_IDX_BIT
+            line.idx & !IDX_TAG_MASK
         };
         CHAIN_DEPTH += 1;
         CHAIN_HOPS += 1;
@@ -3782,7 +5082,13 @@ fn complete_jit<M: FullSystemJitMachine>(m: &mut M, ticket: u64, base: i32, slot
             return;
         };
         let p = PENDING_JIT.swap_remove(pos);
+        if let Some(jit) = SYS_JIT.as_mut() {
+            jit.remove_pending_coverage(&p.kind);
+        }
         if p.slot_count() != slot_count {
+            if let (Some(jit), PendingJitKind::Batch(batch)) = (SYS_JIT.as_mut(), &p.kind) {
+                let _ = jit.finish_pending_page_module(p.ticket, batch, PageModuleFinish::Failed);
+            }
             for offset in 0..slot_count {
                 let idx = base.checked_add(offset as i32).unwrap_or(-1);
                 if idx >= 0 {
@@ -3834,7 +5140,8 @@ fn complete_jit<M: FullSystemJitMachine>(m: &mut M, ticket: u64, base: i32, slot
                 PendingJitKind::Region(region) => {
                     jit.pending_superblock_is_current(p.ticket, region.aspace, &region.pages)
                 }
-                PendingJitKind::Block(_) | PendingJitKind::Batch(_) => true,
+                PendingJitKind::Batch(batch) => jit.page_module_pending_is_current(p.ticket, batch),
+                PendingJitKind::Block(_) => true,
             };
         if !current {
             // A newer overlapping build owns at least one page. The older
@@ -3842,6 +5149,10 @@ fn complete_jit<M: FullSystemJitMachine>(m: &mut M, ticket: u64, base: i32, slot
             // any non-overlapping claims that were not superseded.
             if let PendingJitKind::Region(region) = &p.kind {
                 jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, false);
+            }
+            if let PendingJitKind::Batch(batch) = &p.kind {
+                let _ =
+                    jit.finish_pending_page_module(p.ticket, batch, PageModuleFinish::Cancelled);
             }
             if base >= 0 && source_stale {
                 SB_STALE += 1;
@@ -3859,6 +5170,10 @@ fn complete_jit<M: FullSystemJitMachine>(m: &mut M, ticket: u64, base: i32, slot
             if let PendingJitKind::Region(region) = &p.kind {
                 jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, false);
             }
+            if let PendingJitKind::Batch(batch) = &p.kind {
+                let _ =
+                    jit.finish_pending_page_module(p.ticket, batch, PageModuleFinish::Cancelled);
+            }
             handle_jit_capacity(jit);
             return;
         }
@@ -3866,11 +5181,14 @@ fn complete_jit<M: FullSystemJitMachine>(m: &mut M, ticket: u64, base: i32, slot
             if let PendingJitKind::Region(region) = &p.kind {
                 jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, false);
             }
+            if let PendingJitKind::Batch(batch) = &p.kind {
+                let _ = jit.finish_pending_page_module(p.ticket, batch, PageModuleFinish::Failed);
+            }
             return;
         }
         let slots = (0..slot_count).map(|offset| base + offset as i32);
         let owner = jit
-            .track_owner(slots.clone())
+            .track_owner(p.ticket, slots.clone())
             .expect("valid async JIT slot");
         // A page written while compiling makes the result stale. The write
         // generation closes the dirty-drain/re-mark ABA window: a page cannot
@@ -3893,6 +5211,10 @@ fn complete_jit<M: FullSystemJitMachine>(m: &mut M, ticket: u64, base: i32, slot
                 SB_STALE += 1;
                 jit.finish_pending_superblock(p.ticket, region.aspace, &region.pages, false);
             }
+            if let PendingJitKind::Batch(batch) = &p.kind {
+                let _ =
+                    jit.finish_pending_page_module(p.ticket, batch, PageModuleFinish::Cancelled);
+            }
             jit.retire_unreferenced_slots(owner);
             return;
         }
@@ -3903,7 +5225,12 @@ fn complete_jit<M: FullSystemJitMachine>(m: &mut M, ticket: u64, base: i32, slot
         } else if let PendingJitKind::Block(block) = &p.kind {
             complete_block_landing(m, jit, base, block);
         } else if let PendingJitKind::Batch(batch) = &p.kind {
+            let prior_owner =
+                jit.finish_pending_page_module(p.ticket, batch, PageModuleFinish::Landed(owner));
             complete_batch_landing(m, jit, base, batch);
+            if let Some(prior_owner) = prior_owner.filter(|&prior| prior != owner) {
+                jit.retire_owner(prior_owner, false);
+            }
         }
         jit.retire_unreferenced_slots(owner);
     }
@@ -3935,6 +5262,9 @@ fn complete_region_landing<M: FullSystemJitMachine>(
             },
         );
         for &e in &p.entries {
+            if jit.page_module_owns_cached_entry(p.aspace, e) {
+                continue;
+            }
             // Sparse regions: find the entry's page by lookup (pages are in
             // dispatch order, not address order).
             let Some(pi) = p.pages.iter().position(|&(va, _)| va == e & !0xfff) else {
@@ -3992,6 +5322,9 @@ fn complete_block_landing<M: FullSystemJitMachine>(
     idx: i32,
     p: &PendingBlock,
 ) {
+    if jit.page_module_owns_cached_entry(p.aspace, p.pc) {
+        return;
+    }
     if !block_should_replace_region(jit.cache.get(&p.pc), p.block, unsafe { TRACE_KEEP_MIN }) {
         return;
     }
@@ -4021,7 +5354,6 @@ fn complete_block_landing<M: FullSystemJitMachine>(
         *jit.sb_missed.entry((p.aspace, p.pc & !0xfff)).or_insert(0) += 1;
         unsafe { SB_INDIV += 1 };
     }
-    m.cpu_mut().clear_store_jtlb();
 }
 
 #[allow(static_mut_refs)]
@@ -4031,21 +5363,35 @@ fn complete_batch_landing<M: FullSystemJitMachine>(
     base: i32,
     p: &PendingBatch,
 ) {
+    let page_module = p.page_module.is_some();
     unsafe {
-        if BATCH_CELL_SEQUENCE[p.cell] == p.sequence {
+        if !page_module && BATCH_CELL_SEQUENCE[p.cell] == p.sequence {
             BATCH_BASE_POOL[p.cell] = base as u32;
         }
         BATCHES += 1;
         BATCH_MEMBERS += p.members.len() as u64;
+        if p.page_module.is_some() {
+            PAGE_MODULES_LANDED += 1;
+            PAGE_MODULE_MEMBERS += p.members.len() as u64;
+        }
     }
     for (offset, member) in p.members.iter().enumerate() {
-        if !block_should_replace_region(jit.cache.get(&member.pc), member.block, unsafe {
-            TRACE_KEEP_MIN
-        }) {
+        if !page_module && jit.page_module_owns_cached_entry(member.aspace, member.pc) {
+            continue;
+        }
+        if !page_module
+            && !block_should_replace_region(jit.cache.get(&member.pc), member.block, unsafe {
+                TRACE_KEEP_MIN
+            })
+        {
             continue;
         }
         let mut block = member.block;
-        block.idx = base + offset as i32;
+        block.idx = if page_module {
+            base
+        } else {
+            base + offset as i32
+        };
         block.last_used = next_jit_use_stamp();
         if member.pages.len() > 1 {
             jit.regions.insert(block.idx, member.pages.clone());
@@ -4289,6 +5635,41 @@ static mut BATCH_CELL_NEXT: usize = 0;
 /// and does flip a row it hurts is not worth shipping on. The machinery,
 /// the IC composition and the rate governor stay behind jit_set_batch(1).
 static mut BATCH_ON: bool = false;
+/// Coalesce only entries that independently crossed the tier-up threshold.
+/// Unlike speculative batches and page modules, this changes module packaging
+/// without predicting successors or compiling cold page leaders.
+static mut CONFIRMED_BATCH_ON: bool = false;
+static mut CONFIRMED_BATCH_TARGET: usize = 8;
+
+#[no_mangle]
+pub extern "C" fn jit_set_confirmed_batch(on: u32) {
+    unsafe { CONFIRMED_BATCH_ON = on != 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn jit_set_confirmed_batch_target(target: u32) {
+    // A one-function batch exports `r0`, while the host's one-slot ABI expects
+    // `run`. Keep confirmed batches genuinely multi-function.
+    unsafe { CONFIRMED_BATCH_TARGET = target.clamp(2, 64) as usize }
+}
+/// Pack a hot code page into one multi-function Wasm module. Each discovered
+/// leader keeps its own small register set; fixed edges use direct tail calls
+/// and dynamic page-local edges pass through an internal router. The host
+/// enables this only after validating Wasm tail-call support.
+static mut PAGE_MODULES_ON: bool = false;
+// Two independently hot roots amortize the page module's compilation cost.
+const PAGE_MODULE_THRESHOLD: usize = 2;
+const PAGE_MODULE_WARM_THRESHOLD: usize = 4;
+// Dense modules cost more to compile than they save in host registrations.
+const PAGE_MODULE_MAX_LEADERS: usize = 64;
+static mut PAGE_MODULES_ISSUED: u64 = 0;
+static mut PAGE_MODULES_LANDED: u64 = 0;
+static mut PAGE_MODULE_MEMBERS: u64 = 0;
+
+#[no_mangle]
+pub extern "C" fn jit_set_page_modules(on: u32) {
+    unsafe { PAGE_MODULES_ON = on != 0 }
+}
 /// Blocks in the cache beyond which batching stops (see BATCH_ON).
 /// NOTE: population alone is NOT a sufficient gate — python fib still ran
 /// 180s with a 4096-block cap, because the storm happens during warm-up
@@ -4444,10 +5825,19 @@ pub extern "C" fn jit_set_trace_level(l: u32) {
     rv64_jit::set_trace_level(l);
 }
 
-/// Toggle host-filled TLB misses inside compiled blocks (perf A/B).
+/// Select host-filled TLB misses inside compiled blocks.
+/// `0` forces the old bail-to-interpreter path, `1` forces refill, and `2`
+/// restores the adaptive product policy.
 #[no_mangle]
-pub extern "C" fn jit_set_tlb_fill(on: u32) {
-    rv64_jit::set_tlb_fill(on != 0);
+pub extern "C" fn jit_set_tlb_fill(mode: u32) {
+    unsafe {
+        TLB_FILL_POLICY = match mode {
+            0 => TLB_FILL_OFF,
+            1 => TLB_FILL_ON,
+            _ => TLB_FILL_AUTO,
+        };
+    }
+    reset_tlb_fill_policy();
 }
 
 /// Fused-TLB refill for compiled blocks: called from generated code (a
