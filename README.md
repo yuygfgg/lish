@@ -101,11 +101,15 @@ Linux virtio-net
   -> raw Ethernet WebSocket
   -> Swift host
   -> libslirp
-  -> host network
+     |-> direct host network
+     `-> delayed HTTPS CONNECT proxy at 10.0.2.4:3128
+         `-> host network
 ```
 
-The guest owns DNS, TCP, UDP, and TLS. Lish does not translate HTTP requests
-or install a proxy certificate in the guest.
+Direct traffic keeps guest-owned DNS, TCP, and UDP. The Alpine guest uses the
+CONNECT proxy for HTTPS. The proxy acknowledges CONNECT locally and opens the
+upstream TCP connection only after the guest sends tunnel data. TLS remains
+end to end; Lish does not decrypt HTTPS or install a proxy certificate.
 
 ## JavaScript Runtime
 
@@ -149,9 +153,9 @@ runtime work, and releases JIT ownership. The raw Wasm exports are internal.
 The supported Lish path is `linux-direct` with `none`, raw Ethernet `wsproxy`,
 or an application-provided external Ethernet transport. The `firmware` mode
 remains available when the caller supplies an OpenSBI image. The image builder
-does not create or download firmware. The runtime does not expose
-user-mode, bare-metal, HTTP proxy, WISP, browser-local LAN, 9P, or secondary
-console compatibility APIs.
+does not create or download firmware. The runtime does not expose user-mode,
+bare-metal, a browser-facing HTTP proxy transport, WISP, browser-local LAN, 9P,
+or secondary console compatibility APIs.
 
 ## Native Full-System Runner
 

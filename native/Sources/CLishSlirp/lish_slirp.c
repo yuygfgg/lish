@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,6 +41,7 @@ enum command_kind {
     COMMAND_NONE,
     COMMAND_ADD_FORWARD,
     COMMAND_REMOVE_FORWARD,
+    COMMAND_ADD_UNIX_FORWARD,
 };
 
 struct forward_command {
@@ -49,6 +51,7 @@ struct forward_command {
     struct in_addr guest_address;
     uint16_t host_port;
     uint16_t guest_port;
+    char unix_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     bool complete;
     int result;
 };
@@ -332,9 +335,14 @@ static void process_command(struct lish_slirp *state) {
         result = slirp_add_hostfwd(state->slirp, command.udp,
                                    command.host_address, command.host_port,
                                    command.guest_address, command.guest_port);
-    } else {
+    } else if (command.kind == COMMAND_REMOVE_FORWARD) {
         result = slirp_remove_hostfwd(state->slirp, command.udp,
                                       command.host_address, command.host_port);
+    } else if (command.kind == COMMAND_ADD_UNIX_FORWARD) {
+        result = slirp_add_unix(state->slirp, command.unix_socket_path,
+                                &command.guest_address, command.guest_port);
+    } else {
+        result = -1;
     }
 
     pthread_mutex_lock(&state->mutex);
@@ -561,6 +569,24 @@ int lish_slirp_remove_host_forward(lish_slirp_t *state,
         inet_pton(AF_INET, host_address, &command.host_address) != 1) {
         return -1;
     }
+    return execute_forward_command(state, command);
+}
+
+int lish_slirp_add_unix_forward(lish_slirp_t *state,
+                                const char *unix_socket_path,
+                                const char *guest_address,
+                                uint16_t guest_port) {
+    struct forward_command command = {
+        .kind = COMMAND_ADD_UNIX_FORWARD,
+        .guest_port = guest_port,
+    };
+    if (unix_socket_path == NULL || unix_socket_path[0] == '\0' ||
+        strlen(unix_socket_path) >= sizeof(command.unix_socket_path) ||
+        guest_address == NULL ||
+        inet_pton(AF_INET, guest_address, &command.guest_address) != 1) {
+        return -1;
+    }
+    memcpy(command.unix_socket_path, unix_socket_path, strlen(unix_socket_path) + 1);
     return execute_forward_command(state, command);
 }
 

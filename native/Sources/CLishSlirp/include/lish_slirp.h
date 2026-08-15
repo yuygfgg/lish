@@ -57,6 +57,12 @@ int lish_slirp_remove_host_forward(lish_slirp_t *slirp,
                                    const char *host_address,
                                    uint16_t host_port);
 
+/* Maps one guest TCP endpoint to a Unix domain socket listener on the host. */
+int lish_slirp_add_unix_forward(lish_slirp_t *slirp,
+                                const char *unix_socket_path,
+                                const char *guest_address,
+                                uint16_t guest_port);
+
 void lish_slirp_get_stats(lish_slirp_t *slirp, lish_slirp_stats_t *stats);
 
 /* Stops the poll thread and unblocks pending operations. The object remains valid. */

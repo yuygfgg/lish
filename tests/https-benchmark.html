@@ -26,6 +26,7 @@ const capability = query.get("capability");
 const targetURL = new URL(
   query.get("target") ?? "https://dl-cdn.alpinelinux.org/alpine/",
 );
+const httpsProxyPort = 3128;
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 const state = { status: "starting", executionMode, targetURL: targetURL.href, trials: [], error: null };
@@ -87,10 +88,10 @@ function frameObserver(trial, direction, frame, at) {
   const outbound = direction === "tx";
   const port = outbound ? tcp.sourcePort : tcp.destinationPort;
   const peerPort = outbound ? tcp.destinationPort : tcp.sourcePort;
-  if (peerPort !== 443 && port !== 443) return;
+  if (peerPort !== httpsProxyPort && port !== httpsProxyPort) return;
   const key = outbound ? tcp.sourcePort : tcp.destinationPort;
   let attempt = trial.httpsAttempts.find((item) => item.port === key);
-  if (!attempt && outbound && tcp.sourcePort !== 443) {
+  if (!attempt && outbound && tcp.sourcePort !== httpsProxyPort) {
     attempt = { port: key, synAt: null, synAckAt: null, helloAt: null, closeAt: null,
       flags: [], payloadBytes: 0 };
     trial.httpsAttempts.push(attempt);

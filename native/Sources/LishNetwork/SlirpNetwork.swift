@@ -179,6 +179,23 @@ public final class SlirpNetwork: @unchecked Sendable {
         }
     }
 
+    public func addUnixForward(
+        socketPath: String,
+        guestAddress: String,
+        guestPort: UInt16
+    ) throws {
+        let result = try withHandle { current in
+            socketPath.withCString { path in
+                guestAddress.withCString { guest in
+                    lish_slirp_add_unix_forward(current, path, guest, guestPort)
+                }
+            }
+        }
+        guard result == 0 else {
+            throw SlirpNetworkError.operationFailed("unable to add the libslirp Unix forward")
+        }
+    }
+
     public func statistics() throws -> SlirpNetworkStatistics {
         let value = try withHandle { current in
             var value = lish_slirp_stats_t()

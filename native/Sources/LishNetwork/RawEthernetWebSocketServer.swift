@@ -277,6 +277,7 @@ private final class RawEthernetSession: @unchecked Sendable {
     private let connection: NWConnection
     private let queue: DispatchQueue
     private let network: SlirpNetwork
+    private let proxy: DelayedConnectProxy
     private let drainSignal: SessionSignal
     private let onReady: @Sendable (RawEthernetSession) -> Bool
     private let onStop: @Sendable (RawEthernetSession) -> Void
@@ -303,12 +304,30 @@ private final class RawEthernetSession: @unchecked Sendable {
         self.onReady = onReady
         self.onStop = onStop
         self.drainSignal = drainSignal
-        self.network = try SlirpNetwork(
-            queueCapacity: queueCapacity,
-            disableHostLoopback: disableHostLoopback,
-            outputQueue: queue,
-            outputReady: { drainSignal.send() }
-        )
+        let proxy = try DelayedConnectProxy()
+        do {
+            let network = try SlirpNetwork(
+                queueCapacity: queueCapacity,
+                disableHostLoopback: disableHostLoopback,
+                outputQueue: queue,
+                outputReady: { drainSignal.send() }
+            )
+            do {
+                try network.addUnixForward(
+                    socketPath: proxy.socketPath,
+                    guestAddress: DelayedConnectProxy.guestAddress,
+                    guestPort: DelayedConnectProxy.guestPort
+                )
+            } catch {
+                network.stop()
+                throw error
+            }
+            self.network = network
+            self.proxy = proxy
+        } catch {
+            proxy.stop()
+            throw error
+        }
         drainSignal.install { [weak self] in
             self?.sendNextFrame()
         }
@@ -401,6 +420,7 @@ private final class RawEthernetSession: @unchecked Sendable {
         guard !stopped else { return false }
         stopped = true
         drainSignal.invalidate()
+        proxy.stop()
         network.stop()
         onStop(self)
         return true

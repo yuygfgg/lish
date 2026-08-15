@@ -54,13 +54,14 @@ Linux machine and requires the `ALPINE_READY` marker. The test fails when the
 Wasm module, kernel, or disk is absent; prepare them with
 `web/prepare-images.sh`.
 
-The Swift tests cover DHCP, ARP, UDP, libslirp forwarding, and the raw Ethernet
-WebSocket framing used by the browser network mode. The browser network path
-must carry Ethernet frames. HTTP, TLS, WISP, and 9P translation tests are not
-part of the Lish contract.
+The Swift tests cover DHCP, ARP, UDP, libslirp forwarding, delayed HTTPS
+CONNECT, and the raw Ethernet WebSocket framing used by the browser network
+mode. The CONNECT tests prove that the proxy does not open the upstream TCP
+connection before it receives tunnel payload. TLS remains guest-owned.
 
 Use `tests/https-benchmark.html` to measure cold TLS startup through the raw
-Ethernet path. Build the network host:
+Ethernet path and delayed CONNECT proxy. The benchmark records the guest TCP
+connection to port 3128 and the tunneled ClientHello. Build the network host:
 
 ```sh
 swift build -c release --product lish-network-host --package-path native

@@ -10,7 +10,7 @@ BRANCH="v${VERSION%.*}"
 MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 WEB_IMG="$OUT/alpine-riscv64.ext4"
 NATIVE_IMG="$OUT/alpine-riscv64-native.ext4"
-IMAGE_STAMP="$OUT/alpine-image-v8"
+IMAGE_STAMP="$OUT/alpine-image-v9"
 BENCH="$OUT/guest-benchmarks/rv64-jit-bench"
 TARBALL="$OUT/alpine-minirootfs-$VERSION-riscv64.tar.gz"
 URL="$MIRROR/$BRANCH/releases/riscv64/$(basename "$TARBALL")"
@@ -135,6 +135,8 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 if grep -qw 'rv64.network=wsproxy' /proc/cmdline; then
+    export HTTPS_PROXY=http://10.0.2.4:3128
+    export https_proxy="$HTTPS_PROXY"
     ip link set eth0 up
     if udhcpc -i eth0 -q -n -t 5; then
         echo LISH_NETWORK_DHCP=OK
@@ -148,9 +150,8 @@ if grep -qw 'rv64.network=wsproxy' /proc/cmdline; then
         else
             echo LISH_NETWORK_DNS=FAIL
         fi
-        # The first TLS workload can compile cold guest code. Fastly closes an
-        # idle TCP connection after about one second, so retry the same HTTPS
-        # path during boot before declaring the network unhealthy.
+        # The CONNECT proxy waits for the first tunnel payload before it opens
+        # the upstream TCP connection. Retry transient network failures only.
         https_ok=0
         for _ in 1 2 3 4 5; do
             if wget -q -T 3 -t 1 -O /dev/null \

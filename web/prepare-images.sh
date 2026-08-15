@@ -15,7 +15,7 @@ rm -f "$out/opensbi.bin"
 
 if [ ! -f "$bench/alpine-riscv64.ext4" ] || \
    [ ! -f "$bench/alpine-riscv64-native.ext4" ] || \
-   [ ! -f "$bench/alpine-image-v8" ]; then
+   [ ! -f "$bench/alpine-image-v9" ]; then
     "$root/tests/virt-smoke/mk-alpine-rootfs.sh" "$bench"
 fi
 ln -sfn "../../../target/bench/alpine-riscv64.ext4" "$out/alpine.ext4"
