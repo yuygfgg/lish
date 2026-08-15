@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+cp /opt/rv64/inittab /etc/inittab
+exec /sbin/init

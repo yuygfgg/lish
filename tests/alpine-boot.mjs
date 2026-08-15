@@ -39,15 +39,32 @@ const vm = await RV64.create({
 
 assert.equal(vm.network.mode, "none");
 await vm.start();
-const deadline = performance.now() + 240_000;
-while (vm.running && !output.includes("ALPINE_READY") && performance.now() < deadline) {
-  await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+async function waitForOutput(marker, timeoutMs) {
+  const deadline = performance.now() + timeoutMs;
+  while (vm.running && !output.includes(marker) && performance.now() < deadline) {
+    await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+  }
+  assert.ifError(observedError);
+  assert.ok(output.includes(marker), `timed out waiting for ${marker}`);
 }
-await vm.stop();
-await vm.destroy();
 
-assert.ifError(observedError);
-assert.match(output, /Linux version/);
-assert.match(output, /ALPINE_READY/);
-assert.doesNotMatch(output, /unexpected end of file/);
+try {
+  await waitForOutput("ALPINE_READY", 240_000);
+  await waitForOutput("\x1b[6n", 30_000);
+  vm.console.send("\x1b[1;1R");
+
+  vm.console.send(
+    "sh -c 'prefix=LISH_SIGINT_; trap \"echo ${prefix}OK; exit 0\" INT; " +
+      "echo ${prefix}ARMED; while :; do :; done'\r",
+  );
+  await waitForOutput("LISH_SIGINT_ARMED", 30_000);
+  vm.console.send(Uint8Array.of(0x03));
+  await waitForOutput("LISH_SIGINT_OK", 30_000);
+
+  assert.match(output, /Linux version/);
+  assert.doesNotMatch(output, /unexpected end of file/);
+} finally {
+  await vm.stop();
+  await vm.destroy();
+}
 console.log("PASS Alpine direct boot with networking disabled");

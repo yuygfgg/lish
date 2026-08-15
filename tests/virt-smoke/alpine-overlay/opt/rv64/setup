@@ -1,0 +1,46 @@
+#!/bin/sh
+set -eu
+
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+. /opt/rv64/network-profile.sh
+
+if grep -qw 'rv64.network=wsproxy' /proc/cmdline; then
+    ip link set eth0 up
+    if udhcpc -i eth0 -q -n -t 5; then
+        echo LISH_NETWORK_DHCP=OK
+        if env | grep -qiE '(^|_)https?_proxy='; then
+            echo LISH_NETWORK_PROXY=ON
+        else
+            echo LISH_NETWORK_PROXY=OFF
+        fi
+        if nslookup dl-cdn.alpinelinux.org 10.0.2.3 >/dev/null 2>&1; then
+            echo LISH_NETWORK_DNS=OK
+        else
+            echo LISH_NETWORK_DNS=FAIL
+        fi
+        # The CONNECT proxy waits for the first tunnel payload before it opens
+        # the upstream TCP connection. Retry transient network failures only.
+        https_ok=0
+        for _ in 1 2 3 4 5; do
+            if wget -q -T 3 -t 1 -O /dev/null \
+                https://dl-cdn.alpinelinux.org/alpine/; then
+                https_ok=1
+                break
+            fi
+        done
+        if [ "$https_ok" -eq 1 ]; then
+            echo LISH_NETWORK_HTTPS=OK
+        else
+            echo LISH_NETWORK_HTTPS=FAIL
+        fi
+    else
+        echo LISH_NETWORK_DHCP=FAIL
+    fi
+fi
+
+hostname rv64
+echo ALPINE_READY
+echo 'Try: apk update && apk add nano'
+echo 'JIT lifecycle benchmark: rv64-jit-bench [pages] [rounds] [calls]'

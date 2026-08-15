@@ -10,7 +10,7 @@ BRANCH="v${VERSION%.*}"
 MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 WEB_IMG="$OUT/alpine-riscv64.ext4"
 NATIVE_IMG="$OUT/alpine-riscv64-native.ext4"
-IMAGE_STAMP="$OUT/alpine-image-v9"
+IMAGE_STAMP="$OUT/alpine-image-v10"
 BENCH="$OUT/guest-benchmarks/rv64-jit-bench"
 TARBALL="$OUT/alpine-minirootfs-$VERSION-riscv64.tar.gz"
 URL="$MIRROR/$BRANCH/releases/riscv64/$(basename "$TARBALL")"
@@ -63,6 +63,7 @@ extract_apk() {
 }
 
 require curl
+require cp
 require cut
 require du
 require genext2fs
@@ -113,6 +114,8 @@ base_tar="$work/alpine-minirootfs.tar"
 packages="$work/packages"
 
 "$ROOT_DIR/tools/build-guest-benchmarks.sh" "$OUT/guest-benchmarks"
+mkdir -p "$overlay"
+cp -a "$ROOT_DIR/tests/virt-smoke/alpine-overlay/." "$overlay/"
 mkdir -p \
     "$overlay/usr/lib" \
     "$overlay/usr/local/bin"
@@ -126,57 +129,13 @@ install -m 0755 "$packages/wget/usr/bin/wget" "$overlay/usr/local/bin/wget"
 cp -a "$packages/libidn2/usr/lib/." "$overlay/usr/lib/"
 cp -a "$packages/libunistring/usr/lib/." "$overlay/usr/lib/"
 cp -a "$packages/pcre2/usr/lib/." "$overlay/usr/lib/"
-
-cat > "$overlay/rv64-init" <<'EOF'
-#!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sys /sys
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-
-if grep -qw 'rv64.network=wsproxy' /proc/cmdline; then
-    export HTTPS_PROXY=http://10.0.2.4:3128
-    export https_proxy="$HTTPS_PROXY"
-    ip link set eth0 up
-    if udhcpc -i eth0 -q -n -t 5; then
-        echo LISH_NETWORK_DHCP=OK
-        if env | grep -qiE '(^|_)https?_proxy='; then
-            echo LISH_NETWORK_PROXY=ON
-        else
-            echo LISH_NETWORK_PROXY=OFF
-        fi
-        if nslookup dl-cdn.alpinelinux.org 10.0.2.3 >/dev/null 2>&1; then
-            echo LISH_NETWORK_DNS=OK
-        else
-            echo LISH_NETWORK_DNS=FAIL
-        fi
-        # The CONNECT proxy waits for the first tunnel payload before it opens
-        # the upstream TCP connection. Retry transient network failures only.
-        https_ok=0
-        for _ in 1 2 3 4 5; do
-            if wget -q -T 3 -t 1 -O /dev/null \
-                https://dl-cdn.alpinelinux.org/alpine/; then
-                https_ok=1
-                break
-            fi
-        done
-        if [ "$https_ok" -eq 1 ]; then
-            echo LISH_NETWORK_HTTPS=OK
-        else
-            echo LISH_NETWORK_HTTPS=FAIL
-        fi
-    else
-        echo LISH_NETWORK_DHCP=FAIL
-    fi
-fi
-
-hostname rv64
-echo ALPINE_READY
-echo 'Try: apk update && apk add nano'
-echo 'JIT lifecycle benchmark: rv64-jit-bench [pages] [rounds] [calls]'
-exec /bin/sh -l
-EOF
-chmod 0755 "$overlay/rv64-init"
+chmod 0755 \
+    "$overlay/rv64-init" \
+    "$overlay/opt/rv64/console" \
+    "$overlay/opt/rv64/network-profile.sh" \
+    "$overlay/opt/rv64/setup"
+chmod 0644 \
+    "$overlay/opt/rv64/inittab"
 
 # genext2fs reads an uncompressed tar archive and preserves its target metadata.
 # It applies the overlay as a second layer and maps host ownership to root.

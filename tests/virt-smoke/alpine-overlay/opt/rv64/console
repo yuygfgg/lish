@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+. /opt/rv64/network-profile.sh
+exec /bin/sh -l

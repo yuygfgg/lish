@@ -1,0 +1,4 @@
+::sysinit:/opt/rv64/setup
+ttyS0::respawn:/sbin/getty -n -l /opt/rv64/console -L 115200 ttyS0 vt100
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
